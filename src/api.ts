@@ -1,0 +1,80 @@
+import type { BacktestParams, BacktestResponse } from "./types";
+
+async function j<T>(url: string, opts?: RequestInit): Promise<T> {
+  const r = await fetch(url, opts);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  return data as T;
+}
+
+export function runBacktest(body: {
+  symbols: string[];
+  start: string;
+  end: string;
+  timeframe: string;
+  params: BacktestParams;
+}) {
+  return j<BacktestResponse>("/api/backtest", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export const getAccount = () => j<any>("/api/account");
+export const getPositions = () => j<any[]>("/api/positions");
+export const getOrders = (status = "open") => j<any[]>(`/api/orders?status=${status}`);
+export const scan = (gapMin: number, gapMax: number) =>
+  j<{ rows: any[] }>(`/api/scan?gapMin=${gapMin}&gapMax=${gapMax}`);
+
+export const optionSelect = (symbol: string, side: "call" | "put") =>
+  j<import("./types").OptionSelect>(`/api/option-select?symbol=${symbol}&side=${side}`);
+
+export const getFaber = (symbol: string, sma: number, startYear?: number) =>
+  j<import("./types").FaberResult>(
+    `/api/faber?symbol=${symbol}&sma=${sma}${startYear ? `&startYear=${startYear}` : ""}`
+  );
+
+export const getGex = (symbol: string, maxExpiries = 4, maxDte = 45) =>
+  j<import("./types").GexResult>(`/api/gex?symbol=${symbol}&maxExpiries=${maxExpiries}&maxDte=${maxDte}`);
+
+export const runVolDesk = (tickers: string[], maxDte = 45, requireDb = true) =>
+  j<{ results: import("./types").VolDeskSnapshot[] }>("/api/voldesk", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tickers, maxDte, requireDb }),
+  });
+
+const post = (url: string, body: any) =>
+  j<any>(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+export const voldeskEnter = (
+  ticker: string, riskPremium: number, force: boolean, confirm: boolean,
+  dteTarget: number, moneyness: string
+) => post("/api/voldesk/enter", { ticker, riskPremium, force, confirm, dteTarget, moneyness });
+export const voldeskPositions = () =>
+  j<{ positions: import("./types").VolDeskPosition[] }>("/api/voldesk/positions");
+export const voldeskExit = (id: string, reason: string) => post("/api/voldesk/exit", { id, reason });
+export const voldeskLock = (id: string) => post("/api/voldesk/lock", { id });
+
+export const placeOrder = (body: any) =>
+  j<any>("/api/orders", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+export const cancelOrder = (id: string) => j<any>(`/api/orders/${id}`, { method: "DELETE" });
+export const closePosition = (symbol: string) =>
+  j<any>(`/api/positions/${symbol}`, { method: "DELETE" });
+
+// ---- Flow conviction + auto-trader ---------------------------------------
+export const getFlow = (ticker: string, side: "long" | "short" = "long") =>
+  j<any>(`/api/flow?ticker=${encodeURIComponent(ticker)}&side=${side}`);
+
+export const autoStatus = () => j<any>("/api/autotrader/status");
+export const autoStart = () => post("/api/autotrader/start", {});
+export const autoStop = () => post("/api/autotrader/stop", {});
+export const autoGetConfig = () => j<any>("/api/autotrader/config");
+export const autoSetConfig = (partial: any) => post("/api/autotrader/config", partial);
+export const autoSetWatchlist = (tickers: string[]) => post("/api/autotrader/watchlist", { tickers });

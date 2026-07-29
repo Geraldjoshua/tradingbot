@@ -1,0 +1,43 @@
+# Render Blueprint — one Docker web service that serves the API + built UI and
+# runs the auto-trader loop. Commit this, then in Render: New > Blueprint > pick
+# this repo. It reads everything below automatically.
+services:
+  - type: web
+    name: trading-lab
+    runtime: docker
+    plan: free               # Free spins down after ~15m idle. We fight that with
+                             # a keep-alive (see keepalive.js + the GitHub Action).
+                             # Free CANNOT have a persistent disk, so data/ is
+                             # EPHEMERAL — it resets on every restart/redeploy.
+                             # (Upgrade to "starter" to add the disk block back.)
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+
+    # NOTE: no `disk:` block — free plan does not support persistent disks.
+    # If you switch plan to "starter", re-add:
+    #   disk: { name: data, mountPath: /app/data, sizeGB: 1 }
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Anti-idle: the in-process self-ping uses RENDER_EXTERNAL_URL (auto-set by
+      # Render). Tune or disable with KEEPALIVE_MIN / KEEPALIVE=off.
+      - key: KEEPALIVE_MIN
+        value: "10"
+      # ---- Alpaca (PAPER) — set these in the dashboard, they are secret ----
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_PAPER_BASE
+        value: https://paper-api.alpaca.markets
+      - key: ALPACA_DATA_BASE
+        value: https://data.alpaca.markets
+      - key: ALPACA_FEED
+        value: iex           # datacenter IPs often lack a SIP entitlement; iex is safe
+      # ---- Flow sources ----
+      - key: OPTIONSTRAT_DIR
+        value: /app/data/optionstrat   # put master workbooks here (on the disk)
+      - key: UW_API_KEY
+        sync: false          # leave unset to keep Unusual Whales off

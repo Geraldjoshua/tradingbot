@@ -1,0 +1,25 @@
+{
+  "automation": {
+    "enabled": true,
+    "mode": "full",
+    "pollSeconds": 60,
+    "strategies": { "voldesk": true, "gapgo": false },
+    "marketHoursOnly": true,
+    "t1Action": "take-profit",
+    "maxConcurrent": 5,
+    "maxDailyEntries": 3,
+    "entryCooldownMin": 30,
+    "watchlist": []
+  },
+  "flow": {
+    "enabled": true,
+    "mode": "size",
+    "sources": { "optionstrat": true, "unusualwhales": false },
+    "optionstratDir": "",
+    "sizing": { "agree": 1.0, "neutral": 0.7, "disagree": 0.25 },
+    "minScore": 0.15,
+    "boosts": { "unusual": 0.1, "knows": 0.15 },
+    "sourceWeights": { "optionstrat": 1.0, "unusualwhales": 1.0 }
+  },
+  "risk": { "basePremium": 300 }
+}

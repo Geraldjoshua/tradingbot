@@ -1,0 +1,10 @@
+node_modules
+.venv
+dist
+.git
+data
+*.log
+flow_*.csv
+flow_*.xlsx
+optionstrat_profile
+.env
