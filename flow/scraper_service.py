@@ -57,6 +57,14 @@ def _et_now():
     return utc + timedelta(hours=-4 if edt else -5)
 
 
+# Scrape window, ET. Starts before the bell so the 09:30 bar is captured from the
+# open, and runs past the 16:00 close because OptionStrat keeps printing late/
+# after-hours flow for a while — those rows matter for tomorrow's book, so cutting
+# off at 16:05 threw away real data.
+SCRAPE_START_MIN = int(os.environ.get("SCRAPE_START_MIN", str(9 * 60 + 25)))   # 09:25
+SCRAPE_END_MIN = int(os.environ.get("SCRAPE_END_MIN", str(16 * 60 + 40)))      # 16:40
+
+
 def market_open():
     if not MARKET_HOURS_ONLY:
         return True
@@ -64,8 +72,7 @@ def market_open():
     if t.weekday() >= 5:                      # Sat/Sun
         return False
     mins = t.hour * 60 + t.minute
-    # Start a few minutes early so the 09:30 bar is captured from the open.
-    return 9 * 60 + 25 <= mins <= 16 * 60 + 5
+    return SCRAPE_START_MIN <= mins <= SCRAPE_END_MIN
 
 
 # ---- child process management ----------------------------------------------
@@ -108,26 +115,60 @@ def run_step(script, args=(), label=None):
     return False
 
 
-def build_and_push():
-    """day-CSVs -> masters -> compact cache -> deployed app."""
+def _describe(dirpath):
+    """One-line inventory of what's on disk, for the console."""
+    p = Path(dirpath)
+    bits = []
+    for name in ("flow_master.xlsx", "flow_unusual_master.xlsx", "flow_knows_master.xlsx"):
+        f = p / name
+        if f.exists():
+            bits.append(f"{name}={f.stat().st_size/1048576:.1f}MB")
+    todays = sorted(p.glob("flow_*.csv"))
+    if todays:
+        bits.append(f"{len(todays)} day-csv")
+    c = p / "flow_cache.json"
+    if c.exists():
+        try:
+            import json as _j
+            n = len(_j.loads(c.read_text()).get("tickers", {}))
+            bits.append(f"cache={n} tickers")
+        except Exception:
+            bits.append("cache=?")
+    return "  ".join(bits) or "(empty)"
+
+
+def build_and_push(reason=""):
+    """day-CSVs -> masters -> compact cache -> (optionally) push."""
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+    log("=" * 68)
+    log(f"BUILD {('(' + reason + ')') if reason else ''} — folding today's rows into the master workbooks")
+    log(f"  before: {_describe(OUT_DIR)}")
+
     # The master builder resolves its files relative to CWD, so run it in OUT_DIR.
     cwd = os.getcwd()
     try:
         os.chdir(OUT_DIR)
-        run_step("optionstrat_master_builder.py", label="master-builder")
+        ok_master = run_step("optionstrat_master_builder.py", label="master-builder")
     finally:
         os.chdir(cwd)
-    run_step("build_flow_cache.py", (OUT_DIR,), label="build-cache")
+    log(f"  masters {'updated' if ok_master else 'FAILED'} -> flow_master.xlsx (+unusual/knows if present)")
+
+    ok_cache = run_step("build_flow_cache.py", (OUT_DIR,), label="build-cache")
+    log(f"  cache {'rebuilt' if ok_cache else 'FAILED'} -> flow_cache.json (this is what the bot reads)")
+
     if PUSH_URL:
         run_step("push_flow_cache.py", (OUT_DIR,), label="push-cache")
     else:
-        log("FLOW_PUSH_URL not set — cache built locally, not pushed")
+        log("  local mode — no push needed, the bot reads this folder directly")
+
+    log(f"  after:  {_describe(OUT_DIR)}")
+    log("=" * 68)
 
 
 def main():
+    win = f"{SCRAPE_START_MIN // 60:02d}:{SCRAPE_START_MIN % 60:02d}-{SCRAPE_END_MIN // 60:02d}:{SCRAPE_END_MIN % 60:02d} ET"
     log(f"OUT_DIR={OUT_DIR} build_every={BUILD_EVERY_MIN}m "
-        f"market_hours_only={MARKET_HOURS_ONLY} push={'yes' if PUSH_URL else 'no'}")
+        f"window={win if MARKET_HOURS_ONLY else '24/7'} push={'yes' if PUSH_URL else 'no'}")
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
     proc = None
@@ -145,13 +186,13 @@ def main():
             elif proc is not None and proc.poll() is None:
                 stop(proc, "market closed")
                 proc = None
-                build_and_push()          # final build for the session
+                build_and_push("market closed — end-of-day roll-up")
                 last_build = time.time()
 
             # Periodic build+push while running.
             if time.time() - last_build >= BUILD_EVERY_MIN * 60:
                 if open_now or last_build == 0.0:
-                    build_and_push()
+                    build_and_push("periodic" if open_now else "startup")
                 last_build = time.time()
 
             time.sleep(30)

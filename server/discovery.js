@@ -26,11 +26,11 @@ import * as uw from "./unusualwhales.js";
 import * as vd from "./voldesk_trades.js";
 import * as alpaca from "./alpaca.js";
 import * as playbook from "./playbook.js";
+import { pythonPath } from "./pythonPath.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PY = fs.existsSync(path.join(ROOT, ".venv/bin/python"))
-  ? path.join(ROOT, ".venv/bin/python")
-  : "python3";
+// Cross-platform (Windows venv lives in Scripts\, not bin/) — see pythonPath.js
+const PY = pythonPath();
 
 function runPy(script, args, timeoutMs = 120000) {
   return new Promise((resolve) => {
@@ -270,6 +270,13 @@ async function scanAll(tickers, cfg) {
   }
   await Promise.all(Array.from({ length: conc }, worker));
   return out;
+}
+
+// Scan ONE ticker on demand (writes today's snapshot). Used by the auto-trader
+// when a watchlist/READY name has no snapshot yet.
+export async function scanTicker(ticker, cfg) {
+  const r = await volDeskScan(String(ticker).toUpperCase(), cfg);
+  return r || { error: "scan returned nothing" };
 }
 
 // ---- Public: full discovery run -------------------------------------------

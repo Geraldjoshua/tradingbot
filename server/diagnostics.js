@@ -21,11 +21,11 @@ import * as alpaca from "./alpaca.js";
 import * as flow from "./flow.js";
 import * as discovery from "./discovery.js";
 import * as observe from "./observe.js";
+import { pythonPath } from "./pythonPath.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PY = fs.existsSync(path.join(ROOT, ".venv/bin/python"))
-  ? path.join(ROOT, ".venv/bin/python")
-  : "python3";
+// Cross-platform (Windows venv lives in Scripts\, not bin/) — see pythonPath.js
+const PY = pythonPath();
 
 function runPy(args, timeoutMs = 60000) {
   return new Promise((resolve) => {

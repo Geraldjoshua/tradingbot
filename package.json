@@ -4,11 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "vite build && node server/local.js",
+    "start:fast": "node server/local.js",
+    "start:noscraper": "node -e \"process.env.LOCAL_SCRAPER='off';import('./server/local.js')\"",
     "server": "node server/index.js",
-    "client": "vite",
     "dev": "concurrently -k -n SERVER,CLIENT -c blue,magenta \"npm:server\" \"npm:client\"",
+    "client": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "setup": "node scripts/setup.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

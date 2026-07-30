@@ -23,6 +23,7 @@ import * as discovery from "./discovery.js";
 import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
 import { pingStatus } from "./keepalive.js";
+import * as reconcile from "./reconcile.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOG = path.join(ROOT, "data", "autotrader_log.json");
@@ -124,6 +125,37 @@ async function discoverNames(cfg, ctx) {
   return d.shadowMode ? [] : names;     // shadow: surface nothing to the buyer
 }
 
+// ---- Ensure a fresh snapshot exists before we try to enter ----------------
+// enterTrade() needs today's Vol Desk snapshot for its levels. If a name reaches
+// the entry stage without one (manual watchlist entry, or a scan that failed
+// earlier), the old behaviour was to throw "run a Vol Desk scan first" EVERY
+// tick — an error the user cannot act on, repeated once a minute forever.
+// Instead: scan it on demand, and back off per-ticker if the scan itself fails
+// so a genuinely broken symbol doesn't spin.
+async function ensureSnapshot(ticker, cfg, st) {
+  if (vd.latestSnapshot(ticker)) return true;
+
+  const backoffMin = cfg.discovery?.scanRetryMin ?? 30;
+  st.scanFail = st.scanFail || {};
+  const last = st.scanFail[ticker];
+  if (last && Date.now() - last < backoffMin * 60 * 1000) return false;   // still backing off
+
+  const r = await discovery.scanTicker(ticker, cfg);
+  if (r && !r.error) {
+    log("info", "auto-scan", { ticker, tag: r.tag, grade: r.grade ?? null, reason: "no snapshot yet" });
+    delete st.scanFail[ticker];
+    saveState(st);
+    return Boolean(vd.latestSnapshot(ticker));
+  }
+  st.scanFail[ticker] = Date.now();
+  saveState(st);
+  log("error", "auto-scan-failed", {
+    ticker, error: r?.error || "scan produced no snapshot",
+    note: `backing off ${backoffMin}m for this ticker`,
+  });
+  return false;
+}
+
 // ---- ENTER: trigger + flow gated auto-buy ---------------------------------
 async function enter(cfg) {
   const a = cfg.automation;
@@ -167,6 +199,8 @@ async function enter(cfg) {
 
     try {
       const side = plan.get(ticker) || "long";
+      // No snapshot -> scan now rather than failing every tick.
+      if (!(await ensureSnapshot(ticker, cfg, st))) continue;
       const conviction = await flow.getConviction(ticker, cfg);
       const decision = flow.decideForTrade(conviction, cfg, side);
 
@@ -305,6 +339,20 @@ export function dataHealth(cfg = flow.loadConfig()) {
 // Boot: auto-start only if the config was left enabled.
 export function boot() {
   const cfg = flow.loadConfig();
+  // Overnight (or any downtime) the broker kept living while we didn't. Sync the
+  // local store to reality BEFORE the loop starts managing anything, so we never
+  // chase a position that no longer exists or ignore one that silently filled.
+  reconcile.reconcile({ apply: true })
+    .then((r) => {
+      log(r.untracked.length || r.phantomsClosed.length ? "error" : "info",
+        "reconciled-with-broker", {
+          summary: reconcile.summarize(r),
+          ...(r.phantomsClosed.length ? { closed: r.phantomsClosed.map((x) => `${x.ticker}:${x.orderStatus || "?"}`).join(" ") } : {}),
+          ...(r.entriesResolved.length ? { entries: r.entriesResolved.map((x) => `${x.ticker}:${x.action}`).join(" ") } : {}),
+          ...(r.untracked.length ? { untracked: r.untracked.map((x) => `${x.symbol}x${x.qty}`).join(" ") } : {}),
+        });
+    })
+    .catch((e) => log("error", "reconcile-failed", { error: String(e.message || e) }));
   try {
     const h = dataHealth(cfg);
     if (h.needsUpload) log("error", "needs-flow-upload", { message: h.message, observing: h.observing });

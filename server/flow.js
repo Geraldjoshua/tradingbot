@@ -18,12 +18,12 @@ import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import * as uw from "./unusualwhales.js";
+import { pythonPath } from "./pythonPath.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CONFIG_PATH = path.join(ROOT, "server", "autotrader.config.json");
-const PY = fs.existsSync(path.join(ROOT, ".venv/bin/python"))
-  ? path.join(ROOT, ".venv/bin/python")
-  : "python3";
+// Cross-platform (Windows venv lives in Scripts\, not bin/) — see pythonPath.js
+const PY = pythonPath();
 
 const DEFAULTS = {
   automation: {
@@ -50,7 +50,7 @@ const DEFAULTS = {
     acceptTags: ["CONFIRMED"],            // tradeable today
     seedTags: ["CONFIRMED", "PENDING"],   // worth observing
     minGrade: 0, seedMinGrade: 0,
-    maxDte: 45, requireDeltaBalance: true, exclude: [],
+    maxDte: 45, requireDeltaBalance: true, exclude: [], scanRetryMin: 30,
   },
   flow: {
     enabled: true, mode: "size",

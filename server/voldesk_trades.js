@@ -393,6 +393,30 @@ export async function evaluatePositions() {
 
 export function listAll() { return load(); }
 
+// ---- Store maintenance (used by reconcile.js) -----------------------------
+// Deliberately narrow: set a terminal status, or patch a few fields. Kept here so
+// all writes to the store go through one module.
+export function markStatus(id, status, reason) {
+  const rows = load();
+  const p = rows.find((x) => x.id === id);
+  if (!p) return null;
+  p.status = status;
+  p.exitReason = reason || p.exitReason || status.toLowerCase();
+  p.exitDate = p.exitDate || iso(new Date());
+  p.reconciledAt = new Date().toISOString();
+  persist(rows);
+  return p;
+}
+
+export function patchPosition(id, fields = {}) {
+  const rows = load();
+  const p = rows.find((x) => x.id === id);
+  if (!p) return null;
+  Object.assign(p, fields, { reconciledAt: new Date().toISOString() });
+  persist(rows);
+  return p;
+}
+
 // ---- Exit ----------------------------------------------------------------
 export async function exitTrade({ id, reason = "manual" }) {
   const rows = load();

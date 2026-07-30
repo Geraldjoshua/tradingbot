@@ -20,7 +20,7 @@ export default function App() {
         <button className={`tab ${tab === "gex" ? "active" : ""}`} onClick={() => setTab("gex")}>GEX</button>
         <button className={`tab ${tab === "voldesk" ? "active" : ""}`} onClick={() => setTab("voldesk")}>Vol Desk</button>
         <button className={`tab ${tab === "auto" ? "active" : ""}`} onClick={() => setTab("auto")}>Auto-trader</button>
-        <button className={`tab ${tab === "flow" ? "active" : ""}`} onClick={() => setTab("flow")}>Flow upload</button>
+        <button className={`tab ${tab === "flow" ? "active" : ""}`} onClick={() => setTab("flow")}>Flow</button>
       </div>
       {tab === "backtest" ? <FaberView /> : tab === "paper" ? <PaperTradingView /> :
        tab === "gex" ? <GexView /> : tab === "voldesk" ? <VolDeskView /> :

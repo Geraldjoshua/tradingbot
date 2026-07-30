@@ -208,11 +208,18 @@ def main():
         # max/min of NET gex (the old way) returns the least-negative far strike
         # on put-heavy names — that is how a "call wall" ended up below spot.
         cw, pw, wall_notes = gc.pick_walls(per, spot)
-        if cw is None or pw is None:
-            print(json.dumps({"ticker": ticker,
-                              "error": "could not locate walls on both sides of spot after sanity filters",
-                              "notes": wall_notes}))
-            return
+        # pick_walls degrades rather than failing, but a chain can still be
+        # one-sided (no strikes at all above or below spot). Synthesise a level a
+        # sensible distance away and flag it — a missing wall must never abort the
+        # scan, because no snapshot means the trader can never act on this name.
+        if cw is None:
+            synth = round(spot * 1.05, 2)
+            cw = {"strike": synth, "gex": 0, "oi": 0}
+            wall_notes.append(f"no call strikes above spot — synthesised +5% ({synth})")
+        if pw is None:
+            synth = round(spot * 0.95, 2)
+            pw = {"strike": synth, "gex": 0, "oi": 0}
+            wall_notes.append(f"no put strikes below spot — synthesised -5% ({synth})")
         call_wall = (cw["strike"], cw["gex"])
         put_wall = (pw["strike"], pw["gex"])
         cotmc = cw_num / cw_den if cw_den else spot
@@ -327,6 +334,7 @@ def main():
             "flipFound": flip_found,
             "flipNote": flip_detail.get("reason"),
             "ivDropped": iv_dropped,
+            "wallNotes": wall_notes,
             "levels": {"pTrans": pTrans, "nTrans": nTrans, "zeroGEX": zeroGEX,
                        "plusGEX_T1": plus_gex, "T2": t2, "COTMP": round(cotmp, 2), "COTMC": round(cotmc, 2)},
             "db": round(db, 4), "prior_db": prior_db,

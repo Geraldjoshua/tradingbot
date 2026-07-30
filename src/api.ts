@@ -74,6 +74,9 @@ export const getFlow = (ticker: string, side: "long" | "short" = "long") =>
 
 export const runDiscovery = () => j<any>("/api/discovery");
 export const runDiagnostics = (probe = "SPY") => j<any>(`/api/diagnostics?probe=${probe}`);
+export const getLocal = () => j<any>("/api/local");
+export const localRebuild = () => post("/api/local/rebuild", {});
+export const reconcileNow = (dry = false) => j<any>(`/api/reconcile${dry ? "?dry=1" : ""}`);
 
 // ---- Nightly flow upload + observe list ----------------------------------
 export const uploadFlowFile = (file: File) =>

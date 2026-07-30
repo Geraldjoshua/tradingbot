@@ -28,12 +28,12 @@ import { fileURLToPath } from "url";
 import * as flow from "./flow.js";
 import * as alpaca from "./alpaca.js";
 import * as playbook from "./playbook.js";
+import { pythonPath } from "./pythonPath.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STORE = path.join(ROOT, "data", "observe_list.json");
-const PY = fs.existsSync(path.join(ROOT, ".venv/bin/python"))
-  ? path.join(ROOT, ".venv/bin/python")
-  : "python3";
+// Cross-platform (Windows venv lives in Scripts\, not bin/) — see pythonPath.js
+const PY = pythonPath();
 
 export const DEFAULTS = {
   maxObserving: 25,          // cap the list so daily assessment stays cheap

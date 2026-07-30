@@ -60,7 +60,11 @@ IV_ABS_MAX = 3.00      # 300% — above this is almost always bad Yahoo data
 IV_REL_MAX = 3.0       # reject IV > 3x that expiry's ATM IV
 IV_REL_MIN = 0.25      # reject IV < 0.25x that expiry's ATM IV
 WALL_MIN_OI = 100      # a strike needs this much OI to define a wall
-WALL_BAND_PCT = 0.20   # walls must sit within +/-20% of spot
+WALL_BAND_PCT = 0.20   # preferred band for walls (relaxed automatically if empty)
+# The relative-IV filter must never gut a chain — if it would keep fewer than
+# this, we assume the ATM baseline was bad and fall back to the absolute filter.
+MIN_KEEP = 8
+MIN_KEEP_FRACTION = 0.25
 
 
 def norm_pdf(x):
@@ -99,13 +103,23 @@ def sanitize_expiry(rows, spot):
     out = keep
     dropped_rel = 0
     if atm_iv and atm_iv > 0:
-        out = []
+        filtered = []
         for r in keep:
             ratio = r[2] / atm_iv
             if IV_REL_MIN <= ratio <= IV_REL_MAX:
-                out.append(r)
+                filtered.append(r)
             else:
                 dropped_rel += 1
+        # SAFETY VALVE: the relative filter exists to remove a few garbage prints,
+        # not to gut the chain. If it would drop most of the expiry, the baseline
+        # ATM IV was probably itself bad — trust the absolute filter instead and
+        # keep everything, rather than returning a chain too sparse to locate
+        # walls (which used to abort the whole scan).
+        if len(filtered) >= max(MIN_KEEP, int(len(keep) * MIN_KEEP_FRACTION)):
+            out = filtered
+        else:
+            out = keep
+            dropped_rel = 0
     return out, {
         "atmIv": round(atm_iv, 4) if atm_iv else None,
         "droppedAbs": len(rows) - len(keep),
@@ -141,22 +155,45 @@ def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI):
     Returns (call_wall, put_wall, note) where each wall is
     {"strike", "gex", "oi"} or None when nothing qualifies.
     """
-    lo, hi = spot * (1 - band_pct), spot * (1 + band_pct)
     notes = []
 
     def best(side, predicate, key):
-        cands = [(K, e) for K, e in per.items()
-                 if predicate(K) and lo <= K <= hi and e[f"{side}Oi"] >= min_oi]
-        if not cands:
-            # Relax the OI floor before giving up — thin names legitimately have
-            # low OI and should still get a level, just flagged.
-            cands = [(K, e) for K, e in per.items() if predicate(K) and lo <= K <= hi]
-            if cands:
-                notes.append(f"{side} wall below OI floor {min_oi}")
-        if not cands:
-            notes.append(f"no {side} strikes within {int(band_pct*100)}% {'above' if side=='call' else 'below'} spot")
+        """Degrade gracefully rather than fail closed.
+
+        An earlier version returned None the moment the preferred band+OI filter
+        came up empty, and voldesk.py treated that as a fatal error — so a single
+        thin chain aborted the whole scan, no snapshot was written, and every
+        entry attempt failed forever. Wall selection must never be able to kill a
+        scan: try progressively looser criteria and only give up if there is
+        genuinely no strike on that side of spot.
+        """
+        on_side = [(K, e) for K, e in per.items() if predicate(K)]
+        if not on_side:
+            notes.append(f"no {side} strikes {'above' if side == 'call' else 'below'} spot at all")
             return None
-        K, e = max(cands, key=key)
+
+        attempts = [
+            (band_pct, min_oi, None),
+            (band_pct, 0, f"{side} wall below OI floor {min_oi}"),
+            (band_pct * 2, 0, f"{side} wall outside {int(band_pct*100)}% band"),
+            (None, 0, f"{side} wall unrestricted (thin/unusual chain)"),
+        ]
+        for band, oi_floor, note in attempts:
+            if band is None:
+                cands = [(K, e) for K, e in on_side if e[f"{side}Oi"] >= oi_floor]
+            else:
+                lo, hi = spot * (1 - band), spot * (1 + band)
+                cands = [(K, e) for K, e in on_side
+                         if lo <= K <= hi and e[f"{side}Oi"] >= oi_floor]
+            if cands:
+                if note:
+                    notes.append(note)
+                K, e = max(cands, key=key)
+                return {"strike": K, "gex": round(e[side] if side == "call" else -e[side], 0),
+                        "oi": int(e[f"{side}Oi"])}
+        # on_side was non-empty, so the last attempt cannot fail — belt and braces.
+        K, e = max(on_side, key=key)
+        notes.append(f"{side} wall fallback")
         return {"strike": K, "gex": round(e[side] if side == "call" else -e[side], 0),
                 "oi": int(e[f"{side}Oi"])}
 

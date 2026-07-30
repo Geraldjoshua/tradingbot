@@ -36,8 +36,11 @@ URL = "https://optionstrat.com/flow/live"
 PROFILE_DIR = os.environ.get("OPTIONSTRAT_PROFILE_DIR", "optionstrat_profile")
 POLL_SECONDS = int(os.environ.get("SCRAPER_POLL_SECONDS", "3"))
 STALE_RELOAD_SECONDS = int(os.environ.get("SCRAPER_STALE_SECONDS", "180"))
-# Headless by default (required in a container — there is no display).
-HEADLESS = os.environ.get("SCRAPER_HEADLESS", "true").lower() not in ("0", "false", "no")
+# ALWAYS headless. Deliberately NOT env-overridable: a visible browser window is
+# never wanted — it steals focus, and on a laptop you'd eventually close it by
+# accident and silently kill the feed. If OptionStrat ever serves a blank page to
+# headless, the answer is the fingerprint hardening further down, not a window.
+HEADLESS = True
 # Where day-CSVs are written. In a container this points at a writable volume.
 OUT_DIR = os.environ.get("OPTIONSTRAT_DIR", ".")
 
@@ -217,7 +220,9 @@ def main():
                           "f": f, "w": w, "seen": seen,
                           "filter": t["filter"], "last_added": time.time()})
 
-        print("Scraping all feeds… Ctrl+C to stop.")
+        print(f"Scraping {len(feeds)} feed(s), headless. Ctrl+C to stop.", flush=True)
+        last_heartbeat = time.time()
+        HEARTBEAT_SECONDS = 120
         try:
             while True:
                 now = today_str()
@@ -238,6 +243,7 @@ def main():
                     except Exception:
                         rows = []
                     added = 0
+                    new_names = []
                     for r in rows:
                         k = row_key(r)
                         if k in fd["seen"]:
@@ -245,11 +251,16 @@ def main():
                         fd["seen"].add(k)
                         r["captured"] = stamp
                         fd["w"].writerow(r)
+                        new_names.append(r["ticker"])
                         added += 1
                     if added:
                         fd["f"].flush()
                         fd["last_added"] = time.time()
-                        print(f"[{fd['label']}] +{added} (today {len(fd['seen'])})")
+                        # Print the tickers just captured, not only a count — you can
+                        # then see at a glance that the feed is live and sane.
+                        names = ", ".join(dict.fromkeys(new_names))[:110]
+                        print(f"[{fd['label']}] +{added} rows (session {len(fd['seen'])})"
+                              + (f"  | {names}" if names else ""), flush=True)
                     # Watchdog: if a feed has added nothing for a while, the live
                     # stream likely stalled — reload the page and re-apply its filter.
                     elif time.time() - fd["last_added"] > STALE_RELOAD_SECONDS:
@@ -263,6 +274,12 @@ def main():
                         except Exception as e:
                             print(f"[{fd['label']}] reload failed: {e}")
                         fd["last_added"] = time.time()   # reset so we don't reload every poll
+                # Heartbeat — proves the loop is alive when the tape is quiet, so
+                # "no output" never has to mean "is it hung?".
+                if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
+                    tally = "  ".join(f"{fd['label']}={len(fd['seen'])}" for fd in feeds)
+                    print(f"[heartbeat {datetime.now().strftime('%H:%M:%S')}] rows captured: {tally}", flush=True)
+                    last_heartbeat = time.time()
                 day = now
                 time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:

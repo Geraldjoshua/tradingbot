@@ -16,11 +16,13 @@ import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
 import * as diagnostics from "./diagnostics.js";
 import { startKeepAlive, notePing, pingStatus } from "./keepalive.js";
+import * as localMode from "./local_mode.js";
+import * as reconcileMod from "./reconcile.js";
+import { pythonPath } from "./pythonPath.js";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PY = fs.existsSync(path.join(PROJECT_ROOT, ".venv/bin/python"))
-  ? path.join(PROJECT_ROOT, ".venv/bin/python")
-  : "python3";
+// Cross-platform (Windows venv lives in Scripts\, not bin/) — see pythonPath.js
+const PY = pythonPath();
 
 // Run a python script, resolve parsed-JSON stdout (or reject with stderr).
 function runPy(script, args) {
@@ -212,11 +214,8 @@ app.get("/api/gex", (req, res) => {
   const maxExp = String(parseInt(req.query.maxExpiries) || 4);
   const maxDte = String(parseInt(req.query.maxDte) || 45);
 
-  const venvPy = path.join(PROJECT_ROOT, ".venv/bin/python");
-  const py = fs.existsSync(venvPy) ? venvPy : "python3";
   const script = path.join(PROJECT_ROOT, "gex", "gex.py");
-
-  const child = spawn(py, [script, symbol, maxExp, maxDte]);
+  const child = spawn(PY, [script, symbol, maxExp, maxDte]);
   let out = "", errout = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (errout += d));
@@ -331,6 +330,33 @@ app.get("/api/flow", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ---- Reconcile with the broker (also runs automatically on boot) ----------
+app.get("/api/reconcile", async (req, res) => {
+  try { res.json(await reconcileMod.reconcile({ apply: req.query.dry !== "1" })); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Local mode status / manual ingest ------------------------------------
+app.get("/api/local", (_req, res) => {
+  try {
+    res.json(process.env.LOCAL_MODE === "1"
+      ? localMode.localStatus()
+      : { enabled: false, note: "not running in local mode (started via npm start?)" });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/local/rebuild", async (_req, res) => {
+  try {
+    if (process.env.LOCAL_MODE !== "1") return res.status(400).json({ error: "not in local mode" });
+    res.json(await localMode.triggerRebuild());
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/local/ingest", (_req, res) => {
+  try {
+    if (process.env.LOCAL_MODE !== "1") return res.status(400).json({ error: "not in local mode" });
+    res.json(localMode.triggerIngest());
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ---- Diagnostics: why is discovery finding nothing? -----------------------
 app.get("/api/diagnostics", async (req, res) => {
   try { res.json(await diagnostics.run({ probe: String(req.query.probe || "SPY").toUpperCase() })); }
@@ -396,9 +422,16 @@ app.post("/api/flow-ingest", async (req, res) => {
       cacheInfo = { tickers: Object.keys(blob.tickers || {}).length, generated: blob.generated || null };
     }
 
-    // 2. delete the bulky uploads — the cache is all we need from here on
+    // 2. delete the bulky uploads — the cache is all we need from here on.
+    //
+    // CRITICAL EXCEPTION: in LOCAL MODE this same folder is the scraper's working
+    // directory, and flow_master.xlsx is its ACCUMULATED history that the master
+    // builder appends to every day. Deleting it would silently destroy weeks of
+    // captured flow. So locally we never delete — only a cloud upload (where the
+    // workbook really is just a transport artifact) gets cleaned up.
+    const isLocal = process.env.LOCAL_MODE === "1";
     const deleted = [];
-    if (!keep) {
+    if (!keep && !isLocal) {
       for (const f of before) {
         try { fs.unlinkSync(path.join(dir, f)); deleted.push(f); } catch {}
       }
@@ -414,8 +447,10 @@ app.post("/api/flow-ingest", async (req, res) => {
     const seeded = observe.seed(disc.watch || disc.qualified || [], cfg);
 
     res.json({
-      ok: true, dir,
-      filesProcessed: before, filesDeleted: deleted,
+      ok: true, dir, localMode: isLocal,
+      filesProcessed: before,
+      filesDeleted: deleted,
+      ...(isLocal ? { keptReason: "local mode — masters are the scraper's accumulated history, never deleted" } : {}),
       cache: cacheInfo, buildOutput: built || null,
       discovery: {
         sources: disc.sources || [], considered: disc.considered ?? 0,
@@ -587,4 +622,9 @@ app.listen(PORT, "0.0.0.0", () => {
   try { autotrader.boot(); } catch (e) { console.error("[autotrader] boot failed:", e.message); }
   // Free-plan anti-idle self-ping (helper only; see keepalive.js).
   try { startKeepAlive(); } catch (e) { console.error("[keepalive] failed:", e.message); }
+  // LOCAL MODE: also run the scraper + auto-ingest in this process (npm start).
+  if (process.env.LOCAL_MODE === "1") {
+    try { localMode.startLocalMode(); } catch (e) { console.error("[local] failed:", e.message); }
+    console.log(`\n  ▶  Open  http://localhost:${PORT}\n`);
+  }
 });
