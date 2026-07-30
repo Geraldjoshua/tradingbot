@@ -36,7 +36,7 @@ const DEFAULTS = {
     enabled: true, shadowMode: false,
     sources: { optionstrat: true, unusualwhales: false },
     uwFallbackOnly: true, everyMinutes: 30,
-    maxScan: 8, scanConcurrency: 2,
+    maxScan: 8, scanConcurrency: 2, scanStaggerMs: 400,
     minPremium: 250000, minScore: 0.3,
     normalize: "marketcap", minTierScore: 1.0, maxTierScore: 20,
     keepUnsized: false, dollarVolRefBps: 20,

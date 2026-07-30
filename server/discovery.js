@@ -259,16 +259,22 @@ async function volDeskScan(ticker, cfg) {
 // Scan with limited concurrency (Yahoo is rate-limited and free dynos are small).
 async function scanAll(tickers, cfg) {
   const out = [];
+  // Paced, not bursty — see the note in server/index.js. Yahoo throttles on
+  // request RATE, so concurrency alone isn't the knob; the stagger matters too.
   const conc = Math.max(1, Math.min(cfg.discovery.scanConcurrency || 2, 4));
+  const staggerMs = cfg.discovery.scanStaggerMs ?? 400;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let i = 0;
-  async function worker() {
+  async function worker(slot) {
+    await sleep(slot * staggerMs);
     while (i < tickers.length) {
       const t = tickers[i++];
       const r = await volDeskScan(t, cfg);
       out.push(r && !r.error ? { ticker: t, ...r } : { ticker: t, error: r?.error || "scan failed" });
+      if (i < tickers.length) await sleep(staggerMs);
     }
   }
-  await Promise.all(Array.from({ length: conc }, worker));
+  await Promise.all(Array.from({ length: conc }, (_, k) => worker(k)));
   return out;
 }
 

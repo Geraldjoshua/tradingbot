@@ -91,11 +91,58 @@ def load_prior(data_dir, ticker):
     return priors  # chronological
 
 
-def regime(yf):
+# ---- Yahoo rate-limit protection -------------------------------------------
+# Every ticker scan used to re-fetch SPY, QQQ and ^VIX for the regime read. Those
+# three values are IDENTICAL for every ticker in a run, so scanning 24 names fired
+# 72 redundant requests and Yahoo (correctly) started returning
+# YFRateLimitError: Too Many Requests — which showed up as a wall of ERR rows.
+#
+# Fix: cache the regime on disk with a short TTL, and retry individual Yahoo calls
+# with exponential backoff when we do get throttled.
+REGIME_TTL_SECONDS = int(os.environ.get("REGIME_TTL_SECONDS", "900"))   # 15 min
+YF_RETRIES = int(os.environ.get("YF_RETRIES", "3"))
+YF_BACKOFF_BASE = float(os.environ.get("YF_BACKOFF_BASE", "1.5"))
+
+
+def _is_rate_limit(exc):
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    return "ratelimit" in name or "too many requests" in msg or "429" in msg
+
+
+def yf_retry(fn, what="yahoo call"):
+    """Run a Yahoo call, backing off on rate limits. Re-raises anything else."""
+    import time as _t
+    last = None
+    for attempt in range(YF_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if not _is_rate_limit(e) or attempt == YF_RETRIES - 1:
+                raise
+            wait = YF_BACKOFF_BASE ** (attempt + 1)
+            print(f"[voldesk] rate-limited on {what}, retry {attempt+1}/{YF_RETRIES-1} in {wait:.1f}s",
+                  file=sys.stderr)
+            _t.sleep(wait)
+    raise last
+
+
+def regime(yf, data_dir=None):
+    """Market regime read, CACHED — identical for every ticker in a run."""
+    import time as _t
+    cache_path = os.path.join(data_dir or ".", "_regime_cache.json")
+    try:
+        blob = json.load(open(cache_path))
+        if _t.time() - blob.get("ts", 0) < REGIME_TTL_SECONDS:
+            return blob["regime"]
+    except Exception:
+        pass
+
     out = {}
     for sym in ("SPY", "QQQ", "^VIX"):
         try:
-            h = yf.Ticker(sym).history(period="5d")
+            h = yf_retry(lambda: yf.Ticker(sym).history(period="5d"), f"regime {sym}")
             if len(h) >= 2:
                 chg = (h["Close"].iloc[-1] / h["Close"].iloc[-2] - 1) * 100
                 out[sym] = round(float(chg), 2)
@@ -103,7 +150,7 @@ def regime(yf):
             out[sym] = None
     basket = (out.get("SPY") or -9) > 0.5 or (out.get("QQQ") or -9) > 0.5
     vix_ok = (out.get("^VIX") if out.get("^VIX") is not None else 9) < 0  # vol down = bullish
-    return {
+    result = {
         "spy_chg": out.get("SPY"), "qqq_chg": out.get("QQQ"), "vix_chg": out.get("^VIX"),
         "basket_gate": bool(basket),
         "vix_gate": bool(vix_ok),
@@ -111,6 +158,13 @@ def regime(yf):
         "gates_passed": int(bool(basket)) + int(bool(vix_ok)),
         "gates_note": "bull:bear across 700 names not computed (needs universe); basket+vix only",
     }
+    # Persist so sibling ticker scans in this run reuse it instead of refetching.
+    try:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        json.dump({"ts": _t.time(), "regime": result}, open(cache_path, "w"))
+    except Exception:
+        pass
+    return result
 
 
 def main():
@@ -132,7 +186,7 @@ def main():
 
     try:
         tk = yf.Ticker(ticker)
-        hist = tk.history(period="1y")
+        hist = yf_retry(lambda: tk.history(period="1y"), f"{ticker} history")
         if hist.empty:
             print(json.dumps({"error": f"no price history for {ticker}"}))
             return
@@ -141,7 +195,7 @@ def main():
         spot = closes[-1]
 
         # ---- option chain -> per-strike GEX ----
-        exps = list(tk.options)
+        exps = yf_retry(lambda: list(tk.options), f"{ticker} expiries")
         now = datetime.now(timezone.utc)
         chosen = []
         for e in exps:
@@ -162,7 +216,7 @@ def main():
         cw_num = cw_den = pw_num = pw_den = 0.0
         iv_dropped = 0
         for e, d in chosen:
-            oc = tk.option_chain(e)
+            oc = yf_retry(lambda: tk.option_chain(e), f"{ticker} chain {e}")
             T = d / 365.0
             rows = []
             for df, is_call in ((oc.calls, True), (oc.puts, False)):
@@ -346,7 +400,7 @@ def main():
             "spike_crash": spike_crash,
             "call_oi": int(call_oi), "put_oi": int(put_oi), "total_gex": round(total_gex, 0),
             "filters": filters, "filter_reasons": reasons,
-            "regime": regime(yf),
+            "regime": regime(yf, data_dir),
             "require_db": require_db,
             "tag": tag,
         }

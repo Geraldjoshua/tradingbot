@@ -238,17 +238,26 @@ app.post("/api/voldesk", async (req, res) => {
     if (!tickers.length) return res.status(400).json({ error: "no tickers" });
     const dataDir = path.join(PROJECT_ROOT, "data", "voldesk");
 
-    // Scan up to 4 tickers at once (gentle on Yahoo) instead of one-at-a-time.
+    // Yahoo rate-limits hard. Each ticker costs ~6 requests, so 4 concurrent
+    // workers with no pacing produced a burst that came back as
+    // "YFRateLimitError: Too Many Requests" on most of the batch. Two workers
+    // plus a small stagger keeps the request rate under Yahoo's threshold; the
+    // scan takes longer but actually returns data.
+    const conc = Math.max(1, parseInt(process.env.VOLDESK_CONCURRENCY || "2", 10));
+    const staggerMs = Math.max(0, parseInt(process.env.VOLDESK_STAGGER_MS || "400", 10));
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const results = new Array(tickers.length);
     let idx = 0;
-    async function worker() {
+    async function worker(slot) {
+      await sleep(slot * staggerMs);                      // don't all start at once
       while (idx < tickers.length) {
         const i = idx++;
         try { results[i] = await runPy("gex/voldesk.py", [tickers[i], dataDir, maxDte, requireDb]); }
         catch (e) { results[i] = { ticker: tickers[i], error: String(e.message || e) }; }
+        if (idx < tickers.length) await sleep(staggerMs);
       }
     }
-    await Promise.all(Array.from({ length: Math.min(4, tickers.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(conc, tickers.length) }, (_, k) => worker(k)));
 
     // Rank: CONFIRMED first, then PENDING, then BLOCKED/error — and WITHIN each
     // group by a setup-quality score so the strongest setups are at the very top.
