@@ -135,6 +135,37 @@ export async function getOrders(status = "open") {
 export async function placeOrder(body) {
   return req(`${TRADE}/v2/orders`, { method: "POST", body: JSON.stringify(body) });
 }
+export async function getOrder(id) {
+  return req(`${TRADE}/v2/orders/${id}`);
+}
+
+// Wait for an order to reach a terminal state and return the REAL fill price.
+//
+// Why this exists: entry/exit prices were previously recorded as the quoted MID
+// at the moment we placed the order. On a wide options spread the mid can sit
+// dollars away from where a marketable limit actually fills, so every P&L figure
+// was an estimate of an estimate — badly enough that a losing trade could be
+// reported as a winner. Alpaca knows the truth; ask it.
+export async function waitForFill(id, { timeoutMs = 20000, pollMs = 1000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      last = await getOrder(id);
+      const filled = parseFloat(last.filled_avg_price);
+      if (last.status === "filled" && Number.isFinite(filled) && filled > 0) {
+        return { filled: true, price: filled, qty: parseFloat(last.filled_qty) || 0, status: last.status };
+      }
+      if (["canceled", "expired", "rejected"].includes(last.status)) {
+        return { filled: false, price: null, qty: 0, status: last.status };
+      }
+    } catch { /* transient — keep polling */ }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  // Still working (normal off-hours). Caller keeps its estimate and reconcile
+  // will correct it on the next boot.
+  return { filled: false, price: null, qty: 0, status: last?.status || "pending", timedOut: true };
+}
 export async function cancelOrder(id) {
   return req(`${TRADE}/v2/orders/${id}`, { method: "DELETE" });
 }

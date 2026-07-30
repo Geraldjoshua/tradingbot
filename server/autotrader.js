@@ -24,6 +24,7 @@ import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
 import { pingStatus } from "./keepalive.js";
 import * as reconcile from "./reconcile.js";
+import * as working from "./working_orders.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOG = path.join(ROOT, "data", "autotrader_log.json");
@@ -70,6 +71,25 @@ function marketOpen(now = new Date()) {
   return min >= 570 && min < 960; // 09:30 .. 16:00
 }
 
+// ---- Patient ladders: step them along, open positions when they fill --------
+async function advanceWorkingOrders(cfg) {
+  try {
+    const events = await working.process(cfg, {
+      onFilled: async (w) => {
+        if (w.kind !== "entry") return;
+        const pos = vd.createPositionFromFill(w);
+        try { observe.markEntered(w.ticker, pos.id); } catch {}
+      },
+    });
+    for (const e of events) {
+      const level = e.event === "working-filled" ? "trade" : e.error ? "error" : "info";
+      log(level, e.event, Object.fromEntries(Object.entries(e).filter(([k]) => k !== "event")));
+    }
+  } catch (e) {
+    log("error", "working-orders-failed", { error: String(e.message || e) });
+  }
+}
+
 // ---- MANAGE: auto take-profit + auto-stop ---------------------------------
 async function manage(cfg) {
   let positions = [];
@@ -77,14 +97,25 @@ async function manage(cfg) {
   for (const p of positions) {
     try {
       if (p.action === "EXIT") {
-        const r = await vd.exitTrade({ id: p.id, reason: `auto: ${p.reason}` });
-        log("trade", "auto-exit-stop", { ticker: p.ticker, id: p.id, status: r.status, reason: p.reason });
+        const r = await vd.exitTrade({ id: p.id, reason: `auto: ${p.reason}`, urgency: "urgent" });
+        log("trade", "auto-exit-stop", {
+          ticker: p.ticker, id: p.id, status: r.status,
+          realizedPnl: r.realizedPnl ?? null,
+          ...(r.pnlIsEstimate ? { note: "P&L estimated — a leg had not filled yet" } : {}),
+          reason: p.reason,
+        });
       } else if (p.action === "T1_HIT") {
         if (cfg.automation.t1Action === "lock-and-ride") {
           if (!p.lockedToBreakeven) { vd.lockToBreakeven({ id: p.id }); log("trade", "auto-lock-be", { ticker: p.ticker, id: p.id, t1: p.t1 }); }
         } else {
-          const r = await vd.exitTrade({ id: p.id, reason: `auto: T1 take-profit @${p.t1}` });
-          log("trade", "auto-take-profit", { ticker: p.ticker, id: p.id, status: r.status, t1: p.t1, optPnl: p.optPnl });
+          const r = await vd.exitTrade({ id: p.id, reason: `auto: T1 take-profit @${p.t1}`, urgency: "patient" });
+          // realizedPnl comes from ACTUAL fills; optPnl was a mid-price estimate.
+          log("trade", "auto-take-profit", {
+            ticker: p.ticker, id: p.id, status: r.status, t1: p.t1,
+            realizedPnl: r.realizedPnl ?? null,
+            estimateWas: p.optPnl ?? null,
+            ...(r.pnlIsEstimate ? { note: "P&L estimated — a leg had not filled yet" } : {}),
+          });
         }
       }
     } catch (e) {
@@ -209,7 +240,15 @@ async function enter(cfg) {
         flowDecision: { conviction, decision },
       });
 
-      if (r.status === "ENTERED") {
+      if (r.status === "WORKING") {
+        // Ladder started — not a position yet. Count it against the daily cap so
+        // we don't queue five ladders at once, and let the loop work it.
+        st.entries++; st.cooldown[ticker] = now; saveState(st);
+        log("trade", "entry-working", {
+          ticker, side, contracts: r.contracts,
+          firstRung: r.firstRungPrice, note: r.note,
+        });
+      } else if (r.status === "ENTERED") {
         openCount++; openTickers.add(ticker);
         st.entries++; st.cooldown[ticker] = now; saveState(st);
         try { observe.markEntered(ticker, r.position?.id); } catch {}   // off the list, it's a position now
@@ -224,7 +263,13 @@ async function enter(cfg) {
         // NOT_TRIGGERED / FLOW_BLOCKED — normal, quiet. Cooldown so we don't
         // re-price the same reject every single poll.
         st.cooldown[ticker] = now; saveState(st);
-        log("info", "entry-skip", { ticker, status: r.status, note: r.note || decision.stance });
+        log("info", "entry-skip", {
+          ticker, side, status: r.status,
+          ...(r.status === "NOT_CONFIRMED"
+            ? { tag: r.tag, grade: r.grade, blockers: (r.blockers || []).join(",") }
+            : {}),
+          note: r.note || decision.stance,
+        });
       }
     } catch (e) {
       log("error", "entry-failed", { ticker, error: String(e.message || e) });
@@ -280,6 +325,9 @@ async function tick() {
   try {
     const cfg = flow.loadConfig();
     if (!cfg.automation.enabled) { stop(true); return; }
+    // Advance any patient ladders FIRST — they're non-blocking, so this is quick,
+    // and a fill here should be managed in the same tick.
+    await advanceWorkingOrders(cfg);
     await manage(cfg);                            // always manage exits
     await maybeAssess(cfg);                       // re-vet the observe list (once/day)
     await enter(cfg);                             // enter only in full + hours

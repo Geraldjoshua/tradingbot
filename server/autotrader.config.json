@@ -144,5 +144,27 @@
   },
   "risk": {
     "basePremium": 300
+  },
+  "entry": {
+    "requireTag": [
+      "CONFIRMED"
+    ],
+    "minGrade": 0
+  },
+  "execution": {
+    "enabled": true,
+    "patient": {
+      "steps": 4,
+      "stepSeconds": 90,
+      "startAtMidPct": 0.0
+    },
+    "maxWorkingMinutes": 12,
+    "urgent": {
+      "steps": 2,
+      "stepSeconds": 4,
+      "startAtMidPct": 0.5
+    },
+    "maxTotalSeconds": 20,
+    "minTickSize": 0.01
   }
 }

@@ -74,6 +74,21 @@ const DEFAULTS = {
     minDelta: 0.35, maxDelta: 0.90,
     requireBreakevenBelowTarget: true, riskFreeRate: 0.04,
   },
+  // Order execution — how hard we work to avoid paying the bid/ask spread.
+  execution: {
+    enabled: true,
+    // PATIENT (entries, take-profits) — non-blocking, worked across ticks by
+    // working_orders.js, so a long dwell costs nothing. 90s x 4 rungs = ~6 min.
+    patient: { steps: 4, stepSeconds: 90, startAtMidPct: 0.0 },
+    maxWorkingMinutes: 12,        // give up and don't trade rather than chase
+    // URGENT (stop-losses) — synchronous and fast. Must fit inside one tick,
+    // because not filling a stop is the expensive outcome.
+    urgent:  { steps: 2, stepSeconds: 4, startAtMidPct: 0.5 },
+    maxTotalSeconds: 20, minTickSize: 0.01,
+  },
+  // Entry quality gate — applies to EVERY entry path (discovery, observe list and
+  // the manual watchlist alike). Previously only discovery names were vetted.
+  entry: { requireTag: ["CONFIRMED"], minGrade: 0 },
   // Which directions the bot may trade. Shorts (puts) are OPT-IN because the
   // bearish playbook is a mirror heuristic with far less forward-testing than
   // the long side — see server/playbook.js.

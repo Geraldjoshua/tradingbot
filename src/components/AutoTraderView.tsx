@@ -9,6 +9,10 @@ export default function AutoTraderView() {
   const [status, setStatus] = useState<any>(null);
   const [cfg, setCfg] = useState<any>(null);
   const [watch, setWatch] = useState("");
+  // True once you start editing the watchlist. The status poll runs every 15s and
+  // used to overwrite the textbox from the server on every tick — so a list long
+  // enough to take >15s to type would be wiped out from under you before saving.
+  const [watchDirty, setWatchDirty] = useState(false);
   const [probe, setProbe] = useState("");
   const [probeRes, setProbeRes] = useState<any>(null);
   const [disc, setDisc] = useState<any>(null);
@@ -20,10 +24,11 @@ export default function AutoTraderView() {
     try {
       const s = await api.autoStatus();
       setStatus(s); setCfg(s.config);
-      setWatch((s.config.automation.watchlist || []).join(", "));
+      // Never clobber what you're in the middle of typing.
+      if (!watchDirty) setWatch((s.config.automation.watchlist || []).join(", "));
     } catch (e: any) { setErr(String(e.message || e)); }
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 15000); return () => clearInterval(t); }, []);
+  useEffect(() => { refresh(); const t = setInterval(refresh, 15000); return () => clearInterval(t); }, [watchDirty]);
 
   async function patch(partial: any) {
     setBusy(true); setErr(null);
@@ -41,7 +46,9 @@ export default function AutoTraderView() {
 
   async function saveWatch() {
     const tickers = watch.split(/[,\s]+/).map((t) => t.trim().toUpperCase()).filter(Boolean);
-    await api.autoSetWatchlist(tickers); await refresh();
+    await api.autoSetWatchlist(tickers);
+    setWatchDirty(false);              // saved — polling may sync it again
+    await refresh();
   }
 
   async function runDisc() {
@@ -376,10 +383,20 @@ export default function AutoTraderView() {
       <div className="card" style={{ marginTop: 16 }}>
         <h3>Watchlist (always-checked, in addition to discovery)</h3>
         <div className="row">
-          <input value={watch} onChange={(e) => setWatch(e.target.value)} style={{ width: 360 }}
-            placeholder="TSLA, NVDA, AAPL" />
-          <button onClick={saveWatch} disabled={busy}>Save</button>
-          <span className="sub">Each must have a fresh Vol Desk snapshot; the loop checks trigger + flow.</span>
+          <input value={watch}
+            onChange={(e) => { setWatch(e.target.value); setWatchDirty(true); }}
+            style={{ width: 360 }} placeholder="TSLA, NVDA, AAPL  (no limit)" />
+          <button onClick={saveWatch} disabled={busy}>
+            {watchDirty ? "Save *" : "Save"}
+          </button>
+          <span className="sub">Scanned automatically if no snapshot exists.</span>
+        </div>
+        <p className="sub" style={{ marginTop: 6 }}>
+          Watchlist names are held to the <b>same standard as discovered ones</b>: the setup must be
+          graded <b>CONFIRMED</b> by Vol Desk, then flow and the intraday trigger must agree.
+          Adding a ticker here says "always check this one" — not "buy this one".
+          Skips appear in the log as <code>NOT_CONFIRMED</code> with the failing filters.
+        </p>
         </div>
       </div>
 

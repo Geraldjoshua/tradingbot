@@ -16,6 +16,8 @@ import * as flow from "./flow.js";
 import * as contractSelect from "./contract_select.js";
 import * as playbook from "./playbook.js";
 import * as shares from "./shares.js";
+import * as execution from "./execution.js";
+import * as working from "./working_orders.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STORE = path.join(ROOT, "data", "voldesk_trades.json");
@@ -131,7 +133,7 @@ async function selectCall(ticker, spot, { dteTarget = 45, moneyness = "ITM" } = 
 // ---- Entry ---------------------------------------------------------------
 // flowDecision (optional) lets a caller (the auto-trader) pass a conviction it
 // already fetched so we don't hit the flow sources twice. If absent we compute it.
-export async function enterTrade({ ticker, riskPremium = 300, force = false, confirm = false, dteTarget = 45, moneyness = "ITM", flowDecision = null, ignoreFlow = false, side = "long" }) {
+export async function enterTrade({ ticker, riskPremium = 300, force = false, confirm = false, dteTarget = 45, moneyness = "ITM", flowDecision = null, ignoreFlow = false, side = "long", ignoreSetup = false }) {
   ticker = ticker.toUpperCase();
   const snap = latestSnapshot(ticker);
   if (!snap) throw new Error(`no snapshot for ${ticker} — run a Vol Desk scan first`);
@@ -144,8 +146,35 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   if (!lv) throw new Error(`snapshot for ${ticker} lacks usable levels`);
   const triggered = playbook.triggerMet(fmc, lv);
 
-  // --- Flow conviction (does the options flow cement a LONG here?) ----------
+  // --- SETUP QUALITY GATE ---------------------------------------------------
+  // This check was missing, and the omission was serious: entry gated ONLY on the
+  // flow decision and the price trigger, never on the Vol Desk verdict. Discovery
+  // candidates had to reach CONFIRMED to be offered at all, but anything placed on
+  // the manual watchlist went straight to the buy path — so the bot would happily
+  // buy a setup its own engine had graded BLOCKED (failing grade, R/R, db_change).
+  // Two sources of trades, two completely different standards.
+  //
+  // Now every entry is held to the same bar. Opt out per-call with ignoreSetup, or
+  // globally with entry.requireTag = [] if you really want the old behaviour.
   const cfg = flow.loadConfig();
+  const requireTags = force ? [] : (cfg.entry?.requireTag ?? ["CONFIRMED"]);
+  const minGrade = cfg.entry?.minGrade ?? 0;
+  if (!ignoreSetup && requireTags.length) {
+    const tagOK = requireTags.includes(snap.tag);
+    const gradeOK = (snap.grade ?? 0) >= minGrade;
+    if (!tagOK || !gradeOK) {
+      return {
+        status: "NOT_CONFIRMED", ticker, side,
+        tag: snap.tag ?? null, grade: snap.grade ?? null,
+        requiredTags: requireTags, minGrade,
+        blockers: snap.filter_reasons || [],
+        note: `Vol Desk graded this ${snap.tag ?? "ungraded"}`
+          + (snap.grade != null ? ` (grade ${snap.grade}/11)` : "")
+          + (snap.filter_reasons?.length ? ` — failing: ${snap.filter_reasons.join(", ")}` : "")
+          + ". Not entering. Use Force/ignoreSetup to override, or loosen entry.requireTag.",
+      };
+    }
+  }
   let conviction = flowDecision?.conviction || null;
   let decision = flowDecision?.decision || null;
   if (!ignoreFlow && !decision) {
@@ -224,9 +253,12 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         trigger: lv.trigger, note: `needs 5-min close ${lv.triggerDir} ${lv.trigger}` };
     }
     const res = await shares.enter({ ticker, side, spot, stop: lv.stop, riskBudget: riskPremium * flowMult, cfg });
+    const sf = await alpaca.waitForFill(res.order.id).catch(() => ({ filled: false, price: null }));
+    const shareEntry = sf.filled && sf.price ? sf.price : +spot.toFixed(2);
     const pos = {
       id: `${ticker}-${Date.now()}`, ticker, side, instrument: "shares",
-      shares: res.sized.shares, entryPrice: +spot.toFixed(2),
+      shares: res.sized.shares, entryPrice: shareEntry,
+      entryQuotedPrice: +spot.toFixed(2), entryFilled: Boolean(sf.filled),
       entryDate: iso(new Date()), entrySpot: +spot.toFixed(2),
       pTrans: snap.levels.pTrans, nTrans: snap.levels.nTrans,
       trigger: lv.trigger, stopLevel: lv.stop, t1: lv.t1, t2: lv.t2,
@@ -287,20 +319,58 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
     return { status: "NOT_TRIGGERED", ticker, side, spot, firstFiveMinClose: fmc, trigger: lv.trigger, note: triggerNote };
   }
 
-  // Marketable LIMIT (a hair through the ask): fills like a market order during
-  // RTH, but — unlike an options market order — is accepted/queued off-hours too.
-  const limitPrice = +(((call.ask || prem) * 1.02) || 0.05).toFixed(2);
-  const order = await alpaca.placeOrder({
-    symbol: call.symbol, qty: contracts, side: "buy", type: "limit",
-    limit_price: limitPrice, time_in_force: "day",
-  });
+  // Start a PATIENT limit ladder and return immediately. The trader loop advances
+  // it each tick (see working_orders.js) so a multi-minute dwell never blocks
+  // stop-loss management. The position is created only when it actually fills.
+  if (working.activeFor(ticker)) {
+    return { status: "ALREADY_WORKING", ticker, side, note: `an order is already working for ${ticker}` };
+  }
+  const started = await working.start({
+    ticker, symbol: call.symbol, qty: contracts, side: "buy", isOption: true, kind: "entry",
+    intent: {
+      ticker, side, optionType: optType,
+      contract: {
+        symbol: call.symbol, strike: call.strike, expiry: call.expiry,
+        dte: call.dte, moneyness: call.moneyness,
+      },
+      contracts, quotedMid: prem,
+      levels: { trigger: lv.trigger, stop: lv.stop, t1: lv.t1, t2: lv.t2 },
+      snapLevels: { pTrans: snap.levels.pTrans, nTrans: snap.levels.nTrans },
+      entryBudget: riskPremium, effectiveBudget, flowMult,
+      flowAtEntry: flowSummary,
+      triggeredBy: triggered ? "5min-close" : "forced",
+      selection: rrPick?.best ? {
+        mode: "rr", rr: rrPick.best.rr, delta: rrPick.best.delta, iv: rrPick.best.iv,
+        breakeven: rrPick.best.breakeven, spreadPct: rrPick.best.spreadPct,
+      } : { mode: "legacy" },
+    },
+  }, cfg);
+  if (!started.started) {
+    return { status: "NOT_FILLED", ticker, side, note: `could not start ladder: ${started.reason}` };
+  }
+  return {
+    status: "WORKING", ticker, side,
+    contract: { symbol: call.symbol, strike: call.strike, expiry: call.expiry },
+    contracts, firstRungPrice: started.price,
+    note: `patient ladder started at ${started.price} — repriced each tick, position opens on fill`,
+  };
+
+  // The ladder already confirmed the fill and its price — that IS the truth.
+  const fill = { filled: true, price: exec.price };
+  const entryPrice = exec.price;
 
   const pos = {
     id: `${ticker}-${Date.now()}`,
     ticker, side, instrument: "option", optionType: optType,
     optionSymbol: call.symbol,
     strike: call.strike, expiry: call.expiry, dte: call.dte, moneyness: call.moneyness,
-    contracts, entryPremium: prem,
+    contracts,
+    entryPremium: entryPrice,
+    entryQuotedMid: exec.mid ?? prem,      // book mid at the time we worked the order
+    entryFilled: true,
+    entrySlippage: exec.vsMid,             // + = paid above mid
+    entrySavedVsCross: exec.vsCross,       // + = better than crossing the spread
+    entryRung: `${exec.rung}/${exec.of}`,  // which ladder step filled
     entryDate: iso(new Date()), entrySpot: +spot.toFixed(2),
     pTrans: snap.levels.pTrans, nTrans: snap.levels.nTrans,
     trigger: lv.trigger, stopLevel: lv.stop,
@@ -391,6 +461,39 @@ export async function evaluatePositions() {
   return out;
 }
 
+// Called by working_orders.js when a patient entry ladder finally fills. The
+// position is created HERE, at the real fill price — never before, so we never
+// track a position we don't actually hold.
+export function createPositionFromFill(w) {
+  const i = w.intent || {};
+  const pos = {
+    id: `${i.ticker}-${Date.now()}`,
+    ticker: i.ticker, side: i.side, instrument: "option", optionType: i.optionType,
+    optionSymbol: i.contract?.symbol,
+    strike: i.contract?.strike, expiry: i.contract?.expiry,
+    dte: i.contract?.dte, moneyness: i.contract?.moneyness,
+    contracts: i.contracts,
+    entryPremium: w.filledPrice,          // REAL fill
+    entryQuotedMid: w.mid ?? i.quotedMid,
+    entryFilled: true,
+    entrySlippage: +(w.filledPrice - (w.mid ?? i.quotedMid ?? w.filledPrice)).toFixed(2),
+    entryRung: `${(w.rung ?? 0) + 1}/${w.totalRungs}`,
+    entryWaitedSec: Math.round(((w.filledAt || Date.now()) - w.startedAt) / 1000),
+    entryDate: iso(new Date()), entrySpot: i.entrySpot ?? null,
+    pTrans: i.snapLevels?.pTrans, nTrans: i.snapLevels?.nTrans,
+    trigger: i.levels?.trigger, stopLevel: i.levels?.stop,
+    t1: i.levels?.t1, t2: i.levels?.t2,
+    lockedToBreakeven: false,
+    status: "OPEN", orderId: w.orderId,
+    triggeredBy: i.triggeredBy,
+    entryBudget: i.entryBudget, effectiveBudget: i.effectiveBudget, flowMult: i.flowMult,
+    flowAtEntry: i.flowAtEntry,
+    selection: i.selection,
+  };
+  const rows = load(); rows.push(pos); persist(rows);
+  return pos;
+}
+
 export function listAll() { return load(); }
 
 // ---- Store maintenance (used by reconcile.js) -----------------------------
@@ -418,10 +521,17 @@ export function patchPosition(id, fields = {}) {
 }
 
 // ---- Exit ----------------------------------------------------------------
-export async function exitTrade({ id, reason = "manual" }) {
+// urgency: "urgent" for stop-losses (must get out — cross fast), "patient" for
+// take-profits and manual exits (work the ladder, keep the spread).
+export async function exitTrade({ id, reason = "manual", urgency = null }) {
   const rows = load();
   const p = rows.find((x) => x.id === id && x.status === "OPEN");
   if (!p) throw new Error("open position not found");
+
+  // A stop-out is the one case where paying the spread beats not filling.
+  const isStop = /stop\s*[1-4]|stop:|below stop|above stop|10% adverse/i.test(reason);
+  const urg = urgency || (isStop ? "urgent" : "patient");
+  const cfgX = flow.loadConfig();
 
   // ---- shares: flatten via the stock path -------------------------------
   if (p.instrument === "shares") {
@@ -434,12 +544,19 @@ export async function exitTrade({ id, reason = "manual" }) {
       return { status: "CANCELED", position: p };
     }
     const order = await shares.exit({ ticker: p.ticker, side: p.side || "long", shares: p.shares });
+    const xf = await alpaca.waitForFill(order.id).catch(() => ({ filled: false, price: null }));
     let last = null;
     try { last = await alpaca.getLatestTrade(p.ticker, "delayed_sip"); } catch {}
+    const exitPx = xf.filled && xf.price ? xf.price : (last != null ? +last.toFixed(2) : null);
     p.status = "CLOSED"; p.exitReason = reason; p.exitDate = iso(new Date());
-    p.exitPrice = last != null ? +last.toFixed(2) : null; p.exitOrderId = order.id;
+    p.exitPrice = exitPx; p.exitFilled = Boolean(xf.filled); p.exitOrderId = order.id;
+    // Shares DO invert with side (unlike long-premium options).
+    p.realizedPnl = (p.entryPrice != null && exitPx != null)
+      ? +((((p.side === "short" ? p.entryPrice - exitPx : exitPx - p.entryPrice)) * (p.shares || 0))).toFixed(2)
+      : null;
+    p.pnlIsEstimate = !xf.filled;
     persist(rows);
-    return { status: "CLOSED", instrument: "shares", position: p, order };
+    return { status: "CLOSED", instrument: "shares", position: p, order, realizedPnl: p.realizedPnl };
   }
 
   // If the entry order never filled (e.g. placed off-hours), there's nothing to
@@ -459,15 +576,42 @@ export async function exitTrade({ id, reason = "manual" }) {
     const q = (await alpaca.getOptionQuotes([p.optionSymbol]))[p.optionSymbol]?.latestQuote;
     if (q) { bid = q.bp; optMid = +(((q.bp + q.ap) / 2) || 0).toFixed(2); }
   } catch {}
-  // Marketable limit a hair below the bid to sell out cleanly (accepted off-hours too).
-  const limitPrice = +(((bid || p.entryPremium || 0.05) * 0.98) || 0.01).toFixed(2);
-  const order = await alpaca.placeOrder({
-    symbol: p.optionSymbol, qty: p.contracts, side: "sell", type: "limit",
-    limit_price: limitPrice, time_in_force: "day",
+  const xexec = await execution.execute({
+    symbol: p.optionSymbol, qty: p.contracts, side: "sell",
+    urgency: urg, isOption: true, cfg: cfgX,
   });
-  p.status = "CLOSED"; p.exitReason = reason; p.exitDate = iso(new Date()); p.exitPremium = optMid; p.exitOrderId = order.id;
+  if (!xexec.filled) {
+    // Patient exits can wait for the next tick; an urgent one that still didn't
+    // fill is worth surfacing loudly rather than silently marking it closed.
+    return {
+      status: "EXIT_NOT_FILLED", position: p, urgency: urg,
+      rungs: xexec.rungs, mid: xexec.mid, bid: xexec.bid, ask: xexec.ask,
+      note: xexec.note || "exit ladder expired unfilled — position still OPEN, will retry",
+    };
+  }
+  const order = { id: xexec.orderId };
+  const xfill = { filled: true, price: xexec.price };
+  const exitPrice = xexec.price;
+
+  p.status = "CLOSED";
+  p.exitReason = reason;
+  p.exitDate = iso(new Date());
+  p.exitPremium = exitPrice;
+  p.exitQuotedMid = xexec.mid ?? optMid;
+  p.exitFilled = true;
+  p.exitSlippage = xexec.vsMid;          // + = sold below mid
+  p.exitSavedVsCross = xexec.vsCross;    // + = better than hitting the bid
+  p.exitRung = `${xexec.rung}/${xexec.of}`;
+  p.exitUrgency = urg;
+  p.exitOrderId = order.id;
+  // Realized P&L from ACTUAL fills on both legs. Long premium either way (a long
+  // call and a long put are both bought), so the formula is the same for both sides.
+  p.realizedPnl = (p.entryPremium != null && exitPrice != null)
+    ? +(((exitPrice - p.entryPremium) * (p.contracts || 0) * 100)).toFixed(2)
+    : null;
+  p.pnlIsEstimate = !(p.entryFilled && xfill.filled);   // flag if either leg is a guess
   persist(rows);
-  return { status: "CLOSED", position: p, order };
+  return { status: "CLOSED", position: p, order, realizedPnl: p.realizedPnl, pnlIsEstimate: p.pnlIsEstimate };
 }
 
 // Lock stop to breakeven after T1 (records intent; the stop is enforced by evaluate/user).
@@ -475,6 +619,11 @@ export function lockToBreakeven({ id }) {
   const rows = load();
   const p = rows.find((x) => x.id === id && x.status === "OPEN");
   if (!p) throw new Error("open position not found");
+
+  // A stop-out is the one case where paying the spread beats not filling.
+  const isStop = /stop\s*[1-4]|stop:|below stop|above stop|10% adverse/i.test(reason);
+  const urg = urgency || (isStop ? "urgent" : "patient");
+  const cfgX = flow.loadConfig();
   // Move the stop to entry — for a short that means bringing it DOWN.
   p.lockedToBreakeven = true;
   const side = p.side || "long";
