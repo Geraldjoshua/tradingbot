@@ -22,6 +22,7 @@ import * as vd from "./voldesk_trades.js";
 import * as discovery from "./discovery.js";
 import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
+import { pingStatus } from "./keepalive.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOG = path.join(ROOT, "data", "autotrader_log.json");
@@ -330,6 +331,7 @@ export function status() {
     marketOpen: marketOpen(),
     config: cfg,
     flowCache,                                  // freshness of the uploaded book
+    keepAlive: (() => { try { return pingStatus(); } catch { return null; } })(),
     dataHealth: (() => { try { return dataHealth(cfg); } catch { return null; } })(),
     observing, ready,
     dailyEntries: st.entries,

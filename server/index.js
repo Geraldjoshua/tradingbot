@@ -15,7 +15,7 @@ import * as discovery from "./discovery.js";
 import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
 import * as diagnostics from "./diagnostics.js";
-import { startKeepAlive } from "./keepalive.js";
+import { startKeepAlive, notePing, pingStatus } from "./keepalive.js";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PY = fs.existsSync(path.join(PROJECT_ROOT, ".venv/bin/python"))
@@ -50,9 +50,17 @@ app.use(express.json({ limit: process.env.JSON_LIMIT || "32mb" }));
 
 const PORT = process.env.PORT || 3001;
 
-app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, keys: alpaca.keysPresent(), feed: alpaca.config.FEED })
-);
+app.get("/api/health", (req, res) => {
+  // The self-ping sets x-keepalive:1; anything else hitting this is external
+  // (the GitHub Action, cron-job.org, or you in a browser) — and only EXTERNAL
+  // traffic actually prevents Render's idle spin-down.
+  const selfPing = req.get("x-keepalive") === "1";
+  try { notePing({ external: !selfPing }); } catch {}
+  res.json({
+    ok: true, keys: alpaca.keysPresent(), feed: alpaca.config.FEED,
+    keepAlive: pingStatus(),
+  });
+});
 
 // ---- Backtest -------------------------------------------------------------
 app.post("/api/backtest", async (req, res) => {

@@ -90,6 +90,30 @@ export default function AutoTraderView() {
       </p>
       {err && <p className="err">{err}</p>}
 
+      {/* Keep-alive: is the service actually being pinged from outside? A green
+          checkmark on GitHub does NOT prove the request reached this server. */}
+      {status?.keepAlive && (
+        <div className="card" style={{ marginBottom: 12,
+          borderLeft: `4px solid ${status.keepAlive.healthy ? "#1b7f3b" : "#c77700"}` }}>
+          {status.keepAlive.healthy ? (
+            <span>✓ Keep-alive healthy — last external ping {status.keepAlive.minutesSinceExternalPing}m ago
+              ({status.keepAlive.externalPings} total), up {status.keepAlive.uptimeMinutes}m</span>
+          ) : (
+            <>
+              <b style={{ color: "#c77700" }}>
+                ⚠ Keep-alive: {status.keepAlive.warning || "no external ping recorded yet"}
+              </b>
+              <div className="sub">
+                Render free sleeps after 15 min with no inbound request. Check the repo's Actions tab
+                and that the <code>HEALTHCHECK_URL</code> variable points at
+                <code> /api/health</code> on this service. Up {status.keepAlive.uptimeMinutes}m,
+                {" "}{status.keepAlive.externalPings} external pings seen.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Data reset after a restart — say so loudly, it's otherwise invisible */}
       {status?.dataHealth?.needsUpload && (
         <div className="card" style={{ marginBottom: 12, borderLeft: "4px solid #b3261e", background: "#fff4f4" }}>
