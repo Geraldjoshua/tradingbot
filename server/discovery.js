@@ -298,8 +298,17 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
   const scans = await scanAll(shortlist.map((c) => c.ticker), cfg);
   const byTicker = Object.fromEntries(shortlist.map((c) => [c.ticker, c]));
 
+  // TWO thresholds, deliberately different:
+  //   acceptTags — tradeable TODAY (default CONFIRMED). Feeds same-session entry.
+  //   seedTags   — worth WATCHING (default CONFIRMED + PENDING). Feeds the observe
+  //                list, which re-checks daily and promotes when it firms up.
+  // Seeding only on CONFIRMED made the observe list pointless: it could only ever
+  // hold names that were already tradeable, so nothing was ever "watched".
   const allowTags = new Set(d.acceptTags || ["CONFIRMED"]);
+  const seedTags = new Set(d.seedTags || ["CONFIRMED", "PENDING"]);
   const qualified = [];
+  const watch = [];
+  const tagCounts = {};
   for (const s of scans) {
     if (s.error) continue;
     const c = byTicker[s.ticker] || {};
@@ -321,6 +330,23 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
       okTag = allowTags.has(s.tag);
       okGrade = (s.grade ?? 0) >= (d.minGrade ?? 0);
     }
+    tagCounts[s.tag] = (tagCounts[s.tag] || 0) + 1;
+
+    // Worth watching? (looser bar — this is what the observe list gets)
+    const seedOK = seedTags.has(s.tag) && (side === "short" || (s.grade ?? 0) >= (d.seedMinGrade ?? 0));
+    if (seedOK) {
+      const c2 = byTicker[s.ticker] || {};
+      watch.push({
+        ticker: s.ticker, side, tag: s.tag, grade: s.grade ?? null,
+        rr: shortRR ?? s.rr ?? null,
+        flowRank: c2.rank ?? 0, flowScore: c2.score ?? 0, netPremium: c2.net_premium ?? 0,
+        relBps: c2.relBps ?? null, marketCap: c2.marketCap ?? null,
+        tier: c2.tier ?? null, tierLabel: c2.tierLabel ?? null, tierScore: c2.tierScore ?? null,
+        flowSource: c2.source || "?", inKnows: !!c2.in_knows, inUnusual: !!c2.in_unusual,
+        blockers: s.filter_reasons || s.bearishReasons || [],
+      });
+    }
+
     if (!okTag || !okGrade) continue;
     qualified.push({
       ticker: s.ticker, side, tag: s.tag, grade: s.grade ?? null,
@@ -336,9 +362,10 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
   // Best flow conviction first — the entry stage takes them in this order.
   qualified.sort((a, b) => b.flowRank - a.flowRank);
 
+  watch.sort((a, b) => b.flowRank - a.flowRank);
   return {
     enabled: true, sources, considered: candidates.length,
-    scanned: scans.length, qualified,
+    scanned: scans.length, qualified, watch, tagCounts,
     rejected: scans.filter((s) => !s.error && !qualified.find((q) => q.ticker === s.ticker))
       .map((s) => ({ ticker: s.ticker, tag: s.tag, grade: s.grade ?? null })),
   };

@@ -88,6 +88,8 @@ export function seed(candidates, cfg = flow.loadConfig()) {
         tier: c.tierLabel ?? null, tierScore: c.tierScore ?? null,
         source: c.flowSource ?? "flow", tag: c.tag ?? null, grade: c.grade ?? null,
       },
+      seedTag: c.tag ?? null,
+      blockers: c.blockers || [],
       assessments: [],
       blockedRun: 0,
       lastAssessed: null,
@@ -135,17 +137,23 @@ export async function assessAll(cfg = flow.loadConfig(), { force = false } = {})
     const side = r.side || "long";
     const conv = await flow.getConviction(r.ticker, cfg);
     const decision = flow.decideForTrade(conv, cfg, side);
-    if (flowStale) {
+    // With flow conviction switched off, getConviction() legitimately returns
+    // found:false. Dropping every name as "flow gone" in that case would empty
+    // the list the moment you toggle flow off — so skip the flow rules entirely.
+    const flowOn = cfg.flow?.enabled !== false;
+    if (!flowOn) {
+      // no flow input: structure alone decides
+    } else if (flowStale) {
       // Missed upload — freeze judgement rather than punish the list.
       reasons.push(`flow stale ${cacheState.ageDays}d — upload to refresh`);
     } else if (!conv.found) {
       if (o.dropOnFlowGone) drop = "flow gone (not in latest upload)";
       else reasons.push("no current flow");
-    } else if (o.dropOnFlowFlip &&
+    } else if (flowOn && o.dropOnFlowFlip &&
                ((side === "long" && conv.direction === "bearish") ||
                 (side === "short" && conv.direction === "bullish"))) {
       drop = `flow flipped ${conv.direction} against a ${side} (score ${conv.combinedScore})`;
-    } else if (r.seed.flowScore && conv.combinedScore < r.seed.flowScore * o.flowDecayRatio) {
+    } else if (flowOn && r.seed.flowScore && conv.combinedScore < r.seed.flowScore * o.flowDecayRatio) {
       drop = `flow decayed ${r.seed.flowScore} -> ${conv.combinedScore}`;
     }
 

@@ -73,6 +73,7 @@ export const getFlow = (ticker: string, side: "long" | "short" = "long") =>
   j<any>(`/api/flow?ticker=${encodeURIComponent(ticker)}&side=${side}`);
 
 export const runDiscovery = () => j<any>("/api/discovery");
+export const runDiagnostics = (probe = "SPY") => j<any>(`/api/diagnostics?probe=${probe}`);
 
 // ---- Nightly flow upload + observe list ----------------------------------
 export const uploadFlowFile = (file: File) =>

@@ -12,6 +12,7 @@ export default function FlowUploadView() {
   const [server, setServer] = useState<any>(null);
   const [obs, setObs] = useState<any>(null);
   const [busy, setBusy] = useState("");
+  const [diag, setDiag] = useState<any>(null);
   const [result, setResult] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -46,6 +47,13 @@ export default function FlowUploadView() {
     finally { setBusy(""); }
   }
 
+  async function doDiag() {
+    setBusy("running diagnostics (scans Yahoo, ~30s)…"); setErr(null); setDiag(null);
+    try { setDiag(await api.runDiagnostics()); }
+    catch (e: any) { setErr(String(e.message || e)); }
+    finally { setBusy(""); }
+  }
+
   async function doDrop(t: string) {
     try { await api.dropObserve(t, "manual"); await refresh(); }
     catch (e: any) { setErr(String(e.message || e)); }
@@ -71,6 +79,7 @@ export default function FlowUploadView() {
             Upload &amp; ingest
           </button>
           <button onClick={doAssess} disabled={!!busy}>Re-assess now</button>
+          <button onClick={doDiag} disabled={!!busy}>Why nothing found?</button>
         </div>
         {busy && <p className="sub">{busy}</p>}
         {err && <p className="err">{err}</p>}
@@ -95,12 +104,42 @@ export default function FlowUploadView() {
                 + `deleted:   ${(result.filesDeleted || []).join(", ") || "(kept)"}\n`
                 + `cache:     ${result.cache ? `${result.cache.tickers} tickers` : "not built"}\n`
                 + `ranked:    ${result.discovery?.considered ?? 0} considered, `
-                + `${result.discovery?.scanned ?? 0} scanned, ${result.discovery?.qualified ?? 0} qualified\n`
+                + `${result.discovery?.scanned ?? 0} scanned\n`
+                + `tags:      ${Object.entries(result.discovery?.tagCounts || {}).map(([k, v]) => `${v} ${k}`).join(", ") || "n/a"}\n`
+                + `tradeable: ${result.discovery?.qualified ?? 0} (CONFIRMED today)\n`
+                + `watchable: ${result.discovery?.watch ?? 0} (CONFIRMED + PENDING)\n`
                 + `observing: +${(result.observe?.added || []).join(", ") || "none new"}`
                 + `${result.discovery?.note ? `\nnote:      ${result.discovery.note}` : ""}`
               : `assessed ${result.assessed}\nready: ${(result.ready || []).join(", ") || "-"}\n`
                 + `dropped: ${(result.dropped || []).map((d: any) => `${d.ticker} (${d.reason})`).join("; ") || "-"}`}
           </pre>
+        </div>
+      )}
+
+      {diag && (
+        <div className="card" style={{ marginTop: 12,
+          borderLeft: `4px solid ${diag.verdict === "healthy" ? "#1b7f3b" : "#b3261e"}` }}>
+          <h3>Diagnosis: {diag.verdict}</h3>
+          <p className="sub" style={{ marginTop: 0 }}>{diag.explain}</p>
+          <table className="tbl">
+            <thead><tr><th>check</th><th></th><th>detail</th></tr></thead>
+            <tbody>
+              {(diag.steps || []).map((s: any) => (
+                <tr key={s.name} className={s.ok ? "" : "blocked"}>
+                  <td>{s.name}</td>
+                  <td>{s.ok ? "✓" : "✗"}</td>
+                  <td style={{ fontSize: 11 }}>{s.detail}{s.hint ? ` — ${s.hint}` : ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {diag.funnel && (
+            <p className="sub">
+              funnel: {diag.funnel.considered} considered → {diag.funnel.scanned} scanned → {diag.funnel.qualified} qualified
+              {!!(diag.funnel.rejected || []).length &&
+                ` · rejected: ${diag.funnel.rejected.map((r: any) => `${r.ticker}(${r.tag})`).join(", ")}`}
+            </p>
+          )}
         </div>
       )}
 
@@ -126,8 +165,13 @@ export default function FlowUploadView() {
                   <td className="sub">{r.addedOn}</td>
                   <td>{r.seed?.tier || "—"}{r.seed?.tierScore ? ` ${r.seed.tierScore}×` : ""}</td>
                   <td>${((r.seed?.netPremium || 0) / 1000).toFixed(0)}k</td>
-                  <td>{last ? `${last.date} ${last.tag || ""} g${last.grade ?? "-"}` : "not yet"}</td>
-                  <td style={{ fontSize: 11 }}>{last?.reasons?.join("; ") || (r.status === "READY" ? "all clear" : "")}</td>
+                  <td>{last ? `${last.date} ${last.tag || ""} g${last.grade ?? "-"}` : `seeded ${r.seedTag || "?"}`}</td>
+                  <td style={{ fontSize: 11 }}>
+                    {last?.reasons?.join("; ")
+                      || (r.status === "READY" ? "all clear"
+                      : (r.blockers || []).length ? `needs: ${r.blockers.slice(0, 3).join(", ")}`
+                      : "awaiting first re-check")}
+                  </td>
                   <td><button onClick={() => doDrop(r.ticker)} title="remove manually">✕</button></td>
                 </tr>
               );

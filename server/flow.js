@@ -47,7 +47,9 @@ const DEFAULTS = {
       large: { enabled: true, refBps: 1.5, minPremium: 1000000 },
       mega: { enabled: true, refBps: 0.3, minPremium: 2000000 },
     },
-    acceptTags: ["CONFIRMED"], minGrade: 0,
+    acceptTags: ["CONFIRMED"],            // tradeable today
+    seedTags: ["CONFIRMED", "PENDING"],   // worth observing
+    minGrade: 0, seedMinGrade: 0,
     maxDte: 45, requireDeltaBalance: true, exclude: [],
   },
   flow: {

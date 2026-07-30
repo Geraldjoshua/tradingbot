@@ -3,7 +3,10 @@
     "enabled": true,
     "mode": "full",
     "pollSeconds": 60,
-    "strategies": { "voldesk": true, "gapgo": false },
+    "strategies": {
+      "voldesk": true,
+      "gapgo": false
+    },
     "marketHoursOnly": true,
     "t1Action": "take-profit",
     "maxConcurrent": 5,
@@ -14,7 +17,10 @@
   "discovery": {
     "enabled": true,
     "shadowMode": false,
-    "sources": { "optionstrat": true, "unusualwhales": false },
+    "sources": {
+      "optionstrat": true,
+      "unusualwhales": false
+    },
     "uwFallbackOnly": true,
     "everyMinutes": 30,
     "maxScan": 8,
@@ -27,29 +33,69 @@
     "keepUnsized": false,
     "dollarVolRefBps": 20,
     "tiers": {
-      "micro": { "enabled": false, "refBps": 15, "minPremium": 100000 },
-      "small": { "enabled": true, "refBps": 8, "minPremium": 250000 },
-      "mid": { "enabled": true, "refBps": 4, "minPremium": 500000 },
-      "large": { "enabled": true, "refBps": 1.5, "minPremium": 1000000 },
-      "mega": { "enabled": true, "refBps": 0.3, "minPremium": 2000000 }
+      "micro": {
+        "enabled": false,
+        "refBps": 15,
+        "minPremium": 100000
+      },
+      "small": {
+        "enabled": true,
+        "refBps": 8,
+        "minPremium": 250000
+      },
+      "mid": {
+        "enabled": true,
+        "refBps": 4,
+        "minPremium": 500000
+      },
+      "large": {
+        "enabled": true,
+        "refBps": 1.5,
+        "minPremium": 1000000
+      },
+      "mega": {
+        "enabled": true,
+        "refBps": 0.3,
+        "minPremium": 2000000
+      }
     },
-    "acceptTags": ["CONFIRMED"],
+    "acceptTags": [
+      "CONFIRMED"
+    ],
     "minGrade": 0,
     "maxDte": 45,
     "requireDeltaBalance": true,
-    "exclude": []
+    "exclude": [],
+    "seedTags": [
+      "CONFIRMED",
+      "PENDING"
+    ],
+    "seedMinGrade": 0
   },
   "flow": {
     "enabled": true,
     "mode": "size",
-    "sources": { "optionstrat": true, "unusualwhales": false },
+    "sources": {
+      "optionstrat": true,
+      "unusualwhales": false
+    },
     "optionstratDir": "",
     "maxAgeDays": 3,
     "staleAction": "warn",
-    "sizing": { "agree": 1.0, "neutral": 0.7, "disagree": 0.25 },
+    "sizing": {
+      "agree": 1.0,
+      "neutral": 0.7,
+      "disagree": 0.25
+    },
     "minScore": 0.15,
-    "boosts": { "unusual": 0.1, "knows": 0.15 },
-    "sourceWeights": { "optionstrat": 1.0, "unusualwhales": 1.0 }
+    "boosts": {
+      "unusual": 0.1,
+      "knows": 0.15
+    },
+    "sourceWeights": {
+      "optionstrat": 1.0,
+      "unusualwhales": 1.0
+    }
   },
   "contractSelection": {
     "mode": "rr",
@@ -74,7 +120,9 @@
     "dropOnFlowFlip": true,
     "flowDecayRatio": 0.4,
     "blockedStrikes": 3,
-    "requireTags": ["CONFIRMED"],
+    "requireTags": [
+      "CONFIRMED"
+    ],
     "minGrade": 0
   },
   "retention": {
@@ -83,7 +131,10 @@
     "keepClosedTrades": 200,
     "maxDataMB": 200
   },
-  "sides": { "long": true, "short": false },
+  "sides": {
+    "long": true,
+    "short": false
+  },
   "shares": {
     "enabled": true,
     "minShares": 1,
@@ -91,5 +142,7 @@
     "allowShort": true,
     "requireEasyToBorrow": true
   },
-  "risk": { "basePremium": 300 }
+  "risk": {
+    "basePremium": 300
+  }
 }

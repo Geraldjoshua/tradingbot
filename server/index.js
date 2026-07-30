@@ -14,6 +14,7 @@ import * as autotrader from "./autotrader.js";
 import * as discovery from "./discovery.js";
 import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
+import * as diagnostics from "./diagnostics.js";
 import { startKeepAlive } from "./keepalive.js";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -322,6 +323,12 @@ app.get("/api/flow", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ---- Diagnostics: why is discovery finding nothing? -----------------------
+app.get("/api/diagnostics", async (req, res) => {
+  try { res.json(await diagnostics.run({ probe: String(req.query.probe || "SPY").toUpperCase() })); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ---- Discovery: what would flow surface right now? ------------------------
 // Runs the full harvest -> filter -> Vol Desk validation pipeline on demand.
 // Safe to call any time: it never places orders, it only scans and ranks.
@@ -393,7 +400,10 @@ app.post("/api/flow-ingest", async (req, res) => {
     const cfg = flow.loadConfig();
     const openTickers = new Set(vdTrades.listAll().filter((p) => p.status === "OPEN").map((p) => p.ticker));
     const disc = await discovery.discover(cfg, { openTickers, cooldown: {} });
-    const seeded = observe.seed(disc.qualified || [], cfg);
+    // Seed from `watch` (CONFIRMED + PENDING), not `qualified` (CONFIRMED only).
+    // PENDING names are precisely the ones worth observing — they're close but
+    // haven't reclaimed pTrans yet, so they may firm up tomorrow.
+    const seeded = observe.seed(disc.watch || disc.qualified || [], cfg);
 
     res.json({
       ok: true, dir,
@@ -401,7 +411,10 @@ app.post("/api/flow-ingest", async (req, res) => {
       cache: cacheInfo, buildOutput: built || null,
       discovery: {
         sources: disc.sources || [], considered: disc.considered ?? 0,
-        scanned: disc.scanned ?? 0, qualified: (disc.qualified || []).length,
+        scanned: disc.scanned ?? 0,
+        qualified: (disc.qualified || []).length,
+        watch: (disc.watch || []).length,
+        tagCounts: disc.tagCounts || {},
         note: disc.note || null,
       },
       observe: seeded,
