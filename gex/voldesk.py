@@ -21,7 +21,9 @@ IMPORTANT — these are RAW-GEX APPROXIMATIONS, not the proprietary Vol Desk fee
 
 Usage: voldesk.py TICKER DATA_DIR [max_dte_days]
 """
-import sys, json, math, os, glob
+import sys, json, math, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gexcore as gc, os, glob
 from datetime import datetime, timezone, timedelta
 
 # Snapshots are keyed by US market (Eastern) day, not UTC — so an evening scan
@@ -158,9 +160,11 @@ def main():
         contracts, used = [], []
         call_g = put_g = call_oi = put_oi = 0.0
         cw_num = cw_den = pw_num = pw_den = 0.0
+        iv_dropped = 0
         for e, d in chosen:
             oc = tk.option_chain(e)
             T = d / 365.0
+            rows = []
             for df, is_call in ((oc.calls, True), (oc.puts, False)):
                 for _, row in df.iterrows():
                     K, oi, iv = row.get("strike"), row.get("openInterest"), row.get("impliedVolatility")
@@ -169,57 +173,54 @@ def main():
                     if (isinstance(oi, float) and math.isnan(oi)) or oi <= 0:
                         continue
                     K, oi = float(K), float(oi)
-                    # OI-weighted centers use OI regardless of IV validity
+                    # OI-weighted centers (COTMC/COTMP) use OI regardless of IV validity
                     if is_call:
                         cw_num += K * oi; cw_den += oi; call_oi += oi
                     else:
                         pw_num += K * oi; pw_den += oi; put_oi += oi
                     if iv is None or (isinstance(iv, float) and math.isnan(iv)) or iv <= 0:
                         continue
-                    contracts.append((K, T, float(iv), oi, is_call))
-                    g = bs_gamma(spot, K, T, float(iv))
-                    if is_call:
-                        call_g += g * oi
-                    else:
-                        put_g += g * oi
+                    rows.append((K, T, float(iv), oi, is_call))
+            # Reject Yahoo's garbage IVs before they manufacture fake gamma at
+            # far strikes — those fake-gamma strikes were winning the wall vote
+            # and therefore SETTING THE STOP (nTrans). See gex/gexcore.py.
+            kept, stats = gc.sanitize_expiry(rows, spot)
+            iv_dropped += stats["droppedAbs"] + stats["droppedRel"]
+            for (K, T2, iv2, oi2, is_call2) in kept:
+                contracts.append((K, T2, iv2, oi2, is_call2))
+                g = gc.bs_gamma(spot, K, T2, iv2)
+                if is_call2:
+                    call_g += g * oi2
+                else:
+                    put_g += g * oi2
             used.append(e)
         if not contracts:
             print(json.dumps({"error": "no contracts with OI+IV"}))
             return
 
-        # per-strike GEX at spot (from cache)
-        per_strike = {}
-        for K, T, iv, oi, is_call in contracts:
-            notion = bs_gamma(spot, K, T, iv) * oi * MULT * spot * spot * 0.01
-            per_strike[K] = per_strike.get(K, 0.0) + (notion if is_call else -notion)
-        strikes = sorted(per_strike.keys())
+        # per-strike GEX at spot, call and put legs kept SEPARATE (shared core)
+        per = gc.per_strike_gex(contracts, spot)
+        per_strike = {k: e["net"] for k, e in per.items()}
+        strikes = sorted(per.keys())
         total_gex = sum(per_strike.values())
-        # constrain walls to the correct side of spot so geometry stays coherent
-        above = [(k, v) for k, v in per_strike.items() if k > spot] or list(per_strike.items())
-        below = [(k, v) for k, v in per_strike.items() if k < spot] or list(per_strike.items())
-        call_wall = max(above, key=lambda kv: kv[1])   # +GEX / T1 (above spot)
-        put_wall = min(below, key=lambda kv: kv[1])    # nTrans (below spot)
+        # Call wall = largest CALL gamma above spot; put wall = largest PUT gamma
+        # below spot, both inside a moneyness band with an OI floor. Taking
+        # max/min of NET gex (the old way) returns the least-negative far strike
+        # on put-heavy names — that is how a "call wall" ended up below spot.
+        cw, pw, wall_notes = gc.pick_walls(per, spot)
+        if cw is None or pw is None:
+            print(json.dumps({"ticker": ticker,
+                              "error": "could not locate walls on both sides of spot after sanity filters",
+                              "notes": wall_notes}))
+            return
+        call_wall = (cw["strike"], cw["gex"])
+        put_wall = (pw["strike"], pw["gex"])
         cotmc = cw_num / cw_den if cw_den else spot
         cotmp = pw_num / pw_den if pw_den else spot
 
         # gamma flip via price grid — iterates the CACHED contracts (no network)
-        def net_gamma_at(S):
-            tot = 0.0
-            for K, T, iv, oi, is_call in contracts:
-                g = bs_gamma(S, K, T, iv)
-                tot += (1 if is_call else -1) * g * oi * MULT * S * S * 0.01
-            return tot
-        lo, hi = spot * 0.85, spot * 1.15
-        grid = [lo + (hi - lo) * i / 120 for i in range(121)]
-        prev_S = prev_v = None
-        crossings = []
-        for S in grid:
-            v = net_gamma_at(S)
-            if prev_v is not None and (prev_v <= 0 < v or prev_v >= 0 > v):
-                frac = prev_v / (prev_v - v) if (prev_v - v) else 0.5
-                crossings.append(prev_S + (S - prev_S) * frac)
-            prev_S, prev_v = S, v
-        flip = min(crossings, key=lambda x: abs(x - spot)) if crossings else spot
+        flip_calc, flip_found, flip_detail = gc.gamma_flip(contracts, spot)
+        flip = flip_calc if flip_calc is not None else spot
 
         # ---- Vol Desk level mapping (approximations) ----
         zeroGEX = round(flip, 2)
@@ -323,6 +324,9 @@ def main():
         snapshot = {
             "ticker": ticker, "date": et_date, "asof": now.isoformat(),
             "spot": round(spot, 2),
+            "flipFound": flip_found,
+            "flipNote": flip_detail.get("reason"),
+            "ivDropped": iv_dropped,
             "levels": {"pTrans": pTrans, "nTrans": nTrans, "zeroGEX": zeroGEX,
                        "plusGEX_T1": plus_gex, "T2": t2, "COTMP": round(cotmp, 2), "COTMC": round(cotmc, 2)},
             "db": round(db, 4), "prior_db": prior_db,

@@ -1,0 +1,345 @@
+// Discovery — let the bot FIND names from options flow instead of only grading
+// a hand-written watchlist.
+//
+// Pipeline:
+//   1. HARVEST   rank tickers by bullish flow conviction.
+//                OptionStrat (master workbooks) when present, else/plus Unusual
+//                Whales (live API). Auto-fallback: whichever source has data.
+//   2. FILTER    drop names already open, in cooldown, or explicitly excluded.
+//                Trim to maxScan (Vol Desk scans are the expensive step).
+//   3. VALIDATE  run the real Vol Desk scan on each survivor. This writes the
+//                daily snapshot (pTrans/nTrans/T1/T2) that enterTrade() needs
+//                AND yields the grade + CONFIRMED/PENDING/BLOCKED tag.
+//                Only names passing the tag/grade bar survive.
+//
+// So flow PROPOSES, the Vol Desk playbook DISPOSES. A huge premium print on a
+// structurally broken chart still gets rejected.
+//
+// Snapshots are cached per ticker per day by voldesk.py, so re-scanning the same
+// name later in the session is cheap.
+
+import fs from "fs";
+import path from "path";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
+import * as uw from "./unusualwhales.js";
+import * as vd from "./voldesk_trades.js";
+import * as alpaca from "./alpaca.js";
+import * as playbook from "./playbook.js";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PY = fs.existsSync(path.join(ROOT, ".venv/bin/python"))
+  ? path.join(ROOT, ".venv/bin/python")
+  : "python3";
+
+function runPy(script, args, timeoutMs = 120000) {
+  return new Promise((resolve) => {
+    const child = spawn(PY, [path.join(ROOT, script), ...args]);
+    let out = "", err = "";
+    const kill = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, timeoutMs);
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("error", () => { clearTimeout(kill); resolve(null); });
+    child.on("close", () => {
+      clearTimeout(kill);
+      try { resolve(JSON.parse(out)); } catch { resolve(null); }
+    });
+  });
+}
+
+function optionstratDir(cfg) {
+  return cfg.flow.optionstratDir || process.env.OPTIONSTRAT_DIR || ROOT;
+}
+
+// ---- 1. HARVEST -----------------------------------------------------------
+export async function harvest(cfg) {
+  const d = cfg.discovery;
+  const useOS = d.sources.optionstrat && cfg.flow.sources.optionstrat !== false;
+  const useUW = d.sources.unusualwhales;
+  const merged = new Map();
+  const used = [];
+
+  // Which directions may we trade? Shorts are opt-in (cfg.sides.short).
+  const allowLong = cfg.sides?.long !== false;
+  const allowShort = cfg.sides?.short === true;
+  const direction = allowLong && allowShort ? "both" : allowShort ? "bearish" : "bullish";
+
+  if (useOS) {
+    const r = await runPy("flow/optionstrat_flow.py", [
+      "--discover", optionstratDir(cfg), String(d.maxScan * 2),
+      String(d.minPremium), String(d.minScore), direction,
+    ], 60000);
+    if (r && r.candidates?.length) {
+      used.push("optionstrat");
+      for (const c of r.candidates) merged.set(c.ticker, { ...c, source: "optionstrat", side: c.side || "long" });
+    }
+  }
+
+  // UW runs when enabled AND (always, or only as a fallback when OptionStrat
+  // produced nothing — which is the normal case on a cloud deploy).
+  const needFallback = merged.size === 0;
+  if (useUW && (!d.uwFallbackOnly || needFallback)) {
+    const r = await uw.getTopFlowTickers({
+      topN: d.maxScan * 2, minPremium: d.minPremium, minScore: d.minScore,
+    });
+    if (r.candidates?.length) {
+      used.push("unusualwhales");
+      for (const c of r.candidates) {
+        const prev = merged.get(c.ticker);
+        // Present in BOTH sources = strongest signal: combine the ranks.
+        if (prev) merged.set(c.ticker, { ...prev, rank: prev.rank + c.rank, source: "both" });
+        else merged.set(c.ticker, { ...c, source: "unusualwhales" });
+      }
+    }
+  }
+
+  const candidates = [...merged.values()].sort((a, b) => b.rank - a.rank);
+  return { sources: used, candidates };
+}
+
+// ---- 1b. NORMALIZE by company size / liquidity ----------------------------
+// Two failure modes to avoid:
+//   * RAW DOLLARS bias to mega-caps: $5M of premium is routine on a $4T name.
+//   * FLAT BPS bias to small-caps: a $2B company needs only $400k to print
+//     2 bps, while a $4T company needs $800M for the same 2 bps — so on a pure
+//     bps ranking mega-caps could never qualify. Flipping the bias isn't fixing it.
+//
+// So we score each name against what's NORMAL FOR ITS OWN SIZE CLASS, using the
+// conventional cap tiers. Each tier carries a reference bps (`refBps`) meaning
+// "this much premium, relative to cap, is notable for a company this size", and
+// its own absolute `minPremium` floor.
+//
+//     relBps    = |net_premium| / marketCap * 10,000
+//     tierScore = relBps / tier.refBps        → 1.0 = exactly its tier's bar,
+//                                               3.0 = 3x normal for its size
+//
+// tierScore is comparable ACROSS tiers, so a mega-cap at 3x its own baseline
+// outranks a small-cap at 1.2x its own baseline — which is the behaviour you
+// actually want. Ranking then multiplies by skew and the unusual/knows boosts.
+//
+//   basis "marketcap" — tiered scoring as above (default)
+//   basis "dollarvol" — relative to 20d avg daily dollar volume. Inherently
+//                       size-aware (big companies trade more), so it uses a
+//                       single reference instead of tiers. Uses Alpaca bars we
+//                       already pull — no Yahoo dependency.
+//   basis "none"      — raw premium (mega-cap biased; kept for comparison)
+//
+// NOTE ON CALIBRATION: the refBps values below are seeded from rough
+// observation, NOT fitted to data. Watch the discovery log for a few sessions
+// and adjust — if every hit is one tier, that tier's refBps is too low.
+
+// Conventional US cap buckets. capMax is exclusive.
+const CAP_TIERS = [
+  { key: "micro", label: "Micro",  capMin: 0,      capMax: 3e8,   refBps: 15,   minPremium: 100000 },
+  { key: "small", label: "Small",  capMin: 3e8,    capMax: 2e9,   refBps: 8,    minPremium: 250000 },
+  { key: "mid",   label: "Mid",    capMin: 2e9,    capMax: 1e10,  refBps: 4,    minPremium: 500000 },
+  { key: "large", label: "Large",  capMin: 1e10,   capMax: 2e11,  refBps: 1.5,  minPremium: 1000000 },
+  { key: "mega",  label: "Mega",   capMin: 2e11,   capMax: Infinity, refBps: 0.3, minPremium: 2000000 },
+];
+
+export function tierTable() { return CAP_TIERS; }
+
+function tierFor(cap, cfg) {
+  const overrides = cfg.discovery.tiers || {};
+  for (const t of CAP_TIERS) {
+    if (cap >= t.capMin && cap < t.capMax) {
+      const o = overrides[t.key] || {};
+      return {
+        ...t,
+        refBps: o.refBps ?? t.refBps,
+        minPremium: o.minPremium ?? t.minPremium,
+        enabled: o.enabled !== false,
+      };
+    }
+  }
+  return null;
+}
+
+async function fetchMarketCaps(tickers, cfg) {
+  const cacheDir = path.join(ROOT, "data");
+  const r = await runPy("flow/marketcap.py", [...tickers, "--cache", cacheDir], 90000);
+  return r && !r.__error__ ? r : {};
+}
+
+// Average daily dollar volume over the last ~20 sessions, from Alpaca daily bars.
+async function avgDollarVolume(ticker) {
+  try {
+    const start = new Date(Date.now() - 40 * 864e5).toISOString();
+    const bars = await alpaca.getBars(ticker, "1Day", start, null);
+    const recent = bars.slice(-20);
+    if (!recent.length) return null;
+    const sum = recent.reduce((acc, b) => acc + (b.c || 0) * (b.v || 0), 0);
+    return sum / recent.length;
+  } catch { return null; }
+}
+
+async function normalize(candidates, cfg) {
+  const d = cfg.discovery;
+  const basis = d.normalize || "marketcap";
+  if (basis === "none") {
+    for (const c of candidates) { c.sizeBasis = null; c.relBps = null; }
+    return candidates;
+  }
+
+  if (basis === "marketcap") {
+    const caps = await fetchMarketCaps(candidates.map((c) => c.ticker), cfg);
+    for (const c of candidates) {
+      const cap = caps[c.ticker] || null;
+      c.marketCap = cap;
+      c.sizeBasis = cap;
+      // net_premium is SIGNED (negative = bearish). Size relative to the
+      // magnitude of the bet; direction is carried separately in c.side.
+      c.relBps = cap ? +((Math.abs(c.net_premium) / cap) * 10000).toFixed(4) : null;
+      const t = cap ? tierFor(cap, cfg) : null;
+      c.tier = t ? t.key : null;
+      c.tierLabel = t ? t.label : null;
+      c.tierRefBps = t ? t.refBps : null;
+      // How many times its OWN size class's normal bar this print represents.
+      c.tierScore = (t && c.relBps != null) ? +(c.relBps / t.refBps).toFixed(3) : null;
+      c._tier = t;
+    }
+  } else { // dollarvol — already size-aware, single reference
+    const ref = d.dollarVolRefBps ?? 20;
+    await Promise.all(candidates.map(async (c) => {
+      const addv = await avgDollarVolume(c.ticker);
+      c.avgDollarVol = addv;
+      c.sizeBasis = addv;
+      c.relBps = addv ? +((Math.abs(c.net_premium) / addv) * 10000).toFixed(4) : null;
+      c.tier = "flow"; c.tierLabel = "by $vol"; c.tierRefBps = ref;
+      c.tierScore = c.relBps != null ? +(c.relBps / ref).toFixed(3) : null;
+      c._tier = { enabled: true, minPremium: d.minPremium ?? 0 };
+    }));
+  }
+
+  const keep = candidates.filter((c) => {
+    if (c.tierScore == null) return d.keepUnsized !== false;   // couldn't size it
+    const t = c._tier;
+    if (!t || !t.enabled) return false;                        // tier switched off
+    if (Math.abs(c.net_premium) < (t.minPremium ?? 0)) return false;   // per-tier dollar floor
+    if (d.minTierScore && c.tierScore < d.minTierScore) return false;
+    return true;
+  });
+
+  // Rank on tierScore (comparable across tiers). Clamp so one freak ratio can't
+  // monopolize the shortlist.
+  const clamp = d.maxTierScore ?? 20;
+  for (const c of keep) {
+    const ts = c.tierScore == null ? 0 : Math.min(c.tierScore, clamp);
+    const boost = (c.in_knows ? 1.5 : 1) * (c.in_unusual ? 1.25 : 1);
+    c.rawRank = c.rank;                       // keep the dollar-based rank for display
+    c.rank = +(ts * c.score * boost).toFixed(4);
+    delete c._tier;
+  }
+  keep.sort((a, b) => b.rank - a.rank);
+  return keep;
+}
+
+// ---- 2. FILTER ------------------------------------------------------------
+function filterCandidates(candidates, cfg, { openTickers, cooldown }) {
+  const d = cfg.discovery;
+  const exclude = new Set((d.exclude || []).map((t) => t.toUpperCase()));
+  const now = Date.now();
+  const cdMs = (cfg.automation.entryCooldownMin || 0) * 60 * 1000;
+  return candidates.filter((c) => {
+    if (exclude.has(c.ticker)) return false;
+    if (openTickers.has(c.ticker)) return false;            // already in it
+    if (cdMs && cooldown[c.ticker] && now - cooldown[c.ticker] < cdMs) return false;
+    return true;
+  }).slice(0, d.maxScan);
+}
+
+// ---- 3. VALIDATE through the Vol Desk playbook ----------------------------
+async function volDeskScan(ticker, cfg) {
+  const dataDir = path.join(ROOT, "data", "voldesk");
+  const maxDte = String(cfg.discovery.maxDte || 45);
+  const requireDb = cfg.discovery.requireDeltaBalance === false ? "0" : "1";
+  return runPy("gex/voldesk.py", [ticker, dataDir, maxDte, requireDb], 120000);
+}
+
+// Scan with limited concurrency (Yahoo is rate-limited and free dynos are small).
+async function scanAll(tickers, cfg) {
+  const out = [];
+  const conc = Math.max(1, Math.min(cfg.discovery.scanConcurrency || 2, 4));
+  let i = 0;
+  async function worker() {
+    while (i < tickers.length) {
+      const t = tickers[i++];
+      const r = await volDeskScan(t, cfg);
+      out.push(r && !r.error ? { ticker: t, ...r } : { ticker: t, error: r?.error || "scan failed" });
+    }
+  }
+  await Promise.all(Array.from({ length: conc }, worker));
+  return out;
+}
+
+// ---- Public: full discovery run -------------------------------------------
+// Returns { sources, considered, scanned, qualified: [{ticker, tag, grade, flowRank}] }
+export async function discover(cfg, { openTickers = new Set(), cooldown = {} } = {}) {
+  const d = cfg.discovery;
+  if (!d.enabled) return { enabled: false, qualified: [] };
+
+  const { sources, candidates: raw } = await harvest(cfg);
+  if (!raw.length) {
+    return { enabled: true, sources, considered: 0, scanned: 0, qualified: [],
+      note: "no flow candidates (OptionStrat masters missing and/or UW off)" };
+  }
+
+  // Size-normalize BEFORE trimming, so a small-cap with a big relative
+  // footprint isn't cut just because a mega-cap had more raw dollars.
+  const candidates = await normalize(raw, cfg);
+  if (!candidates.length) {
+    return { enabled: true, sources, considered: raw.length, scanned: 0, qualified: [],
+      note: `all candidates filtered by size floors (normalize=${d.normalize || "marketcap"})` };
+  }
+
+  const shortlist = filterCandidates(candidates, cfg, { openTickers, cooldown });
+  if (!shortlist.length) return { enabled: true, sources, considered: candidates.length, scanned: 0, qualified: [] };
+
+  const scans = await scanAll(shortlist.map((c) => c.ticker), cfg);
+  const byTicker = Object.fromEntries(shortlist.map((c) => [c.ticker, c]));
+
+  const allowTags = new Set(d.acceptTags || ["CONFIRMED"]);
+  const qualified = [];
+  for (const s of scans) {
+    if (s.error) continue;
+    const c = byTicker[s.ticker] || {};
+    const side = c.side || "long";
+
+    // voldesk.py's tag is computed for LONGS ONLY (it tests spot >= pTrans), so
+    // it cannot gate a short. Shorts get the mirrored assessment instead.
+    let okTag, okGrade, shortRR = null;
+    if (side === "short") {
+      const lv = playbook.levelsFor(s, "short");
+      let spot = null;
+      try { spot = await alpaca.getLatestTrade(s.ticker, "delayed_sip"); } catch {}
+      const a = playbook.assessShort(s, spot, lv, { minRR: cfg.contractSelection?.minRR ?? 1.5 });
+      okTag = allowTags.has(a.tag);
+      okGrade = true;                      // no bearish grade exists; R/R is the bar
+      shortRR = a.rr;
+      s = { ...s, tag: a.tag, bearishReasons: a.reasons };
+    } else {
+      okTag = allowTags.has(s.tag);
+      okGrade = (s.grade ?? 0) >= (d.minGrade ?? 0);
+    }
+    if (!okTag || !okGrade) continue;
+    qualified.push({
+      ticker: s.ticker, side, tag: s.tag, grade: s.grade ?? null,
+      rr: shortRR ?? s.rr ?? null,
+      flowRank: c.rank ?? 0, flowScore: c.score ?? 0, netPremium: c.net_premium ?? 0,
+      relBps: c.relBps ?? null, marketCap: c.marketCap ?? null,
+      avgDollarVol: c.avgDollarVol ?? null,
+      tier: c.tier ?? null, tierLabel: c.tierLabel ?? null,
+      tierScore: c.tierScore ?? null, tierRefBps: c.tierRefBps ?? null,
+      flowSource: c.source || "?", inKnows: !!c.in_knows, inUnusual: !!c.in_unusual,
+    });
+  }
+  // Best flow conviction first — the entry stage takes them in this order.
+  qualified.sort((a, b) => b.flowRank - a.flowRank);
+
+  return {
+    enabled: true, sources, considered: candidates.length,
+    scanned: scans.length, qualified,
+    rejected: scans.filter((s) => !s.error && !qualified.find((q) => q.ticker === s.ticker))
+      .map((s) => ({ ticker: s.ticker, tag: s.tag, grade: s.grade ?? null })),
+  };
+}

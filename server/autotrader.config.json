@@ -11,15 +11,85 @@
     "entryCooldownMin": 30,
     "watchlist": []
   },
+  "discovery": {
+    "enabled": true,
+    "shadowMode": false,
+    "sources": { "optionstrat": true, "unusualwhales": false },
+    "uwFallbackOnly": true,
+    "everyMinutes": 30,
+    "maxScan": 8,
+    "scanConcurrency": 2,
+    "minPremium": 250000,
+    "minScore": 0.3,
+    "normalize": "marketcap",
+    "minTierScore": 1.0,
+    "maxTierScore": 20,
+    "keepUnsized": false,
+    "dollarVolRefBps": 20,
+    "tiers": {
+      "micro": { "enabled": false, "refBps": 15, "minPremium": 100000 },
+      "small": { "enabled": true, "refBps": 8, "minPremium": 250000 },
+      "mid": { "enabled": true, "refBps": 4, "minPremium": 500000 },
+      "large": { "enabled": true, "refBps": 1.5, "minPremium": 1000000 },
+      "mega": { "enabled": true, "refBps": 0.3, "minPremium": 2000000 }
+    },
+    "acceptTags": ["CONFIRMED"],
+    "minGrade": 0,
+    "maxDte": 45,
+    "requireDeltaBalance": true,
+    "exclude": []
+  },
   "flow": {
     "enabled": true,
     "mode": "size",
     "sources": { "optionstrat": true, "unusualwhales": false },
     "optionstratDir": "",
+    "maxAgeDays": 3,
+    "staleAction": "warn",
     "sizing": { "agree": 1.0, "neutral": 0.7, "disagree": 0.25 },
     "minScore": 0.15,
     "boosts": { "unusual": 0.1, "knows": 0.15 },
     "sourceWeights": { "optionstrat": 1.0, "unusualwhales": 1.0 }
+  },
+  "contractSelection": {
+    "mode": "rr",
+    "dteMin": 21,
+    "dteMax": 75,
+    "dteTarget": 45,
+    "strikeBandPct": 0.2,
+    "maxExpiries": 3,
+    "maxCandidates": 24,
+    "expectedDaysToTarget": 14,
+    "minRR": 1.5,
+    "maxSpreadPct": 0.15,
+    "minDelta": 0.35,
+    "maxDelta": 0.9,
+    "requireBreakevenBelowTarget": true,
+    "riskFreeRate": 0.04
+  },
+  "observe": {
+    "maxObserving": 25,
+    "maxObserveDays": 10,
+    "dropOnFlowGone": true,
+    "dropOnFlowFlip": true,
+    "flowDecayRatio": 0.4,
+    "blockedStrikes": 3,
+    "requireTags": ["CONFIRMED"],
+    "minGrade": 0
+  },
+  "retention": {
+    "snapshotDays": 30,
+    "snapshotsPerTicker": 40,
+    "keepClosedTrades": 200,
+    "maxDataMB": 200
+  },
+  "sides": { "long": true, "short": false },
+  "shares": {
+    "enabled": true,
+    "minShares": 1,
+    "maxNotionalPct": 0.1,
+    "allowShort": true,
+    "requireEasyToBorrow": true
   },
   "risk": { "basePremium": 300 }
 }

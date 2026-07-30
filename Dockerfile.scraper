@@ -1,0 +1,34 @@
+# Scraper service image — Chromium + Playwright, headless.
+#
+# Separate from the main Dockerfile on purpose: the web service should stay small
+# and fast to deploy, while this one carries a ~400MB browser. Build this as its
+# own Render service (Background Worker) or run it anywhere with Docker.
+#
+# Playwright's official image already contains Chromium and every system library
+# it needs — installing those by hand on slim Debian is a long, brittle list.
+FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
+
+WORKDIR /app
+
+# openpyxl for the master builder / cache builder. Playwright itself is preinstalled.
+RUN pip install --no-cache-dir openpyxl>=3.1.5
+
+# Only the flow pipeline is needed here — not the Node app.
+COPY flow/ /app/flow/
+
+# Data lives on a mounted volume so CSVs/masters/profile survive restarts.
+# SCRAPER_FEEDS=live keeps this to ONE browser tab, which roughly halves peak
+# memory vs all three feeds. Set to "live,unusual,knows" if you have the RAM and
+# want the in_unusual / in_knows ranking boosts.
+ENV OPTIONSTRAT_DIR=/data \
+    SCRAPER_HEADLESS=true \
+    SCRAPER_FEEDS=live \
+    SCRAPER_JS_HEAP_MB=256 \
+    BUILD_EVERY_MIN=15 \
+    MARKET_HOURS_ONLY=true \
+    PYTHONUNBUFFERED=1
+RUN mkdir -p /data
+
+# Chromium needs more than Docker's default 64MB /dev/shm; the launch args in
+# strata_flow.py (--disable-dev-shm-usage) handle the constrained case.
+CMD ["python", "/app/flow/scraper_service.py"]

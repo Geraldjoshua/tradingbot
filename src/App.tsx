@@ -4,8 +4,9 @@ import PaperTradingView from "./components/PaperTradingView";
 import GexView from "./components/GexView";
 import VolDeskView from "./components/VolDeskView";
 import AutoTraderView from "./components/AutoTraderView";
+import FlowUploadView from "./components/FlowUploadView";
 
-type Tab = "backtest" | "paper" | "gex" | "voldesk" | "auto";
+type Tab = "backtest" | "paper" | "gex" | "voldesk" | "auto" | "flow";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("backtest");
@@ -19,9 +20,11 @@ export default function App() {
         <button className={`tab ${tab === "gex" ? "active" : ""}`} onClick={() => setTab("gex")}>GEX</button>
         <button className={`tab ${tab === "voldesk" ? "active" : ""}`} onClick={() => setTab("voldesk")}>Vol Desk</button>
         <button className={`tab ${tab === "auto" ? "active" : ""}`} onClick={() => setTab("auto")}>Auto-trader</button>
+        <button className={`tab ${tab === "flow" ? "active" : ""}`} onClick={() => setTab("flow")}>Flow upload</button>
       </div>
       {tab === "backtest" ? <FaberView /> : tab === "paper" ? <PaperTradingView /> :
-       tab === "gex" ? <GexView /> : tab === "voldesk" ? <VolDeskView /> : <AutoTraderView />}
+       tab === "gex" ? <GexView /> : tab === "voldesk" ? <VolDeskView /> :
+       tab === "auto" ? <AutoTraderView /> : <FlowUploadView />}
     </div>
   );
 }

@@ -73,6 +73,58 @@ and re-add the `disk:` block shown in `render.yaml`.
 **3. Secrets go in env vars, never in the repo.** `.env` is git-ignored and
 docker-ignored. Set keys in the Render dashboard (`sync: false` above).
 
+## Running the OptionStrat scraper in the cloud (hands-off flow)
+
+The scraper is a real Chromium browser, so it can't live inside the web service on
+free. It runs as its **own** always-on process and **pushes** its result to the app:
+
+```
+scraper_service.py ──> strata_flow.py        (scrapes -> day CSVs)
+                  ──> optionstrat_master_builder.py  (CSVs -> masters)
+                  ──> build_flow_cache.py    (masters -> flow_cache.json, ~200KB)
+                  ──> push_flow_cache.py     (POST /api/flow-cache)
+```
+
+Push, not a shared disk, because **a Render disk attaches to exactly one service** —
+a worker cannot write files the web service reads. The upside: the scraper can run
+*anywhere* (Render worker, VPS, a spare machine) and the deployed bot stays fed.
+
+**Setup**
+
+1. On the web service set `FLOW_PUSH_TOKEN` to a long random string. Without it the
+   ingest route returns 503, so nobody can inject flow data by default.
+2. Run the scraper somewhere always-on, with:
+   ```bash
+   OPTIONSTRAT_DIR=/data \
+   FLOW_PUSH_URL=https://your-app.onrender.com \
+   FLOW_PUSH_TOKEN=<same secret> \
+   SCRAPER_HEADLESS=true \
+   python flow/scraper_service.py
+   ```
+   Or build the image: `docker build -f Dockerfile.scraper -t flow-scraper .`
+3. Verify: `curl https://your-app.onrender.com/api/flow-cache` → should show
+   `present: true` with a ticker count and `ageMinutes`.
+
+`scraper_service.py` restarts the scraper if it dies, rebuilds + pushes every
+`BUILD_EVERY_MIN` (15), and by default only scrapes 09:25–16:05 ET on weekdays
+(`MARKET_HOURS_ONLY=false` for 24/7).
+
+**Two hard limits, stated plainly:**
+
+- **This cannot run on Render's free plan.** Background workers are paid-only, and
+  Chromium with three feed tabs needs ~700MB–1GB, so `standard` (2GB) is the
+  realistic floor — `starter` (512MB) will OOM. The commented worker block in
+  `render.yaml` has it configured; uncomment when you're ready to pay. **Free
+  alternatives:** run `scraper_service.py` on any always-on machine you own (it
+  pushes to the cloud app identically), or use Unusual Whales, which is an API and
+  needs no browser at all.
+- **OptionStrat may block a datacenter IP.** Your own script notes the site
+  sometimes serves headless browsers a blank page. `strata_flow.py` now includes
+  fingerprint hardening (`navigator.webdriver` masked, plugins/languages spoofed,
+  real UA + ET timezone) which improves the odds, but a cloud IP can still be
+  refused. Watch the worker log for `rows visible: 0` — that's the tell. If it
+  happens, a residential-IP box or Unusual Whales are the ways out.
+
 **4. OptionStrat data doesn't exist on Render by itself.** The flow conviction
 reads `flow_master.xlsx` etc., which your **Playwright scraper** (`strata_flow.py`)
 produces. That scraper is a browser automation job — it does **not** belong in

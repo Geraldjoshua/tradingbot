@@ -38,6 +38,60 @@ services:
         value: iex           # datacenter IPs often lack a SIP entitlement; iex is safe
       # ---- Flow sources ----
       - key: OPTIONSTRAT_DIR
-        value: /app/data/optionstrat   # put master workbooks here (on the disk)
+        value: /app/data/optionstrat   # flow_cache.json is written here
       - key: UW_API_KEY
         sync: false          # leave unset to keep Unusual Whales off
+      # Shared secret that lets the scraper service POST /api/flow-cache.
+      # Generate a long random string; set the SAME value on the worker below.
+      - key: FLOW_PUSH_TOKEN
+        sync: false
+
+  # ---------------------------------------------------------------------------
+  # OptionStrat scraper — Chromium/Playwright, headless, pushes flow_cache.json
+  # to the web service above.
+  #
+  # ⚠ NOT AVAILABLE ON THE FREE PLAN — Render background workers are paid-only.
+  # That's a plan restriction, not a memory one: no amount of tab-trimming makes
+  # a free worker exist.
+  #
+  # Memory (each feed = one browser tab, the dominant cost):
+  #   SCRAPER_FEEDS=live              1 tab  ~300-430MB  -> `starter` (512MB) is
+  #                                                         plausible but tight
+  #   SCRAPER_FEEDS=live,unusual,knows 3 tabs ~500-700MB  -> needs `standard` (2GB)
+  # Starting lean on `starter` and watching for OOM restarts is the cheap path.
+  #
+  # Free alternatives: run flow/scraper_service.py on your own always-on machine
+  # (it pushes to the cloud app identically, $0), or subscribe to Unusual Whales
+  # (~$50/mo) which needs no browser and runs fine on free hosting.
+  #
+  # ⚠ Also uncertain: OptionStrat sometimes serves headless/datacenter browsers a
+  # blank page. strata_flow.py includes fingerprint hardening, but a cloud IP may
+  # still get blocked. Check the worker logs for "rows visible: 0".
+  #
+  # To enable: uncomment, set plan, and set FLOW_PUSH_URL to the web service URL.
+  # - type: worker
+  #   name: optionstrat-scraper
+  #   runtime: docker
+  #   plan: starter                  # 512MB — OK with SCRAPER_FEEDS=live (1 tab).
+  #                                  # Use `standard` (2GB) for all three feeds.
+  #   dockerfilePath: ./Dockerfile.scraper
+  #   autoDeploy: true
+  #   disk:
+  #     name: flowdata
+  #     mountPath: /data
+  #     sizeGB: 2
+  #   envVars:
+  #     - key: OPTIONSTRAT_DIR
+  #       value: /data
+  #     - key: SCRAPER_HEADLESS
+  #       value: "true"
+  #     - key: SCRAPER_FEEDS
+  #       value: live               # 1 tab. "live,unusual,knows" needs ~2GB.
+  #     - key: MARKET_HOURS_ONLY
+  #       value: "true"
+  #     - key: BUILD_EVERY_MIN
+  #       value: "15"
+  #     - key: FLOW_PUSH_URL
+  #       value: https://REPLACE-with-your-web-service.onrender.com
+  #     - key: FLOW_PUSH_TOKEN
+  #       sync: false                # must match the web service's value

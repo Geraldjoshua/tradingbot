@@ -198,9 +198,17 @@ export interface GexResult {
   asof: string;
   expiries: string[];
   gammaFlip: number | null;
+  flipFound?: boolean;
+  flipNote?: string | null;
   regime: "long_gamma" | "short_gamma" | null;
-  callWall: { strike: number; gex: number };
-  putWall: { strike: number; gex: number };
+  // null when no strike on that side survives the sanity filters
+  callWall: { strike: number; gex: number; oi?: number } | null;
+  putWall: { strike: number; gex: number; oi?: number } | null;
   totalGex: number;
+  callGex?: number;
+  putGex?: number;
+  netGex?: number;
+  grossGex?: number;
+  dataQuality?: Record<string, any>;
   profile: { strike: number; gex: number }[];
 }

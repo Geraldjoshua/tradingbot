@@ -19,6 +19,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import * as flow from "./flow.js";
 import * as vd from "./voldesk_trades.js";
+import * as discovery from "./discovery.js";
+import * as housekeeping from "./housekeeping.js";
+import * as observe from "./observe.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOG = path.join(ROOT, "data", "autotrader_log.json");
@@ -88,6 +91,38 @@ async function manage(cfg) {
   }
 }
 
+// ---- DISCOVER: let flow surface new names ---------------------------------
+// Runs at most every discovery.everyMinutes (Vol Desk scans are expensive).
+// Returns the discovered tickers, which get appended to the watchlist for this
+// tick's entry pass. In shadowMode it only logs them and returns nothing.
+async function discoverNames(cfg, ctx) {
+  const d = cfg.discovery || {};
+  if (!d.enabled) return [];
+  const st = loadState();
+  const gapMs = Math.max(1, d.everyMinutes || 30) * 60 * 1000;
+  if (st.lastDiscovery && Date.now() - st.lastDiscovery < gapMs) return st.lastQualified || [];
+
+  const res = await discovery.discover(cfg, ctx);
+  st.lastDiscovery = Date.now();
+  const names = (res.qualified || []).map((q) => q.ticker);
+  st.lastQualified = names;
+  saveState(st);
+
+  if (res.qualified?.length) {
+    log(d.shadowMode ? "info" : "trade", d.shadowMode ? "discovery-shadow" : "discovery-hit", {
+      sources: (res.sources || []).join("+"),
+      considered: res.considered, scanned: res.scanned,
+      qualified: res.qualified.map((q) => `${q.ticker}(${q.tag},g${q.grade},$${Math.round(q.netPremium / 1000)}k)`).join(" "),
+    });
+  } else {
+    log("info", "discovery-none", {
+      sources: (res.sources || []).join("+") || "none",
+      considered: res.considered ?? 0, scanned: res.scanned ?? 0, note: res.note || "",
+    });
+  }
+  return d.shadowMode ? [] : names;     // shadow: surface nothing to the buyer
+}
+
 // ---- ENTER: trigger + flow gated auto-buy ---------------------------------
 async function enter(cfg) {
   const a = cfg.automation;
@@ -95,10 +130,7 @@ async function enter(cfg) {
   if (!a.strategies.voldesk) return;             // only wired strategy for now
   if (a.marketHoursOnly && !marketOpen()) return;
 
-  const watch = (a.watchlist || []).map((t) => String(t).toUpperCase()).filter(Boolean);
-  if (!watch.length) return;
-
-  const st = loadState();
+  let st = loadState();
   if (st.entries >= a.maxDailyEntries) return;
 
   let openRows = [];
@@ -109,6 +141,23 @@ async function enter(cfg) {
   const now = Date.now();
   const cooldownMs = (a.entryCooldownMin || 0) * 60 * 1000;
 
+  // Candidates, in priority order:
+  //   1. READY names from the observe list — vetted over one or more days
+  //      (flow still valid + Vol Desk CONFIRMED). This is the main path.
+  //   2. Any manual watchlist entries you added by hand.
+  //   3. Same-session discovery, if enabled (faster but less vetted).
+  const readyTrades = observe.readyTrades();                    // [{ticker, side}]
+  const manual = (a.watchlist || []).map((t) => String(t).toUpperCase()).filter(Boolean);
+  const found = await discoverNames(cfg, { openTickers, cooldown: st.cooldown || {} });
+  // discoverNames persists its own fields — re-read so we don't clobber them.
+  st = loadState();
+  // Merge into {ticker -> side}; observe wins (it's the vetted source).
+  const plan = new Map();
+  for (const t of [...manual, ...found]) plan.set(t, "long");
+  for (const r of readyTrades) plan.set(r.ticker, r.side);
+  const watch = [...plan.keys()];
+  if (!watch.length) return;
+
   for (const ticker of watch) {
     if (openCount >= a.maxConcurrent) break;
     if (st.entries >= a.maxDailyEntries) break;
@@ -116,19 +165,22 @@ async function enter(cfg) {
     if (cooldownMs && st.cooldown[ticker] && now - st.cooldown[ticker] < cooldownMs) continue;
 
     try {
+      const side = plan.get(ticker) || "long";
       const conviction = await flow.getConviction(ticker, cfg);
-      const decision = flow.decideForTrade(conviction, cfg, "long");
+      const decision = flow.decideForTrade(conviction, cfg, side);
 
       const r = await vd.enterTrade({
-        ticker, riskPremium: cfg.risk.basePremium, confirm: true, force: false,
+        ticker, side, riskPremium: cfg.risk.basePremium, confirm: true, force: false,
         flowDecision: { conviction, decision },
       });
 
       if (r.status === "ENTERED") {
         openCount++; openTickers.add(ticker);
         st.entries++; st.cooldown[ticker] = now; saveState(st);
+        try { observe.markEntered(ticker, r.position?.id); } catch {}   // off the list, it's a position now
         log("trade", "auto-entry", {
-          ticker, id: r.position.id, contracts: r.position.contracts,
+          ticker, side, instrument: r.instrument || "option",
+          id: r.position.id, contracts: r.position.contracts ?? r.position.shares,
           flowStance: decision.stance, flowMult: decision.sizeMultiplier,
           flowDir: decision.flowDirection, flowScore: decision.flowScore,
           budget: r.position.effectiveBudget,
@@ -145,6 +197,47 @@ async function enter(cfg) {
   }
 }
 
+// ---- Daily observe-list re-assessment --------------------------------------
+// Runs once per day, pre-open if possible, so READY/DROPPED status is fresh
+// before the trigger window. This is the "next day, if it still meets every
+// requirement, take it — otherwise don't" step.
+async function maybeAssess(cfg) {
+  try {
+    const st = loadState();
+    if (st.lastAssessDay === todayISO()) return;
+    if (!observe.activeList().length) return;
+    const r = await observe.assessAll(cfg);
+    const st2 = loadState();
+    st2.lastAssessDay = todayISO();
+    saveState(st2);
+    log("info", "observe-assessed", {
+      assessed: r.assessed,
+      ready: r.ready.join(",") || "-",
+      dropped: r.dropped.map((d) => `${d.ticker}(${d.reason})`).join("; ") || "-",
+    });
+    observe.prune(30);
+  } catch (e) {
+    log("error", "observe-assess-failed", { error: String(e.message || e) });
+  }
+}
+
+// ---- Housekeeping: prune data/ once per day --------------------------------
+function maybeSweep(cfg) {
+  try {
+    const st = loadState();
+    if (st.lastSweepDay === todayISO()) return;
+    const r = housekeeping.sweep(cfg);
+    st.lastSweepDay = todayISO();
+    saveState(st);
+    log("info", "housekeeping", {
+      snapshotsRemoved: r.snapshots.removed, tradesRolled: r.trades.rolled,
+      dataMB: r.after.dataMB, freedMB: r.freedMB, ...(r.warning ? { warning: r.warning } : {}),
+    });
+  } catch (e) {
+    log("error", "housekeeping-failed", { error: String(e.message || e) });
+  }
+}
+
 // ---- tick ------------------------------------------------------------------
 async function tick() {
   if (busy) return;                              // never overlap ticks
@@ -153,7 +246,9 @@ async function tick() {
     const cfg = flow.loadConfig();
     if (!cfg.automation.enabled) { stop(true); return; }
     await manage(cfg);                            // always manage exits
+    await maybeAssess(cfg);                       // re-vet the observe list (once/day)
     await enter(cfg);                             // enter only in full + hours
+    maybeSweep(cfg);                              // bound disk growth (once/day)
   } catch (e) {
     log("error", "tick-failed", { error: String(e.message || e) });
   } finally {
@@ -179,9 +274,41 @@ export function stop(silent = false) {
   return status();
 }
 
+// ---- Data-loss detection ---------------------------------------------------
+// On a host without a persistent disk (Render free), every restart/redeploy wipes
+// data/ — the uploaded flow cache AND the observe list vanish. That's silent
+// unless we say so, and a silent empty observe list looks identical to "nothing
+// qualified today". So on boot we check for the telltale signs and raise a flag
+// the UI shows prominently until you re-upload.
+export function dataHealth(cfg = flow.loadConfig()) {
+  const cs = flow.cacheStatus(cfg);
+  let observing = 0, everTraded = 0;
+  try { observing = observe.activeList().length; } catch {}
+  try { everTraded = vd.listAll().length; } catch {}
+  const usingOptionStrat = cfg.flow.sources.optionstrat && !cfg.flow.sources.unusualwhales;
+  const needsUpload = usingOptionStrat && !cs.present;
+  return {
+    needsUpload,
+    flowPresent: cs.present,
+    flowAgeDays: cs.ageDays ?? null,
+    observing,
+    knownPositions: everTraded,
+    message: needsUpload
+      ? (observing === 0 && everTraded === 0
+        ? "No flow data and nothing tracked — if this follows a restart/redeploy, your data was reset. Re-upload tonight's flow to resume finding trades."
+        : "No flow_cache.json on the server — upload flow to keep discovery running.")
+      : null,
+  };
+}
+
 // Boot: auto-start only if the config was left enabled.
 export function boot() {
   const cfg = flow.loadConfig();
+  try {
+    const h = dataHealth(cfg);
+    if (h.needsUpload) log("error", "needs-flow-upload", { message: h.message, observing: h.observing });
+    else log("info", "boot-data-ok", { flowAgeDays: h.flowAgeDays, observing: h.observing });
+  } catch {}
   if (cfg.automation.enabled) {
     const ms = Math.max(10, cfg.automation.pollSeconds) * 1000;
     timer = setInterval(tick, ms);
@@ -195,10 +322,16 @@ export function status() {
   const st = loadState();
   let open = 0;
   try { open = vd.listAll().filter((p) => p.status === "OPEN").length; } catch {}
+  let flowCache = null, observing = 0, ready = [];
+  try { flowCache = flow.cacheStatus(cfg); } catch {}
+  try { observing = observe.activeList().length; ready = observe.readyTickers(); } catch {}
   return {
     running: Boolean(timer),
     marketOpen: marketOpen(),
     config: cfg,
+    flowCache,                                  // freshness of the uploaded book
+    dataHealth: (() => { try { return dataHealth(cfg); } catch { return null; } })(),
+    observing, ready,
     dailyEntries: st.entries,
     openPositions: open,
     log: readJson(LOG, []).slice(-50).reverse(),

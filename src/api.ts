@@ -72,6 +72,20 @@ export const closePosition = (symbol: string) =>
 export const getFlow = (ticker: string, side: "long" | "short" = "long") =>
   j<any>(`/api/flow?ticker=${encodeURIComponent(ticker)}&side=${side}`);
 
+export const runDiscovery = () => j<any>("/api/discovery");
+
+// ---- Nightly flow upload + observe list ----------------------------------
+export const uploadFlowFile = (file: File) =>
+  j<any>(`/api/flow-upload?filename=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: file,
+  });
+export const listFlowFiles = () => j<{ dir: string; files: any[] }>("/api/flow-upload");
+export const ingestFlow = () => post("/api/flow-ingest", {});
+export const getObserve = () => j<any>("/api/observe");
+export const assessObserve = (force = false) => post("/api/observe/assess", { force });
+export const dropObserve = (ticker: string, reason?: string) => post("/api/observe/drop", { ticker, reason });
 export const autoStatus = () => j<any>("/api/autotrader/status");
 export const autoStart = () => post("/api/autotrader/start", {});
 export const autoStop = () => post("/api/autotrader/stop", {});

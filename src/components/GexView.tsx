@@ -58,13 +58,14 @@ export default function GexView() {
             </div>
             <div className="stats-grid">
               <div className="stat"><div className="k">Spot</div><div className="v">${gex.spot}</div></div>
-              <div className="stat"><div className="k">Gamma flip</div><div className="v">{gex.gammaFlip ?? "—"}</div></div>
+              <div className="stat"><div className="k">Gamma flip</div>
+                <div className="v">{gex.flipFound === false ? "none in range" : (gex.gammaFlip ?? "—")}</div></div>
               <div className="stat"><div className="k">Regime</div>
                 <div className={`v ${gex.regime === "long_gamma" ? "pos" : "neg"}`}>
                   {gex.regime === "long_gamma" ? "Long γ" : gex.regime === "short_gamma" ? "Short γ" : "—"}
                 </div></div>
-              <div className="stat"><div className="k">Call wall (resist.)</div><div className="v pos">{gex.callWall.strike}</div></div>
-              <div className="stat"><div className="k">Put wall (support)</div><div className="v neg">{gex.putWall.strike}</div></div>
+              <div className="stat"><div className="k">Call wall (resist.)</div><div className="v pos">{gex.callWall?.strike ?? "—"}</div></div>
+              <div className="stat"><div className="k">Put wall (support)</div><div className="v neg">{gex.putWall?.strike ?? "—"}</div></div>
               <div className="stat"><div className="k">Total GEX /1%</div>
                 <div className={`v ${gex.totalGex >= 0 ? "pos" : "neg"}`}>{fmtB(gex.totalGex)}</div></div>
             </div>

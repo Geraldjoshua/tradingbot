@@ -76,6 +76,42 @@ def parse_premium(premium_str, tag=None):
         return None
 
 
+# ── FAST PATH: flow_cache.json (built by flow/build_flow_cache.py) ──────────
+# Reading the Aggregate sheet out of an 8MB master costs ~8.7s once Active grows
+# to ~150k rows (openpyxl must parse the shared-string table regardless of
+# read_only). The cache turns that into a few milliseconds. We always prefer it
+# and fall back to the workbooks if it's missing.
+CACHE_NAME = "flow_cache.json"
+_CACHE = {"path": None, "blob": None}
+
+
+def _load_cache(directory):
+    path = Path(directory) / CACHE_NAME
+    if _CACHE["path"] == str(path) and _CACHE["blob"] is not None:
+        return _CACHE["blob"]
+    if not path.exists():
+        return None
+    try:
+        blob = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(blob, dict) or "tickers" not in blob:
+        return None
+    _CACHE["path"], _CACHE["blob"] = str(path), blob
+    return blob
+
+
+def _agg_from_cache(directory, ticker):
+    blob = _load_cache(directory)
+    if not blob:
+        return None
+    e = blob["tickers"].get(ticker)
+    if not e:
+        return None
+    return (e.get("bull", 0.0), e.get("bear", 0.0), e.get("cw", []), e.get("pw", [])), \
+        bool(e.get("u")), bool(e.get("k"))
+
+
 def _agg_from_master(path, ticker):
     """Return (bullish, bearish, call_walls, put_walls) for ticker from a master's
     Aggregate sheet, or None if the ticker/sheet/file is missing."""
@@ -153,6 +189,23 @@ def conviction(ticker, directory):
     directory = Path(directory)
     used = []
 
+    # Fast path first.
+    cached = _agg_from_cache(directory, ticker)
+    if cached is not None:
+        (bullish, bearish, call_walls, put_walls), in_unusual, in_knows = cached
+        net = bullish - bearish
+        total = bullish + bearish
+        score = round(abs(net) / total, 4) if total > 0 else 0.0
+        direction = "neutral" if total <= 0 else ("bullish" if net > 0 else "bearish" if net < 0 else "neutral")
+        return {
+            "ticker": ticker, "found": True,
+            "bullish_premium": round(bullish, 2), "bearish_premium": round(bearish, 2),
+            "net_premium": round(net, 2), "direction": direction, "score": score,
+            "in_unusual": in_unusual, "in_knows": in_knows,
+            "call_walls": call_walls, "put_walls": put_walls,
+            "sources": [CACHE_NAME],
+        }
+
     agg = _agg_from_master(directory / MASTERS["live"], ticker)
     if agg is not None:
         used.append(MASTERS["live"])
@@ -201,12 +254,157 @@ def conviction(ticker, directory):
     }
 
 
+# ── DISCOVERY: rank the whole book, don't just answer about one ticker ──────
+
+def _all_rows_from_master(path):
+    """Every Aggregate row for a master as {ticker: (bullish, bearish)}."""
+    out = {}
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return out
+    if not path.exists():
+        return out
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return out
+    if "Aggregate" not in wb.sheetnames:
+        wb.close(); return out
+    rows = ws_rows = wb["Aggregate"].iter_rows(values_only=True)
+    header = next(ws_rows, None)
+    if not header:
+        wb.close(); return out
+    idx = {str(h): i for i, h in enumerate(header)}
+    t_i = idx.get("ticker", 0)
+    b_i, r_i = idx.get("bullish_premium"), idx.get("bearish_premium")
+    for row in ws_rows:
+        if not row or row[t_i] in (None, ""):
+            continue
+        t = str(row[t_i]).upper()
+        bull = parse_premium(row[b_i]) if b_i is not None else 0.0
+        bear = parse_premium(row[r_i]) if r_i is not None else 0.0
+        out[t] = (bull or 0.0, bear or 0.0)
+    wb.close()
+    return out
+
+
+def _daycsv_all(directory):
+    """Fallback discovery source: aggregate today's live day-CSV by ticker."""
+    day = datetime.now().strftime("%Y-%m-%d")
+    path = directory / f"flow_{day}.csv"
+    out = {}
+    if not path.exists():
+        return out
+    try:
+        with path.open(newline="") as fh:
+            for r in csv.DictReader(fh):
+                t = str(r.get("ticker", "")).upper()
+                if not t:
+                    continue
+                prem = parse_premium(r.get("premium"), r.get("premiumTag")) or 0.0
+                sent = str(r.get("sentiment", "")).lower()
+                bull, bear = out.get(t, (0.0, 0.0))
+                if sent in BULLISH_SENTS:
+                    bull += prem
+                elif sent in BEARISH_SENTS:
+                    bear += prem
+                else:
+                    continue
+                out[t] = (bull, bear)
+    except Exception:
+        return {}
+    return out
+
+
+def discover(directory, top_n=10, min_premium=250_000.0, min_score=0.30,
+             direction="bullish", boost_unusual=1.25, boost_knows=1.5):
+    """Rank tickers by bullish conviction across all three feeds.
+
+    rank = net_premium * skew_score * feed_boost
+      net_premium  — bullish minus bearish (only positive/bullish names kept)
+      skew_score   — |net| / total, so a one-sided book beats a near-tie
+      feed_boost   — multiplier if the name also appears in the "Highly Unusual"
+                     and/or "In The Know" books (your higher-signal presets)
+    """
+    directory = Path(directory)
+    src = "masters"
+    blob = _load_cache(directory)
+    if blob:                                   # fast path
+        live = {t: (e.get("bull", 0.0), e.get("bear", 0.0)) for t, e in blob["tickers"].items()}
+        unusual = {t for t, e in blob["tickers"].items() if e.get("u")}
+        knows = {t for t, e in blob["tickers"].items() if e.get("k")}
+        src = CACHE_NAME
+    else:
+        live = _all_rows_from_master(directory / MASTERS["live"])
+        if not live:
+            live = _daycsv_all(directory)
+            src = "day-csv"
+        unusual = set(_all_rows_from_master(directory / MASTERS["unusual"]).keys())
+        knows = set(_all_rows_from_master(directory / MASTERS["knows"]).keys())
+
+    want_bull = direction in ("bullish", "both")
+    want_bear = direction in ("bearish", "both")
+
+    cands = []
+    for t, (bull, bear) in live.items():
+        net = bull - bear
+        total = bull + bear
+        if total <= 0:
+            continue
+        # Keep only the direction(s) the caller trades. A bullish book is a long
+        # candidate; a bearish book is a short (put) candidate.
+        if net > 0 and not want_bull:
+            continue
+        if net < 0 and not want_bear:
+            continue
+        if net == 0:
+            continue
+        score = abs(net) / total
+        if abs(net) < min_premium or score < min_score:
+            continue
+        side = "long" if net > 0 else "short"
+        boost = 1.0
+        if t in unusual:
+            boost *= boost_unusual
+        if t in knows:
+            boost *= boost_knows
+        cands.append({
+            "ticker": t,
+            "side": side,
+            "bullish_premium": round(bull, 2),
+            "bearish_premium": round(bear, 2),
+            "net_premium": round(net, 2),          # signed: +bullish, -bearish
+            "abs_premium": round(abs(net), 2),     # magnitude, for ranking
+            "score": round(score, 4),
+            "in_unusual": t in unusual,
+            "in_knows": t in knows,
+            "rank": round(abs(net) * score * boost, 2),
+        })
+    cands.sort(key=lambda c: c["rank"], reverse=True)
+    return {"source": "optionstrat", "via": src, "count": len(cands), "candidates": cands[:top_n]}
+
+
 def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({"found": False, "error": "usage: optionstrat_flow.py TICKER [dir]"}))
+    argv = sys.argv[1:]
+    # Discovery mode:  optionstrat_flow.py --discover <dir> [topN] [minPremium] [minScore]
+    if argv and argv[0] == "--discover":
+        directory = argv[1] if len(argv) > 1 else "."
+        top_n = int(argv[2]) if len(argv) > 2 else 10
+        min_prem = float(argv[3]) if len(argv) > 3 else 250_000.0
+        min_score = float(argv[4]) if len(argv) > 4 else 0.30
+        direction = argv[5] if len(argv) > 5 else "bullish"
+        try:
+            print(json.dumps(discover(directory, top_n, min_prem, min_score, direction)))
+        except Exception as e:
+            print(json.dumps({"source": "optionstrat", "count": 0, "candidates": [], "error": str(e)}))
         return
-    ticker = sys.argv[1]
-    directory = sys.argv[2] if len(sys.argv) > 2 else "."
+
+    if not argv:
+        print(json.dumps({"found": False, "error": "usage: optionstrat_flow.py TICKER [dir] | --discover DIR [topN]"}))
+        return
+    ticker = argv[0]
+    directory = argv[1] if len(argv) > 1 else "."
     try:
         print(json.dumps(conviction(ticker, directory)))
     except Exception as e:  # never crash the caller

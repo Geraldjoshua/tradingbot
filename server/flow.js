@@ -32,14 +32,53 @@ const DEFAULTS = {
     marketHoursOnly: true, t1Action: "take-profit",
     maxConcurrent: 5, maxDailyEntries: 3, entryCooldownMin: 30, watchlist: [],
   },
+  discovery: {
+    enabled: true, shadowMode: false,
+    sources: { optionstrat: true, unusualwhales: false },
+    uwFallbackOnly: true, everyMinutes: 30,
+    maxScan: 8, scanConcurrency: 2,
+    minPremium: 250000, minScore: 0.3,
+    normalize: "marketcap", minTierScore: 1.0, maxTierScore: 20,
+    keepUnsized: false, dollarVolRefBps: 20,
+    tiers: {
+      micro: { enabled: false, refBps: 15, minPremium: 100000 },
+      small: { enabled: true, refBps: 8, minPremium: 250000 },
+      mid: { enabled: true, refBps: 4, minPremium: 500000 },
+      large: { enabled: true, refBps: 1.5, minPremium: 1000000 },
+      mega: { enabled: true, refBps: 0.3, minPremium: 2000000 },
+    },
+    acceptTags: ["CONFIRMED"], minGrade: 0,
+    maxDte: 45, requireDeltaBalance: true, exclude: [],
+  },
   flow: {
     enabled: true, mode: "size",
     sources: { optionstrat: true, unusualwhales: false },
     optionstratDir: "",
+    maxAgeDays: 3, staleAction: "warn",
     sizing: { agree: 1.0, neutral: 0.7, disagree: 0.25 },
     minScore: 0.15,
     boosts: { unusual: 0.1, knows: 0.15 },
     sourceWeights: { optionstrat: 1.0, unusualwhales: 1.0 },
+  },
+  observe: {
+    maxObserving: 25, maxObserveDays: 10,
+    dropOnFlowGone: true, dropOnFlowFlip: true, flowDecayRatio: 0.4,
+    blockedStrikes: 3, requireTags: ["CONFIRMED"], minGrade: 0,
+  },
+  contractSelection: {
+    mode: "rr", dteMin: 21, dteMax: 75, dteTarget: 45,
+    strikeBandPct: 0.20, maxExpiries: 3, maxCandidates: 24,
+    expectedDaysToTarget: 14, minRR: 1.5, maxSpreadPct: 0.15,
+    minDelta: 0.35, maxDelta: 0.90,
+    requireBreakevenBelowTarget: true, riskFreeRate: 0.04,
+  },
+  // Which directions the bot may trade. Shorts (puts) are OPT-IN because the
+  // bearish playbook is a mirror heuristic with far less forward-testing than
+  // the long side — see server/playbook.js.
+  sides: { long: true, short: false },
+  shares: {
+    enabled: true, minShares: 1, maxNotionalPct: 0.10,
+    allowShort: true, requireEasyToBorrow: true,
   },
   risk: { basePremium: 300 },
 };
@@ -76,6 +115,42 @@ export function saveConfig(partial) {
 // project root (where you'd typically run the scraper from).
 function optionstratDir(cfg) {
   return cfg.flow.optionstratDir || process.env.OPTIONSTRAT_DIR || ROOT;
+}
+
+// ---- Flow freshness guard --------------------------------------------------
+// You upload flow at night. If an upload is missed (travel, forgot, scraper
+// died), the cache silently goes stale and the bot would keep trading on a
+// week-old book as if it were current. That's the dangerous failure mode: not
+// an error, just quietly wrong conviction.
+//
+// So we read the cache's own `generated` stamp and report the age. What happens
+// past maxAgeDays is YOUR choice (flow.staleAction, switchable in the UI):
+//   "off"   — ignore age entirely
+//   "warn"  — DEFAULT: banner only, trading continues untouched
+//   "block" — refuse new entries until you upload
+// Exits are never blocked in any mode — managing an open position must not
+// depend on flow freshness.
+export function cacheStatus(cfg = loadConfig()) {
+  const dir = optionstratDir(cfg);
+  const p = path.join(dir, "flow_cache.json");
+  const maxAgeDays = cfg.flow.maxAgeDays ?? 3;
+  const action = cfg.flow.staleAction || "warn";
+  if (!fs.existsSync(p)) {
+    return { present: false, stale: true, ageHours: null, maxAgeDays, action,
+      note: "no flow_cache.json — upload flow or enable Unusual Whales" };
+  }
+  let generated = null;
+  try { generated = JSON.parse(fs.readFileSync(p)).generated || null; } catch {}
+  // Fall back to file mtime if the blob has no stamp.
+  const ts = generated ? Date.parse(generated) : fs.statSync(p).mtimeMs;
+  const ageHours = +((Date.now() - ts) / 3.6e6).toFixed(1);
+  const stale = ageHours > maxAgeDays * 24;
+  return {
+    present: true, generated, ageHours,
+    ageDays: +(ageHours / 24).toFixed(2),
+    maxAgeDays, action, stale,
+    note: stale ? `flow is ${(ageHours / 24).toFixed(1)}d old (limit ${maxAgeDays}d)` : null,
+  };
 }
 
 function runOptionStrat(ticker, dir) {
@@ -148,6 +223,24 @@ export function decideForTrade(conv, cfg = loadConfig(), side = "long") {
 
   // Flow off, or nothing found -> neutral: full size, never block.
   if (!f.enabled) return verdict("flow-disabled", "neutral", 1.0, false, conv, cfg);
+
+  // STALE GUARD — only meaningful when OptionStrat (a file that ages) is the
+  // source. Unusual Whales is live, so if UW supplied this conviction we don't
+  // penalise it for a stale file.
+// staleAction: "off"   -> guard disabled entirely; age is reported but ignored
+//              "warn"  -> DEFAULT. Banner tells you it's stale; trading unaffected.
+//              "block" -> refuse new entries until you upload.
+  const uwLive = f.sources.unusualwhales && conv.sources?.unusualwhales?.found;
+  const action = f.staleAction || "warn";
+  if (!uwLive && action === "block") {
+    const cs = cacheStatus(cfg);
+    if (cs.stale) {
+      const v = verdict("flow-stale", "neutral", 0, true, conv, cfg);
+      v.stale = true; v.staleNote = cs.note; v.ageDays = cs.ageDays;
+      return v;
+    }
+  }
+
   if (!conv.found) return verdict("no-flow-data", "neutral", modeNeutralMult(cfg), false, conv, cfg);
 
   const agrees = wantBullish ? conv.direction === "bullish" : conv.direction === "bearish";

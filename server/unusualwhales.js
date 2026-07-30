@@ -62,6 +62,55 @@ async function fetchAlerts(ticker) {
   return j.data || j.flow_alerts || j.alerts || (Array.isArray(j) ? j : []) || [];
 }
 
+// ---- Discovery: rank the whole market's flow, not one ticker ---------------
+// Pulls the market-wide flow-alert feed and aggregates premium per ticker, so
+// the auto-trader can SURFACE names instead of only grading a watchlist.
+// Returns [] on any failure / missing key — discovery just finds nothing.
+const MARKET_PATH = process.env.UW_MARKET_FLOW_PATH || "/api/option-trades/flow-alerts";
+
+export async function getTopFlowTickers({ topN = 10, minPremium = 250000, minScore = 0.3 } = {}) {
+  if (!KEY) return { source: "unusualwhales", count: 0, candidates: [], reason: "UW_API_KEY not set" };
+  try {
+    const url = new URL(BASE + MARKET_PATH);
+    url.searchParams.set("limit", "500");
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${KEY}`, Accept: "application/json" } });
+    if (!r.ok) throw new Error(`UW ${r.status}`);
+    const j = await r.json();
+    const alerts = j.data || j.flow_alerts || j.alerts || (Array.isArray(j) ? j : []) || [];
+
+    const cutoff = Date.now() - LOOKBACK_MIN * 60 * 1000;
+    const agg = new Map(); // ticker -> { bull, bear }
+    for (const a of alerts) {
+      const t = String(a.ticker ?? a.underlying_symbol ?? a.symbol ?? "").toUpperCase();
+      if (!t) continue;
+      const ts = Date.parse(a.created_at ?? a.executed_at ?? a.timestamp ?? "") || Date.now();
+      if (ts < cutoff) continue;
+      const prem = premiumOf(a); const side = sideOf(a);
+      if (!prem || !side) continue;
+      const cur = agg.get(t) || { bull: 0, bear: 0 };
+      if (side === "bullish") cur.bull += prem; else cur.bear += prem;
+      agg.set(t, cur);
+    }
+
+    const candidates = [];
+    for (const [ticker, { bull, bear }] of agg) {
+      const net = bull - bear, total = bull + bear;
+      if (net <= 0 || total <= 0) continue;            // long-only discovery
+      const score = Math.abs(net) / total;
+      if (net < minPremium || score < minScore) continue;
+      candidates.push({
+        ticker, bullish_premium: +bull.toFixed(2), bearish_premium: +bear.toFixed(2),
+        net_premium: +net.toFixed(2), score: +score.toFixed(4),
+        in_unusual: false, in_knows: false, rank: +(net * score).toFixed(2),
+      });
+    }
+    candidates.sort((a, b) => b.rank - a.rank);
+    return { source: "unusualwhales", count: candidates.length, candidates: candidates.slice(0, topN) };
+  } catch (e) {
+    return { source: "unusualwhales", count: 0, candidates: [], error: String(e.message || e) };
+  }
+}
+
 export async function getConviction(ticker) {
   ticker = String(ticker).toUpperCase();
   if (!KEY) return { ticker, found: false, reason: "UW_API_KEY not set", source: "unusualwhales", direction: "neutral", score: 0 };

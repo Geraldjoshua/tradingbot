@@ -117,6 +117,11 @@ export async function getOptionQuotes(symbols) {
 export async function getAccount() {
   return req(`${TRADE}/v2/account`);
 }
+// Asset metadata — needed by the share fallback to check tradable / shortable /
+// easy-to-borrow before placing a stock order (especially for shorts).
+export async function getAsset(symbol) {
+  return req(`${TRADE}/v2/assets/${encodeURIComponent(symbol.toUpperCase())}`);
+}
 export async function getPositions() {
   return req(`${TRADE}/v2/positions`);
 }

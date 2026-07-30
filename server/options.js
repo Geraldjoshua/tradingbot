@@ -42,6 +42,31 @@ export function bs(type, S, K, T, r, sigma) {
   return { price, delta, gamma };
 }
 
+// Implied volatility from a market price, by bisection on bs().
+//
+// Needed by the R/R contract selector: to project what a contract will be worth
+// if the underlying reaches T1 (or the stop), we first need the vol the market
+// is currently pricing into THAT contract. Bisection (not Newton) because it
+// can't diverge on deep ITM/OTM strikes where vega collapses.
+//
+// Returns null if the price is outside the arbitrage bounds or won't converge —
+// callers fall back to realized vol.
+export function impliedVol(type, marketPrice, S, K, T, r = 0.04, tol = 1e-4, maxIter = 100) {
+  if (!(marketPrice > 0) || !(S > 0) || !(K > 0) || !(T > 0)) return null;
+  const intrinsic = type === "call" ? Math.max(S - K * Math.exp(-r * T), 0) : Math.max(K * Math.exp(-r * T) - S, 0);
+  if (marketPrice < intrinsic - 0.01) return null;        // below intrinsic: bad quote
+  let lo = 1e-4, hi = 5.0;
+  if (bs(type, S, K, T, r, hi).price < marketPrice) return null;  // needs vol > 500%
+  for (let i = 0; i < maxIter; i++) {
+    const mid = (lo + hi) / 2;
+    const p = bs(type, S, K, T, r, mid).price;
+    if (Math.abs(p - marketPrice) < tol) return mid;
+    if (p > marketPrice) hi = mid; else lo = mid;
+  }
+  const out = (lo + hi) / 2;
+  return out > 0.001 && out < 4.99 ? out : null;
+}
+
 // Annualized realized volatility from daily close-to-close returns.
 export function realizedVol(dailyBars) {
   const closes = dailyBars.map((b) => b.c).filter((c) => c > 0);

@@ -11,6 +11,9 @@ import { optionOverlay } from "./options.js";
 import * as vdTrades from "./voldesk_trades.js";
 import * as flow from "./flow.js";
 import * as autotrader from "./autotrader.js";
+import * as discovery from "./discovery.js";
+import * as housekeeping from "./housekeeping.js";
+import * as observe from "./observe.js";
 import { startKeepAlive } from "./keepalive.js";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -38,7 +41,11 @@ function runPy(script, args) {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Limit raised from the 100kb default: the scraper POSTs flow_cache.json to
+// /api/flow-cache, which is a few hundred KB for a few thousand tickers (and
+// grows with coverage). The global parser runs before any route-level one, so
+// the limit has to be set here or large pushes 413 before reaching the route.
+app.use(express.json({ limit: process.env.JSON_LIMIT || "32mb" }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -312,6 +319,175 @@ app.get("/api/flow", async (req, res) => {
     const conviction = await flow.getConviction(ticker, cfg);
     const decision = flow.decideForTrade(conviction, cfg, req.query.side === "short" ? "short" : "long");
     res.json({ conviction, decision });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Discovery: what would flow surface right now? ------------------------
+// Runs the full harvest -> filter -> Vol Desk validation pipeline on demand.
+// Safe to call any time: it never places orders, it only scans and ranks.
+app.get("/api/discovery", async (_req, res) => {
+  try {
+    const cfg = flow.loadConfig();
+    const openTickers = new Set(vdTrades.listAll().filter((p) => p.status === "OPEN").map((p) => p.ticker));
+    res.json(await discovery.discover(cfg, { openTickers, cooldown: {} }));
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Nightly flow upload (xlsx/csv from your Windows scraper) --------------
+// You upload the masters + day-CSVs; we distill them into flow_cache.json and
+// then DELETE the uploads. Nothing bulky is ever retained: the workbooks are a
+// transport format, the cache is the only thing we keep (a few hundred KB).
+//
+// Raw-body upload (one file per request) instead of multipart so we don't add a
+// dependency. The browser panel loops over your selected files.
+function flowDir() {
+  return flow.loadConfig().flow.optionstratDir || process.env.OPTIONSTRAT_DIR || PROJECT_ROOT;
+}
+const UPLOAD_OK = /^[\w.\-]+\.(xlsx|csv)$/i;
+
+app.post("/api/flow-upload",
+  express.raw({ type: "*/*", limit: process.env.UPLOAD_LIMIT || "128mb" }),
+  (req, res) => {
+    try {
+      const name = String(req.query.filename || "");
+      if (!UPLOAD_OK.test(name) || name.includes("..") || name.includes("/")) {
+        return res.status(400).json({ error: "filename must be a plain *.xlsx or *.csv" });
+      }
+      if (!req.body || !req.body.length) return res.status(400).json({ error: "empty body" });
+      const dir = flowDir();
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, name);
+      fs.writeFileSync(dest, req.body);
+      console.log(`[flow-upload] ${name} (${(req.body.length / 1048576).toFixed(2)} MB)`);
+      res.json({ ok: true, filename: name, sizeMB: +(req.body.length / 1048576).toFixed(2) });
+    } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+  });
+
+// Distill -> discover -> seed the observe list -> DELETE the source files.
+app.post("/api/flow-ingest", async (req, res) => {
+  try {
+    const dir = flowDir();
+    const keep = req.body?.keepFiles === true;   // debug escape hatch
+    const before = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /\.(xlsx|csv)$/i.test(f)) : [];
+    if (!before.length) return res.status(400).json({ error: `no .xlsx/.csv found in ${dir} — upload first` });
+
+    // 1. masters/CSVs -> flow_cache.json (the expensive parse, done once)
+    const built = await runPy("flow/build_flow_cache.py", [dir]).catch(() => null);
+
+    let cacheInfo = null;
+    const cachePath = path.join(dir, "flow_cache.json");
+    if (fs.existsSync(cachePath)) {
+      const blob = JSON.parse(fs.readFileSync(cachePath));
+      cacheInfo = { tickers: Object.keys(blob.tickers || {}).length, generated: blob.generated || null };
+    }
+
+    // 2. delete the bulky uploads — the cache is all we need from here on
+    const deleted = [];
+    if (!keep) {
+      for (const f of before) {
+        try { fs.unlinkSync(path.join(dir, f)); deleted.push(f); } catch {}
+      }
+    }
+
+    // 3. rank the book and seed the observe list
+    const cfg = flow.loadConfig();
+    const openTickers = new Set(vdTrades.listAll().filter((p) => p.status === "OPEN").map((p) => p.ticker));
+    const disc = await discovery.discover(cfg, { openTickers, cooldown: {} });
+    const seeded = observe.seed(disc.qualified || [], cfg);
+
+    res.json({
+      ok: true, dir,
+      filesProcessed: before, filesDeleted: deleted,
+      cache: cacheInfo, buildOutput: built || null,
+      discovery: {
+        sources: disc.sources || [], considered: disc.considered ?? 0,
+        scanned: disc.scanned ?? 0, qualified: (disc.qualified || []).length,
+        note: disc.note || null,
+      },
+      observe: seeded,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// What's sitting in the flow dir right now (so you can see uploads landed).
+app.get("/api/flow-upload", (_req, res) => {
+  try {
+    const dir = flowDir();
+    if (!fs.existsSync(dir)) return res.json({ dir, files: [] });
+    const files = fs.readdirSync(dir).filter((f) => /\.(xlsx|csv|json)$/i.test(f)).map((f) => {
+      const st = fs.statSync(path.join(dir, f));
+      return { name: f, sizeMB: +(st.size / 1048576).toFixed(2), modified: st.mtime.toISOString() };
+    });
+    res.json({ dir, files });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Observe list ---------------------------------------------------------
+app.get("/api/observe", (_req, res) => {
+  try { res.json({ all: observe.list(), active: observe.activeList(), ready: observe.readyTickers() }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/observe/assess", async (req, res) => {
+  try { res.json(await observe.assessAll(flow.loadConfig(), { force: req.body?.force === true })); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/api/observe/drop", (req, res) => {
+  try { res.json(observe.drop(String(req.body?.ticker || "").toUpperCase(), req.body?.reason || "manual") || { error: "not found" }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Flow-cache ingest (push from the scraper) -----------------------------
+// Render disks attach to exactly ONE service, so a separate scraper worker can't
+// write files this service reads. Instead the scraper PUSHES its distilled
+// flow_cache.json here and we write it to OPTIONSTRAT_DIR. This also lets the
+// scraper run anywhere (your box, a VPS, a Render worker) and keep the deployed
+// bot fed automatically.
+//
+// Guarded by FLOW_PUSH_TOKEN. If that env var isn't set the route is disabled,
+// so nobody can inject flow data into your bot by default.
+app.post("/api/flow-cache", (req, res) => {
+  try {
+    const token = process.env.FLOW_PUSH_TOKEN;
+    if (!token) return res.status(503).json({ error: "flow push disabled (FLOW_PUSH_TOKEN not set)" });
+    const given = req.get("x-flow-token") || req.query.token;
+    if (given !== token) return res.status(401).json({ error: "bad token" });
+
+    const blob = req.body;
+    if (!blob || typeof blob !== "object" || !blob.tickers || typeof blob.tickers !== "object") {
+      return res.status(400).json({ error: "expected a flow_cache.json body with a .tickers object" });
+    }
+    const dir = flow.loadConfig().flow.optionstratDir || process.env.OPTIONSTRAT_DIR || PROJECT_ROOT;
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, "flow_cache.json");
+    fs.writeFileSync(dest, JSON.stringify(blob));
+    const n = Object.keys(blob.tickers).length;
+    console.log(`[flow-cache] received ${n} tickers -> ${dest}`);
+    res.json({ ok: true, tickers: n, generated: blob.generated || null, path: dest });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// What flow data does the server currently hold?
+app.get("/api/flow-cache", (_req, res) => {
+  try {
+    const dir = flow.loadConfig().flow.optionstratDir || process.env.OPTIONSTRAT_DIR || PROJECT_ROOT;
+    const p = path.join(dir, "flow_cache.json");
+    if (!fs.existsSync(p)) return res.json({ present: false, dir });
+    const st = fs.statSync(p);
+    const blob = JSON.parse(fs.readFileSync(p));
+    res.json({
+      present: true, dir, sizeKB: +(st.size / 1024).toFixed(1),
+      tickers: Object.keys(blob.tickers || {}).length,
+      generated: blob.generated || null,
+      ageMinutes: blob.generated ? Math.round((Date.now() - Date.parse(blob.generated)) / 60000) : null,
+    });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Storage usage / manual sweep -----------------------------------------
+app.get("/api/storage", (req, res) => {
+  try {
+    if (req.query.sweep === "1") return res.json(housekeeping.sweep(flow.loadConfig()));
+    res.json({ usage: housekeeping.usage(), retention: housekeeping.RETENTION_DEFAULTS });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
