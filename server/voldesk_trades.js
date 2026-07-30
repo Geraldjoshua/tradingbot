@@ -130,6 +130,101 @@ async function selectCall(ticker, spot, { dteTarget = 45, moneyness = "ITM" } = 
   };
 }
 
+// ---- Position sizing -------------------------------------------------------
+// Pure, so it can be tested without a broker. Returns either a refusal
+// ({ status }) or { contracts, cost, sizing }.
+//
+// The bug this replaced: `Math.max(1, Math.floor(budget / costPerContract))`
+// forced a minimum of one contract even when one contract cost many times the
+// budget. A $300 budget against a $29 premium bought a $2,910 position — ~10x
+// over — and it made flow sizing inert too, since 0.25x of $300 still rounded
+// up to the same single contract.
+//
+// Order of constraints:
+//   1. want      — fixed count if set, else "as many as the budget fits", else 1
+//   2. budget    — trims, but only when enforceBudget is on
+//   3. overrun   — the only way to end up above budget, and only ever 1 contract
+//   4. buying power — always binds, whatever the toggles say
+export function sizeOrder({ prem, budget, budgetTarget = budget, buyingPower = 0, rk = {}, cheaperSearch = null }) {
+  const enforceBudget = rk.enforceBudget !== false;
+  const fixedOn = rk.fixedContracts?.enabled === true;
+  const fixedN = Math.max(1, Math.floor(rk.fixedContracts?.count ?? 1));
+  const maxContracts = Math.max(1, rk.maxContracts ?? 10);
+
+  const costPerContract = prem * 100;
+  const affordable = Math.floor(budget / costPerContract);
+  const overrunRatio = costPerContract / Math.max(budget, 1);
+  const capacity = buyingPower > 0 ? Math.floor(buyingPower / costPerContract) : Infinity;
+  const bp = Math.round(buyingPower);
+
+  const tooPoor = {
+    status: "INSUFFICIENT_FUNDS", premium: prem,
+    costPerContract: +costPerContract.toFixed(2), buyingPower: bp,
+    note: `1 contract costs $${costPerContract.toFixed(0)} but buying power is $${bp}.`,
+  };
+
+  // 1. What do we want? With the budget off and no fixed count, "want" stays 1 —
+  //    turning a constraint off should remove a limit, not start buying ten.
+  let contracts = fixedOn
+    ? Math.min(fixedN, maxContracts)
+    : enforceBudget ? Math.min(maxContracts, affordable) : 1;
+  const wanted = contracts;
+  const notes = [];
+
+  // 2. Budget trims.
+  if (enforceBudget && contracts > affordable) {
+    contracts = affordable;
+    if (contracts >= 1) notes.push(`trimmed ${wanted}->${contracts} to fit the $${budget} budget`);
+  }
+
+  // 3. Even one contract busts the budget. findCheaper already had its shot (it
+  //    re-ranked the chain on affordability and came back empty), so it's now
+  //    "buy 1 anyway" or "skip and let the loop try the next ticker" — which is
+  //    the other half of finding a cheaper name.
+  if (enforceBudget && contracts < 1) {
+    const tolerance = rk.overrunTolerance ?? 1.0;   // 1.0 = no overrun permitted
+    const allowed = rk.allowBudgetOverrun !== false && overrunRatio <= Math.max(tolerance, 1);
+    if (capacity < 1) return tooPoor;
+    if (!allowed) {
+      return {
+        status: "TOO_EXPENSIVE", premium: prem,
+        costPerContract: +costPerContract.toFixed(2),
+        budget, buyingPower: bp, overrunRatio: +overrunRatio.toFixed(2), cheaperSearch,
+        note: `1 contract costs $${costPerContract.toFixed(0)} but the budget is $${budget} `
+          + `(${overrunRatio.toFixed(1)}x over)`
+          + (cheaperSearch ? ` and nothing under $${cheaperSearch.ceiling} passed the R/R filters` : "")
+          + ".",
+      };
+    }
+    contracts = 1;
+    notes.push(`over budget ${overrunRatio.toFixed(1)}x — bought 1 anyway (overrun allowed)`);
+  }
+
+  // 4. Buying power is the hard ceiling — it binds even with the budget off.
+  if (contracts > capacity) {
+    if (capacity < 1) return tooPoor;
+    notes.push(`cut ${contracts}->${capacity} to stay inside $${bp} buying power`);
+    contracts = capacity;
+  }
+  contracts = Math.max(1, Math.min(contracts, maxContracts));
+
+  return {
+    contracts,
+    cost: +(prem * contracts * 100).toFixed(2),
+    sizing: {
+      budget, budgetTarget, costPerContract: +costPerContract.toFixed(2),
+      affordable, wanted, contracts, maxContracts,
+      cost: +(prem * contracts * 100).toFixed(2),
+      mode: fixedOn ? `fixed ${fixedN}` : enforceBudget ? "fit budget" : "budget off",
+      enforceBudget, overrunRatio: +overrunRatio.toFixed(2),
+      budgetBusted: enforceBudget && affordable < 1,
+      ...(buyingPower > 0 ? { buyingPower: bp } : {}),
+      ...(cheaperSearch ? { cheaperSearch } : {}),
+      ...(notes.length ? { notes } : {}),
+    },
+  };
+}
+
 // ---- Entry ---------------------------------------------------------------
 // flowDecision (optional) lets a caller (the auto-trader) pass a conviction it
 // already fetched so we don't hit the flow sources twice. If absent we compute it.
@@ -195,12 +290,56 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   // acceptable (or if contractSelection.mode is "legacy").
   const csMode = (cfg.contractSelection?.mode) || "rr";
   const optType = lv.optionType;                       // "call" for long, "put" for short
-  let call = null, rrPick = null;
+
+  // ---- Budget, resolved BEFORE we pick a contract -------------------------
+  // Four independent controls, in the order they bind:
+  //   enforceBudget   — is the premium budget a real constraint at all?
+  //   fixedContracts  — buy exactly N per trade instead of "as many as fit"
+  //   findCheaper     — if the best contract busts the budget, rank only the
+  //                     contracts that FIT rather than the best outright
+  //   allowBudgetOverrun — last resort: buy 1 anyway
+  // Buying power sits above all four: we never order more than the account can
+  // pay for, whatever the toggles say.
+  const rk = cfg.risk || {};
+  const enforceBudget = rk.enforceBudget !== false;
+  const findCheaper = rk.findCheaper !== false;
+  const fixedOn = rk.fixedContracts?.enabled === true;
+  const fixedN = Math.max(1, Math.floor(rk.fixedContracts?.count ?? 1));
+  const maxContracts = Math.max(1, rk.maxContracts ?? 10);
+
+  let buyingPower = 0;
+  try { buyingPower = parseFloat((await alpaca.getAccount()).buying_power) || 0; } catch {}
+  const budgetTarget = effectiveBudget > 0 ? effectiveBudget : riskPremium;
+  const budgetForSizing = buyingPower > 0 ? Math.min(budgetTarget, buyingPower) : budgetTarget;
+  const budgetClampedByCash = buyingPower > 0 && budgetTarget > buyingPower;
+
+  // Per-contract ceiling handed to the selector. With a fixed count of 3 and a
+  // $6,000 budget each contract has to come in under $2,000, not $6,000.
+  const wantContracts = fixedOn ? fixedN : 1;
+  const priceCeiling = enforceBudget && findCheaper ? budgetForSizing / wantContracts : 0;
+
+  let call = null, rrPick = null, cheaperSearch = null;
   if (csMode === "rr") {
     try {
       rrPick = await contractSelect.selectByRiskReward(
-        ticker, spot, { target: lv.t1, stop: lv.stop }, cfg, optType
+        ticker, spot, { target: lv.t1, stop: lv.stop }, cfg, optType,
+        { maxPremium: priceCeiling }
       );
+      if (priceCeiling > 0) {
+        cheaperSearch = { ceiling: Math.round(priceCeiling), found: Boolean(rrPick.best) };
+        if (!rrPick.best) {
+          // Nothing affordable passed. Re-rank WITHOUT the ceiling — not to buy
+          // it, but so the overrun / TOO_EXPENSIVE decision below is made against
+          // the real cheapest qualifying contract and can say what it costs.
+          const uncapped = await contractSelect.selectByRiskReward(
+            ticker, spot, { target: lv.t1, stop: lv.stop }, cfg, optType
+          );
+          if (uncapped.best) {
+            rrPick = { ...uncapped, note: `no contract under $${Math.round(priceCeiling)}; best overall: ${uncapped.note}` };
+            cheaperSearch.fellBackToBest = true;
+          }
+        }
+      }
       if (rrPick.best) {
         call = {
           symbol: rrPick.best.symbol, strike: rrPick.best.strike, expiry: rrPick.best.expiry,
@@ -215,12 +354,36 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       rrPick = { best: null, note: `R/R selection failed: ${String(e.message || e)}` };
     }
   }
-  // Simple picker as the second choice.
+  // Simple picker as the second choice: nearest DTE target, ~5% in/out of the
+  // money. It does no scoring at all — which is how a contract with a 31% spread
+  // (bid 19.80 / ask 27.20) got bought on GOOGL. The R/R path rejects anything
+  // over maxSpreadPct; this path had no such check, so "we couldn't find a good
+  // contract" silently became "buy an arbitrary one".
+  //
+  // The spread check now applies to BOTH paths. If the fallback's pick is also
+  // unacceptable we take no option at all and let the share fallback decide —
+  // paying a third of the premium to the market maker is not a fallback, it's a
+  // worse trade than not trading.
   if (!call) {
     try {
-      call = optType === "put"
+      const pick = optType === "put"
         ? await selectPut(ticker, spot, { dteTarget, moneyness })
         : await selectCall(ticker, spot, { dteTarget, moneyness });
+      const maxSpread = cfg.contractSelection?.maxSpreadPct ?? 0.15;
+      const mid = pick?.mid || pick?.ask;
+      const sp = pick && pick.bid > 0 && mid > 0 ? (pick.ask - pick.bid) / mid : null;
+      if (pick && sp != null && sp > maxSpread) {
+        rrPick = rrPick || {};
+        rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback pick ${pick.strike} ${pick.expiry} `
+          + `rejected: spread ${(sp * 100).toFixed(0)}% > ${(maxSpread * 100).toFixed(0)}%`;
+        rrPick.fallbackRejected = { symbol: pick.symbol, spreadPct: +(sp * 100).toFixed(1) };
+      } else if (pick && sp == null) {
+        rrPick = rrPick || {};
+        rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback pick has no two-sided market — rejected`;
+      } else {
+        call = pick;
+        if (call) { call.spreadPct = sp != null ? +(sp * 100).toFixed(1) : null; call.viaFallback = true; }
+      }
     } catch (e) {
       rrPick = rrPick || {};
       rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback picker failed: ${String(e.message || e)}`;
@@ -235,8 +398,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   if (noOption) {
     if (!shareCfg.enabled) throw new Error(`no usable ${optType} contract and share fallback disabled`);
     if (!confirm) {
-      const bp = await alpaca.getAccount().then((a) => parseFloat(a.buying_power) || 0).catch(() => 0);
-      const sized = shares.size(spot, lv.stop, riskPremium * flowMult, bp, cfg);
+      const sized = shares.size(spot, lv.stop, riskPremium * flowMult, buyingPower, cfg);
       return {
         status: "PREVIEW", instrument: "shares", ticker, side, spot: +spot.toFixed(2),
         triggered, firstFiveMinClose: fmc,
@@ -273,9 +435,17 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
 
   const prem = call.mid || call.ask;
   if (!prem) throw new Error("no option quote available to size the trade");
-  const budgetForSizing = effectiveBudget > 0 ? effectiveBudget : riskPremium;
-  const contracts = Math.max(1, Math.floor(budgetForSizing / (prem * 100)));
-  const cost = +(prem * contracts * 100).toFixed(2);
+
+  const sized = sizeOrder({ prem, budget: budgetForSizing, budgetTarget, buyingPower, rk, cheaperSearch });
+  if (sized.status) {
+    return {
+      ...sized, ticker, side,
+      contract: { symbol: call.symbol, strike: call.strike, expiry: call.expiry },
+      note: sized.note + (sized.status === "TOO_EXPENSIVE" ? ` Skipping ${ticker}.` : ""),
+    };
+  }
+  const { contracts, cost, sizing } = sized;
+  if (budgetClampedByCash) sizing.budgetClampedByCash = true;
 
   const triggerNote = triggered
     ? `Trigger met (first 5-min close ${lv.triggerDir} ${lv.trigger}).`
@@ -295,7 +465,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         symbol: call.symbol, strike: call.strike, expiry: call.expiry, dte: call.dte,
         moneyness: call.moneyness, bid: call.bid, ask: call.ask, mid: call.mid,
       },
-      premium: prem, contracts, cost,
+      premium: prem, contracts, cost, sizing,
       budget: riskPremium, effectiveBudget, overBudget: cost > budgetForSizing,
       flow: flowSummary,
       flowBlocked: flowBlock,
@@ -333,7 +503,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         symbol: call.symbol, strike: call.strike, expiry: call.expiry,
         dte: call.dte, moneyness: call.moneyness,
       },
-      contracts, quotedMid: prem,
+      contracts, quotedMid: prem, sizing,
       levels: { trigger: lv.trigger, stop: lv.stop, t1: lv.t1, t2: lv.t2 },
       snapLevels: { pTrans: snap.levels.pTrans, nTrans: snap.levels.nTrans },
       entryBudget: riskPremium, effectiveBudget, flowMult,

@@ -88,7 +88,8 @@ async function candidateGrid(ticker, spot, type, c) {
 }
 
 // Score one contract. Returns null if it can't be evaluated at all.
-function evaluate(k, { spot, target, stop, type, c, fallbackVol }) {
+// Exported so the scoring can be inspected/tested without hitting the broker.
+export function evaluate(k, { spot, target, stop, type, c, fallbackVol }) {
   const K = +k.strike_price;
   const T = Math.max(k._dte / 365, 1e-5);
   const bid = k._bid, ask = k._ask;
@@ -122,6 +123,13 @@ function evaluate(k, { spot, target, stop, type, c, fallbackVol }) {
   const delta = Math.abs(entryLeg.delta);
 
   const reasons = [];
+  // Price ceiling: "find a cheaper contract" mode passes the budget down here, so
+  // instead of picking the best contract and *then* discovering we can't afford
+  // it, we only ever rank contracts that fit. A contract is 100 shares, so the
+  // cash cost is entryCost x 100.
+  if (c.maxPremium > 0 && entryCost * 100 > c.maxPremium) {
+    reasons.push(`costs $${Math.round(entryCost * 100)} > budget $${Math.round(c.maxPremium)}`);
+  }
   if (spreadPct > c.maxSpreadPct) reasons.push(`spread ${(spreadPct * 100).toFixed(0)}%`);
   if (!(bid > 0)) reasons.push("no bid");
   if (delta < c.minDelta) reasons.push(`delta ${delta.toFixed(2)} too low`);
@@ -153,8 +161,11 @@ function evaluate(k, { spot, target, stop, type, c, fallbackVol }) {
 // ---- Public ---------------------------------------------------------------
 // levels: { target, stop } — for Vol Desk longs, target = T1, stop = nTrans.
 // Returns { best, alternatives, rejected, note }.
-export async function selectByRiskReward(ticker, spot, levels, cfg, type = "call") {
-  const c = cfgFor(cfg);
+// opts.maxPremium — dollar ceiling for ONE contract (premium x 100). Contracts
+// above it are rejected outright, so the winner is the best contract you can
+// actually afford rather than the best contract full stop.
+export async function selectByRiskReward(ticker, spot, levels, cfg, type = "call", opts = {}) {
+  const c = { ...cfgFor(cfg), ...(opts.maxPremium > 0 ? { maxPremium: opts.maxPremium } : {}) };
   const target = levels.target, stop = levels.stop;
   if (!(target > 0) || !(stop > 0)) throw new Error("selectByRiskReward needs target and stop levels");
 

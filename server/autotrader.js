@@ -246,7 +246,19 @@ async function enter(cfg) {
         st.entries++; st.cooldown[ticker] = now; saveState(st);
         log("trade", "entry-working", {
           ticker, side, contracts: r.contracts,
-          firstRung: r.firstRungPrice, note: r.note,
+          firstRung: r.firstRungPrice,
+          ...(r.sizing ? {
+            costPerContract: r.sizing.costPerContract,
+            budget: r.sizing.budget, sizingMode: r.sizing.mode,
+            ...(r.sizing.notes ? { sizingNotes: r.sizing.notes.join("; ") } : {}),
+            ...(r.sizing.cheaperSearch?.found ? { foundCheaper: `under $${r.sizing.cheaperSearch.ceiling}` } : {}),
+            ...(r.sizing.budgetClampedByCash
+              ? { CASH_CAPPED: `budget cut to $${r.sizing.budget} by buying power` } : {}),
+            ...(r.sizing.budgetBusted
+              ? { OVER_BUDGET: `${r.sizing.overrunRatio}x — 1 contract costs more than the budget` }
+              : {}),
+          } : {}),
+          note: r.note,
         });
       } else if (r.status === "ENTERED") {
         openCount++; openTickers.add(ticker);
@@ -265,6 +277,14 @@ async function enter(cfg) {
         st.cooldown[ticker] = now; saveState(st);
         log("info", "entry-skip", {
           ticker, side, status: r.status,
+          ...(r.status === "TOO_EXPENSIVE" || r.status === "INSUFFICIENT_FUNDS"
+            ? {
+                costPerContract: r.costPerContract, budget: r.budget,
+                ...(r.buyingPower != null ? { buyingPower: r.buyingPower } : {}),
+                ...(r.overrunRatio != null ? { overrun: `${r.overrunRatio}x` } : {}),
+                ...(r.cheaperSearch ? { noCheaperUnder: `$${r.cheaperSearch.ceiling}` } : {}),
+              }
+            : {}),
           ...(r.status === "NOT_CONFIRMED"
             ? { tag: r.tag, grade: r.grade, blockers: (r.blockers || []).join(",") }
             : {}),

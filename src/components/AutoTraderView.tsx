@@ -74,6 +74,7 @@ export default function AutoTraderView() {
   };
   const sd = cfg.sides || { long: true, short: false };
   const sh = cfg.shares || {};
+  const rk = cfg.risk || { basePremium: 300, maxContracts: 10 };
   const running = status?.running;
 
   return (
@@ -185,8 +186,65 @@ export default function AutoTraderView() {
             <input type="number" value={a.maxDailyEntries} style={{ width: 44 }}
             onChange={(e) => patch({ automation: { maxDailyEntries: +e.target.value } })} />/day
           </div>
-          <div className="row">Base premium $<input type="number" value={cfg.risk.basePremium} style={{ width: 70 }}
-            onChange={(e) => patch({ risk: { basePremium: +e.target.value } })} /></div>
+          <hr style={{ border: 0, borderTop: "1px solid var(--border, #333)", margin: "10px 0 6px" }} />
+          <h4 style={{ margin: "4px 0" }}>Sizing</h4>
+
+          {/* (a) respect the budget */}
+          <label className="row">
+            <input type="checkbox" checked={rk.enforceBudget !== false}
+              onChange={(e) => patch({ risk: { enforceBudget: e.target.checked } })} />
+            Respect the premium budget&nbsp;
+            $<input type="number" step="100" value={rk.basePremium} style={{ width: 90 }}
+              onChange={(e) => patch({ risk: { basePremium: +e.target.value } })} /> per trade
+          </label>
+          <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+            On: contracts = budget ÷ (premium × 100). Off: the budget is ignored and size comes
+            from the fixed count below. Either way the order is capped by your actual buying power —
+            it will never spend money you don't have.
+          </p>
+
+          {/* (b) exact contract count */}
+          <label className="row">
+            <input type="checkbox" checked={rk.fixedContracts?.enabled === true}
+              onChange={(e) => patch({ risk: { fixedContracts: { enabled: e.target.checked } } })} />
+            Always buy exactly&nbsp;
+            <input type="number" min={1} value={rk.fixedContracts?.count ?? 1} style={{ width: 44 }}
+              disabled={rk.fixedContracts?.enabled !== true}
+              onChange={(e) => patch({ risk: { fixedContracts: { count: +e.target.value } } })} />
+            &nbsp;contract(s) per trade
+          </label>
+          <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+            Off: buy as many as the budget fits. Hard ceiling either way:&nbsp;
+            <input type="number" value={rk.maxContracts ?? 10} style={{ width: 44 }}
+              onChange={(e) => patch({ risk: { maxContracts: +e.target.value } })} /> contracts.
+          </p>
+
+          {/* (d) find something cheaper */}
+          <label className="row">
+            <input type="checkbox" checked={rk.findCheaper !== false}
+              onChange={(e) => patch({ risk: { findCheaper: e.target.checked } })} />
+            Find a cheaper contract when the best one busts the budget
+          </label>
+          <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+            Re-ranks the chain with your budget as a per-contract price ceiling and takes the best
+            contract that <i>fits</i>, instead of the best contract outright. If nothing fits (usually
+            true on mega-caps — cheap strikes are far OTM and fail the delta/R-R filters) the ticker is
+            skipped and the loop moves on to the next name, which is how it finds a cheaper <i>ticker</i>.
+          </p>
+
+          {/* (c) overrun */}
+          <label className="row">
+            <input type="checkbox" checked={rk.allowBudgetOverrun !== false}
+              onChange={(e) => patch({ risk: { allowBudgetOverrun: e.target.checked } })} />
+            Last resort: buy 1 contract even if it exceeds the budget
+          </label>
+          <p className="sub" style={{ margin: "0 0 0 22px" }}>
+            A $30 premium contract costs <b>$3,000</b>, so a $300 budget can't afford one. Ticked, it
+            buys 1 anyway and logs <code>OVER_BUDGET 10x</code> — that's how three ~$3,000 positions
+            were opened on a "$300" budget. Unticked, it skips as <code>TOO_EXPENSIVE</code>. Capped at
+            <input type="number" value={rk.overrunTolerance ?? 15} style={{ width: 40 }}
+              onChange={(e) => patch({ risk: { overrunTolerance: +e.target.value } })} />× the budget.
+          </p>
         </div>
 
         {/* Flow */}
@@ -281,6 +339,31 @@ export default function AutoTraderView() {
           min skew <input type="number" step="0.05" value={d.minScore} style={{ width: 54 }}
             onChange={(e) => patch({ discovery: { minScore: +e.target.value } })} />
         </div>
+
+        <label className="row">
+          <input type="checkbox" checked={d.tierFloors !== false}
+            onChange={(e) => patch({ discovery: { tierFloors: e.target.checked } })} />
+          Let smaller companies in — use each tier's own min premium
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          <b>On:</b> the gate above drops to the lowest floor among enabled tiers, and each tier's own
+          "min premium" below does the filtering. <b>Off:</b> that single gate applies to every name
+          regardless of size — which meant the smaller tiers' floors could never be reached, so those
+          companies were excluded no matter how you set the table.
+        </p>
+
+        <label className="row">
+          <input type="checkbox" checked={d.affordability?.enabled === true}
+            onChange={(e) => patch({ discovery: { affordability: { enabled: e.target.checked } } })} />
+          Prefer tickers whose contracts fit the budget
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Only the top <b>{d.maxScan}</b> names get scanned each cycle. If those slots all go to $400
+          stocks they're scanned, sized, and skipped as <code>TOO_EXPENSIVE</code> while the affordable
+          names never got looked at. This moves cheaper names up the ranking (est. contract cost ≈ spot
+          × 8, against your ${cfg.risk?.basePremium ?? 300} budget). A <i>preference</i>, not a filter —
+          a mega-cap with exceptional flow still outranks a cheap name with mediocre flow.
+        </p>
         <div className="row">
           Size-normalize by&nbsp;
           <select value={d.normalize || "marketcap"}
@@ -397,7 +480,6 @@ export default function AutoTraderView() {
           Adding a ticker here says "always check this one" — not "buy this one".
           Skips appear in the log as <code>NOT_CONFIRMED</code> with the failing filters.
         </p>
-        </div>
       </div>
 
       {/* Flow probe */}

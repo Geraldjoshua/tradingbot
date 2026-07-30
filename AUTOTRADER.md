@@ -83,12 +83,35 @@ bullish (score ≥ `minScore`). The **effect mode** decides what that does:
 | `display` | full size | full size | full size |
 
 The multiplier scales the **premium budget**: `effectiveBudget =
-basePremium × multiplier`, and contracts = `floor(effectiveBudget / (premium×100))`
-(min 1). So "against the flow" still lets you take a token position in `size`
-mode, whereas `gate` refuses it outright.
+basePremium × multiplier`. So "against the flow" still lets you take a token
+position in `size` mode, whereas `gate` refuses it outright.
 
 This is exactly the behaviour you asked for: *agree → normal size, disagree →
 very small (or block under a hard gate), and it's all switchable.*
+
+## Sizing — how many contracts
+
+Four controls under **Auto-trader → Automation → Sizing**, applied in this order.
+Buying power sits above all four: the bot never orders what the account can't pay for.
+
+| Control | `risk.*` key | Off | On |
+|---|---|---|---|
+| Respect the premium budget | `enforceBudget` + `basePremium` | budget ignored; size comes from the fixed count | contracts = `floor(budget / (premium×100))` |
+| Always buy exactly N | `fixedContracts.enabled` / `.count` | buy as many as the budget fits | buy N (still trimmed by budget + cash) |
+| Find a cheaper contract | `findCheaper` | rank the chain on R/R alone | rank only contracts costing ≤ `budget / N`, take the best that fits |
+| Buy 1 even if over budget | `allowBudgetOverrun` + `overrunTolerance` | skip as `TOO_EXPENSIVE` | buy 1 and log `OVER_BUDGET 9.7x` |
+
+`maxContracts` is a hard ceiling regardless of everything above.
+
+A contract is 100 shares, so a $29 premium costs **$2,900**. The old code did
+`Math.max(1, floor(...))`, which forced one contract even at ~10× the budget —
+that's how three ~$3,000 positions were opened on a "$300" budget, and why flow
+sizing was inert (0.25 × $300 still rounded up to the same single contract).
+
+**Finding a cheaper *ticker*** is the same mechanism: when nothing on a chain fits,
+the name returns `TOO_EXPENSIVE`, which does **not** consume a daily entry slot, so
+the loop moves straight on to the next candidate. On mega-caps the cheap strikes are
+usually far OTM and fail the delta / R-R filters, so this fires often and correctly.
 
 ---
 

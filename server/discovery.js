@@ -26,6 +26,7 @@ import * as uw from "./unusualwhales.js";
 import * as vd from "./voldesk_trades.js";
 import * as alpaca from "./alpaca.js";
 import * as playbook from "./playbook.js";
+import { realizedVol } from "./options.js";
 import { pythonPath } from "./pythonPath.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -51,11 +52,36 @@ function optionstratDir(cfg) {
   return cfg.flow.optionstratDir || process.env.OPTIONSTRAT_DIR || ROOT;
 }
 
+// The dollar floor applied BEFORE anything is sized — a name below it never
+// enters the candidate list at all.
+//
+// This was a live bug. `discovery.minPremium` ($250k) was passed here as a flat
+// gate, which meant the per-tier floors underneath it could never bind: the
+// micro tier was configured to accept $100k prints, but every $100k print was
+// already dropped one step upstream. The effect was a universe that quietly
+// excluded smaller companies no matter how the tier table was set.
+//
+// With tierFloors on (default) the gate drops to the LOWEST floor among enabled
+// tiers, and each tier's own floor does the real filtering later in normalize().
+// Turning it off restores the single flat gate.
+export function harvestFloor(cfg) {
+  const d = cfg.discovery;
+  if (d.tierFloors === false) return d.minPremium;
+  const overrides = d.tiers || {};
+  const floors = CAP_TIERS
+    .map((t) => ({ ...t, ...(overrides[t.key] || {}) }))
+    .filter((t) => t.enabled !== false)
+    .map((t) => t.minPremium ?? 0);
+  if (!floors.length) return d.minPremium;
+  return Math.min(d.minPremium, ...floors);
+}
+
 // ---- 1. HARVEST -----------------------------------------------------------
 export async function harvest(cfg) {
   const d = cfg.discovery;
   const useOS = d.sources.optionstrat && cfg.flow.sources.optionstrat !== false;
   const useUW = d.sources.unusualwhales;
+  const floor = harvestFloor(cfg);
   const merged = new Map();
   const used = [];
 
@@ -67,7 +93,7 @@ export async function harvest(cfg) {
   if (useOS) {
     const r = await runPy("flow/optionstrat_flow.py", [
       "--discover", optionstratDir(cfg), String(d.maxScan * 2),
-      String(d.minPremium), String(d.minScore), direction,
+      String(floor), String(d.minScore), direction,
     ], 60000);
     if (r && r.candidates?.length) {
       used.push("optionstrat");
@@ -80,7 +106,7 @@ export async function harvest(cfg) {
   const needFallback = merged.size === 0;
   if (useUW && (!d.uwFallbackOnly || needFallback)) {
     const r = await uw.getTopFlowTickers({
-      topN: d.maxScan * 2, minPremium: d.minPremium, minScore: d.minScore,
+      topN: d.maxScan * 2, minPremium: floor, minScore: d.minScore,
     });
     if (r.candidates?.length) {
       used.push("unusualwhales");
@@ -234,6 +260,86 @@ async function normalize(candidates, cfg) {
   return keep;
 }
 
+// ---- 1b. AFFORDABILITY PREFERENCE -----------------------------------------
+// Only `maxScan` names get a Vol Desk scan each cycle. If those slots all go to
+// $400 stocks, the loop scans them, sizes them, skips them all as TOO_EXPENSIVE,
+// and the affordable names never got looked at — "find a cheaper ticker" only
+// worked by accident, if the next name down the ranking happened to be cheap.
+//
+// So affordability becomes a RANKING preference, not a filter. Nothing is
+// excluded: a mega-cap with exceptional flow still outranks a cheap name with
+// mediocre flow. It just stops price being invisible to the ordering.
+//
+// Estimating the cost. Two methods are available and the DEFAULT IS THE CRUDE
+// ONE, which is not what you'd guess:
+//
+//   flat (default)  est = spot x premiumPctOfSpot x 100
+//   vol-aware       est = spot x 0.4 x vol x sqrt(dte/365) x itmFactor x 100
+//
+// The vol-aware version is more principled and did NOT measure better. Checked
+// against the three fills we have real prices for, the actual cost landed at
+// 6.8% (TSLA), 6.5% (MSFT) and 11.0% (GOOGL) of spot — nearly flat across very
+// different volatilities. The reason is that the dominant variable isn't vol,
+// it's WHICH strike and expiry the R/R selector lands on within its delta band;
+// that swamps the vol term. On the one borderline name (MSFT, actually $3,315
+// against a $3,000 budget) the flat estimate correctly called it over budget and
+// the vol-aware one called it under.
+//
+// So `useVol` stays available but off. Revisit it with more fills — three data
+// points is not enough to conclude much, only enough to refuse the upgrade that
+// doesn't pay for itself. Vol comes from Alpaca daily bars, not Yahoo, so
+// turning it on doesn't worsen the rate-limit problem.
+//
+// Either way this is a RANKING input, not a gate. Being wrong reorders the scan
+// queue; it never rejects a trade.
+//
+// `quote` and `bars` are injectable so this is testable without a broker.
+export async function applyAffordability(
+  candidates, cfg,
+  quote = (t) => alpaca.getLatestTrade(t, "delayed_sip"),
+  bars = (t) => alpaca.getBars(t, "1Day", new Date(Date.now() - 90 * 864e5).toISOString(), null),
+) {
+  const af = cfg.discovery?.affordability || {};
+  if (af.enabled !== true) return candidates;
+
+  const budget = cfg.risk?.basePremium ?? 300;
+  const pct = af.premiumPctOfSpot ?? 0.08;   // fallback only, when vol is unknown
+  const dte = cfg.contractSelection?.dteTarget ?? 45;
+  const itm = af.itmFactor ?? 1.7;
+  const boost = af.boost ?? 2.0;             // multiplier for names that fit
+  const penalty = af.penalty ?? 0.5;         // multiplier for names that don't
+  const sqrtT = Math.sqrt(dte / 365);
+
+  await Promise.all(candidates.map(async (c) => {
+    try {
+      const spot = await quote(c.ticker);
+      if (!(spot > 0)) return;
+      c.spot = +spot.toFixed(2);
+
+      let vol = null;
+      if (af.useVol === true) {
+        try {
+          const daily = await bars(c.ticker);
+          if (daily?.length > 5) vol = realizedVol(daily);
+        } catch { /* fall through to the flat estimate */ }
+      }
+      c.estVol = vol ? +vol.toFixed(3) : null;
+      c.estContractCost = Math.round(
+        vol ? spot * 0.4 * vol * sqrtT * itm * 100
+            : spot * pct * 100
+      );
+      c.affordable = c.estContractCost <= budget;
+    } catch { /* leave unscored — treated as neutral below */ }
+  }));
+
+  for (const c of candidates) {
+    if (c.affordable == null) continue;      // no quote: don't reward or punish
+    c.rank = +(c.rank * (c.affordable ? boost : penalty)).toFixed(4);
+  }
+  candidates.sort((a, b) => b.rank - a.rank);
+  return candidates;
+}
+
 // ---- 2. FILTER ------------------------------------------------------------
 function filterCandidates(candidates, cfg, { openTickers, cooldown }) {
   const d = cfg.discovery;
@@ -304,6 +410,8 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
     return { enabled: true, sources, considered: raw.length, scanned: 0, qualified: [],
       note: `all candidates filtered by size floors (normalize=${d.normalize || "marketcap"})` };
   }
+
+  await applyAffordability(candidates, cfg);
 
   const shortlist = filterCandidates(candidates, cfg, { openTickers, cooldown });
   if (!shortlist.length) return { enabled: true, sources, considered: candidates.length, scanned: 0, qualified: [] };

@@ -38,7 +38,19 @@ const DEFAULTS = {
     uwFallbackOnly: true, everyMinutes: 30,
     maxScan: 8, scanConcurrency: 2, scanStaggerMs: 400,
     minPremium: 250000, minScore: 0.3,
-    normalize: "marketcap", minTierScore: 1.0, maxTierScore: 20,
+    normalize: "marketcap",
+    // Let each tier's own minPremium do the filtering instead of one flat gate.
+    // With this false, discovery.minPremium is applied to every name regardless
+    // of size — which silently made the smaller tiers' floors unreachable.
+    tierFloors: true,
+    // Rank preference (not a filter) for names whose contracts fit the budget.
+    affordability: {
+      // useVol is the more principled estimate and measured no better on the
+      // fills we have — see the note above applyAffordability(). Left off.
+      enabled: false, useVol: false, itmFactor: 1.7,
+      premiumPctOfSpot: 0.07,      // ~ what real fills came in at, as % of spot
+      boost: 2.0, penalty: 0.5,
+    }, minTierScore: 1.0, maxTierScore: 20,
     keepUnsized: false, dollarVolRefBps: 20,
     tiers: {
       micro: { enabled: false, refBps: 15, minPremium: 100000 },
@@ -97,7 +109,24 @@ const DEFAULTS = {
     enabled: true, minShares: 1, maxNotionalPct: 0.10,
     allowShort: true, requireEasyToBorrow: true,
   },
-  risk: { basePremium: 300 },
+  risk: {
+    // (a) The budget, and whether it actually binds. Buying power is checked
+    //     separately and ALWAYS binds — we never order what the account can't pay for.
+    basePremium: 300,          // $ of premium to deploy per trade (before flow sizing)
+    enforceBudget: true,       // false = budget is advisory, size comes from fixedContracts
+    // (b) Buy exactly N contracts per trade instead of "as many as the budget fits".
+    fixedContracts: { enabled: false, count: 1 },
+    maxContracts: 10,          // hard cap regardless of everything else
+    // (c) What to do when ONE contract already costs more than the budget:
+    //   allowBudgetOverrun true  -> buy 1 anyway (old behaviour, logged loudly)
+    //   allowBudgetOverrun false -> skip the trade as TOO_EXPENSIVE
+    allowBudgetOverrun: true,
+    overrunTolerance: 15,      // with overrun allowed, still refuse beyond this multiple
+    // (d) Before giving up on price, re-rank the chain with the budget as a
+    //     per-contract ceiling and take the best contract that FITS. If nothing
+    //     fits, the trade is skipped and the loop moves to the next ticker.
+    findCheaper: true,
+  },
 };
 
 function deepMerge(base, over) {

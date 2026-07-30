@@ -28,6 +28,15 @@
     "minPremium": 250000,
     "minScore": 0.3,
     "normalize": "marketcap",
+    "tierFloors": true,
+    "affordability": {
+      "enabled": false,
+      "useVol": false,
+      "itmFactor": 1.7,
+      "premiumPctOfSpot": 0.07,
+      "boost": 2.0,
+      "penalty": 0.5
+    },
     "minTierScore": 1.0,
     "maxTierScore": 20,
     "keepUnsized": false,
@@ -143,7 +152,16 @@
     "requireEasyToBorrow": true
   },
   "risk": {
-    "basePremium": 300
+    "basePremium": 300,
+    "enforceBudget": true,
+    "fixedContracts": {
+      "enabled": false,
+      "count": 1
+    },
+    "maxContracts": 10,
+    "allowBudgetOverrun": true,
+    "overrunTolerance": 15,
+    "findCheaper": true
   },
   "entry": {
     "requireTag": [
