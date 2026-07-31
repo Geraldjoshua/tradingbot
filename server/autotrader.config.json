@@ -14,7 +14,8 @@
     "entryCooldownMin": 30,
     "triggerMode": "open",
     "intradayCutoffMin": 840,
-    "watchlist": []
+    "watchlist": [],
+    "queuedExitDelayMin": 5
   },
   "discovery": {
     "enabled": true,
@@ -48,27 +49,27 @@
       "micro": {
         "enabled": false,
         "refBps": 15,
-        "minPremium": 100000
+        "minPremium": 50000
       },
       "small": {
         "enabled": true,
         "refBps": 8,
-        "minPremium": 250000
+        "minPremium": 100000
       },
       "mid": {
         "enabled": true,
         "refBps": 4,
-        "minPremium": 500000
+        "minPremium": 250000
       },
       "large": {
         "enabled": true,
         "refBps": 1.5,
-        "minPremium": 1000000
+        "minPremium": 450000
       },
       "mega": {
         "enabled": true,
         "refBps": 0.3,
-        "minPremium": 2000000
+        "minPremium": 650000
       }
     },
     "acceptTags": [
@@ -86,7 +87,7 @@
     "scanRetryMin": 30
   },
   "flow": {
-    "enabled": true,
+    "enabled": false,
     "mode": "size",
     "sources": {
       "optionstrat": true,
@@ -192,5 +193,10 @@
     "snapshotsPerTicker": 40,
     "keepClosedTrades": 200,
     "maxDataMB": 200
+  },
+  "scaleOut": {
+    "enabled": false,
+    "firstPct": 0.8,
+    "moveStopToBreakeven": true
   }
 }

@@ -51,8 +51,12 @@ function log(level, event, extra = {}) {
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
 function loadState() {
-  const s = readJson(STATE, { day: todayISO(), entries: 0, cooldown: {} });
-  if (s.day !== todayISO()) { s.day = todayISO(); s.entries = 0; s.cooldown = {}; } // reset daily
+  const s = readJson(STATE, { day: todayISO(), entries: 0, cooldown: {}, queuedExits: {} });
+  // Daily reset — but NOT queuedExits. A stop that breached after the close on
+  // Thursday has to survive into Friday's session; that overnight gap is the
+  // entire reason the queue exists.
+  if (s.day !== todayISO()) { s.day = todayISO(); s.entries = 0; s.cooldown = {}; }
+  if (!s.queuedExits) s.queuedExits = {};
   return s;
 }
 function saveState(s) { writeJson(STATE, s); }
@@ -62,13 +66,22 @@ const fmtET = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", hour12: false, weekday: "short",
   hour: "2-digit", minute: "2-digit",
 });
-function marketOpen(now = new Date()) {
+function etMinutes(now = new Date()) {
   const p = Object.fromEntries(fmtET.formatToParts(now).map((o) => [o.type, o.value]));
-  const dow = p.weekday;
-  if (dow === "Sat" || dow === "Sun") return false;
   let h = parseInt(p.hour, 10); if (h === 24) h = 0;
-  const min = h * 60 + parseInt(p.minute, 10);
+  return { dow: p.weekday, min: h * 60 + parseInt(p.minute, 10) };
+}
+function marketOpen(now = new Date()) {
+  const { dow, min } = etMinutes(now);
+  if (dow === "Sat" || dow === "Sun") return false;
   return min >= 570 && min < 960; // 09:30 .. 16:00
+  // NOTE: this does not know market holidays. On roughly nine days a year it
+  // will believe the market is open. Orders simply won't fill, as before.
+}
+// Minutes elapsed since 09:30 ET, or null when the market isn't open.
+function minutesSinceOpen(now = new Date()) {
+  if (!marketOpen(now)) return null;
+  return etMinutes(now).min - 570;
 }
 
 // ---- Patient ladders: step them along, open positions when they fill --------
@@ -104,12 +117,86 @@ async function advanceWorkingOrders(cfg) {
 }
 
 // ---- MANAGE: auto take-profit + auto-stop ---------------------------------
+//
+// The market-hours guard used to apply only to enter(). manage() ran around the
+// clock, so a stop that breached near the close kept placing orders into a shut
+// market and retrying every 60s — observed live on INTC at 16:18, 16:19, 16:20
+// and 16:23, all EXIT_NOT_FILLED, because US options stopped trading at 16:00.
+// None of those could ever have filled, and the noise buried real failures.
+//
+// Now a breach outside hours is QUEUED rather than fired: recorded once against
+// the position, then executed at the next tick the market is open — and because
+// a queued stop is by definition already in trouble, the fill is verified rather
+// than assumed. The overnight exposure is real either way; this at least makes
+// it visible instead of pretending an order is working.
+// Persisted in the state file, not held in memory: the free tier restarts
+// overnight, which is precisely the window a queued stop has to survive.
 async function manage(cfg) {
   let positions = [];
   try { positions = await vd.evaluatePositions(); } catch (e) { log("error", "evaluate-failed", { error: String(e.message || e) }); return; }
+  const open = marketOpen();
+  const st = loadState();
+  let stDirty = false;
+
+  // Fire anything that queued while we were closed, before the routine pass.
+  // A queued stop is by definition already in trouble, so it stays queued until
+  // we've actually seen it close — "placed" is not "filled".
+  // Wait out the opening auction before firing queued exits. The first minutes
+  // carry the widest spreads of the day, and a queued stop crosses the book by
+  // design — so firing at 09:30:05 pays the worst spread available precisely
+  // when the position is already in trouble. A few minutes lets the book settle.
+  // It does NOT improve the price on a real gap: the option is worth what it's
+  // worth. It only avoids paying an opening-auction spread on top of the gap.
+  const delayMin = cfg.automation?.queuedExitDelayMin ?? 5;
+  const sinceOpen = minutesSinceOpen();
+  const holdForOpen = open && sinceOpen != null && sinceOpen < delayMin;
+
+  // Say it once, not on every tick of the wait.
+  if (open && holdForOpen && Object.keys(st.queuedExits).length && st.queuedWaitDay !== todayISO()) {
+    st.queuedWaitDay = todayISO(); stDirty = true;
+    log("info", "queued-exit-waiting", {
+      count: Object.keys(st.queuedExits).length,
+      note: `holding for the opening spread to settle — fires at `
+        + `09:${String(30 + delayMin).padStart(2, "0")} ET`,
+    });
+  }
+
+  if (open && !holdForOpen) {
+    for (const [id, q] of Object.entries(st.queuedExits)) {
+      const pos = positions.find((x) => x.id === id);
+      if (!pos) { delete st.queuedExits[id]; stDirty = true; continue; }
+      try {
+        const r = await vd.exitTrade({ id, reason: `${q.reason} (queued while closed)`, urgency: q.urgency });
+        const done = r.status === "CLOSED" || r.status === "CANCELED";
+        log("trade", "queued-exit-fired", {
+          ticker: pos.ticker, id, status: r.status,
+          queuedFor: `${Math.round((Date.now() - q.queuedAt) / 60000)} min`,
+          realizedPnl: r.realizedPnl ?? null, reason: q.reason,
+          ...(done ? {} : { note: "NOT filled yet — stays queued and retries every tick until it closes" }),
+        });
+        if (done) { delete st.queuedExits[id]; stDirty = true; }
+      } catch (e) {
+        log("error", "queued-exit-failed", { ticker: pos.ticker, id, error: String(e.message || e) });
+      }
+    }
+  }
+
   for (const p of positions) {
     try {
       if (p.action === "EXIT") {
+        if (!open) {
+          // Queue it, and say so exactly once.
+          if (!st.queuedExits[p.id]) {
+            st.queuedExits[p.id] = { reason: `auto: ${p.reason}`, urgency: "urgent", queuedAt: Date.now() };
+            stDirty = true;
+            log("trade", "exit-queued", {
+              ticker: p.ticker, id: p.id, reason: p.reason,
+              note: "market closed — order will be placed and verified at the next open. "
+                + "The position is unprotected until then.",
+            });
+          }
+          continue;
+        }
         const r = await vd.exitTrade({ id: p.id, reason: `auto: ${p.reason}`, urgency: "urgent" });
         log("trade", "auto-exit-stop", {
           ticker: p.ticker, id: p.id, status: r.status,
@@ -117,10 +204,42 @@ async function manage(cfg) {
           ...(r.pnlIsEstimate ? { note: "P&L estimated — a leg had not filled yet" } : {}),
           reason: p.reason,
         });
+      } else if (!open) {
+        continue;                 // nothing else is actionable with the market shut
+      } else if (p.action === "T2_HIT") {
+        // The runner left over from a scale-out has reached T2 — close it out.
+        const r = await vd.exitTrade({ id: p.id, reason: `auto: T2 runner @${p.t2}`, urgency: "patient" });
+        if (!(r.status === "EXIT_WORKING" && !r.firstRungPrice)) {
+          log("trade", "auto-runner-exit", {
+            ticker: p.ticker, id: p.id, status: r.status, t2: p.t2, contracts: p.contracts,
+            ...(r.firstRungPrice ? { firstRung: r.firstRungPrice } : {}),
+            realizedPnl: r.realizedPnl ?? null,
+          });
+        }
       } else if (p.action === "T1_HIT") {
         if (cfg.automation.t1Action === "lock-and-ride") {
           if (!p.lockedToBreakeven) { vd.lockToBreakeven({ id: p.id }); log("trade", "auto-lock-be", { ticker: p.ticker, id: p.id, t1: p.t1 }); }
         } else {
+          // Scale-out: bank most of it at T1, move the stop to entry, let the
+          // rest run to T2. planScaleOut returns null when it can't apply —
+          // disabled, or a single contract, which cannot be split.
+          const plan = vd.planScaleOut(p.contracts, cfg);
+          if (plan) {
+            const r = await vd.exitTrade({
+              id: p.id, reason: `auto: T1 scale-out @${p.t1}`, urgency: "patient",
+              qty: plan.first, moveStopToBreakeven: cfg.scaleOut?.moveStopToBreakeven !== false,
+            });
+            if (!(r.status === "EXIT_WORKING" && !r.firstRungPrice)) {
+              log("trade", "auto-scale-out", {
+                ticker: p.ticker, id: p.id, status: r.status, t1: p.t1,
+                selling: `${plan.first}/${p.contracts} (${Math.round(plan.pct * 100)}%)`,
+                runner: plan.runner, nextTarget: p.t2,
+                ...(r.firstRungPrice ? { firstRung: r.firstRungPrice } : {}),
+                realizedPnl: r.realizedPnl ?? null,
+              });
+            }
+            continue;
+          }
           const r = await vd.exitTrade({ id: p.id, reason: `auto: T1 take-profit @${p.t1}`, urgency: "patient" });
           // A patient exit returns EXIT_WORKING and then keeps returning it every
           // tick while the ladder runs. Log the START of the ladder, not each
@@ -144,6 +263,7 @@ async function manage(cfg) {
       log("error", "manage-action-failed", { ticker: p.ticker, id: p.id, error: String(e.message || e) });
     }
   }
+  if (stDirty) saveState(st);
 }
 
 // ---- DISCOVER: let flow surface new names ---------------------------------

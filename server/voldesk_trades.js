@@ -701,9 +701,14 @@ export async function evaluatePositions() {
       } else if (daysHeld >= 7 && progress < 0.5) {
         action = "EXIT"; urgent = true;
         reason = `Stop 3: day ${daysHeld}, only ${(progress * 100).toFixed(0)}% to T1`;
-      } else if (p.t1 != null && favourable(p.t1)) {
+      } else if (p.t1 != null && favourable(p.t1) && !p.t1Taken) {
         action = "T1_HIT";
         reason = `T1 reached (${p.t1}) — take profit, or lock stop to entry and ride to T2 ${p.t2}`;
+      } else if (p.t1Taken && p.t2 != null && favourable(p.t2)) {
+        // Scale-out runner: the first tranche went at T1, the remainder is
+        // riding to T2 on a breakeven stop.
+        action = "T2_HIT";
+        reason = `T2 reached (${p.t2}) — close the remaining ${p.contracts} contract(s)`;
       } else if (adverse(trigger)) {
         action = "WATCH";
         reason = `back ${side === "short" ? "above" : "below"} trigger ${trigger} but stop intact — hold, add nothing`;
@@ -782,10 +787,14 @@ export function patchPosition(id, fields = {}) {
 // ---- Exit ----------------------------------------------------------------
 // urgency: "urgent" for stop-losses (must get out — cross fast), "patient" for
 // take-profits and manual exits (work the ladder, keep the spread).
-export async function exitTrade({ id, reason = "manual", urgency = null }) {
+// `qty` sells only part of the position (scale-out); omit it to close fully.
+// `moveStopToBreakeven` is applied once the partial actually fills.
+export async function exitTrade({ id, reason = "manual", urgency = null, qty = null, moveStopToBreakeven = false }) {
   const rows = load();
   const p = rows.find((x) => x.id === id && x.status === "OPEN");
   if (!p) throw new Error("open position not found");
+  const sellQty = qty != null ? Math.min(Math.max(1, Math.floor(qty)), p.contracts || 1) : null;
+  const isPartial = sellQty != null && sellQty < (p.contracts || 0);
 
   // A stop-out is the one case where paying the spread beats not filling.
   const isStop = /stop\s*[1-4]|stop:|below stop|above stop|10% adverse/i.test(reason);
@@ -867,9 +876,9 @@ export async function exitTrade({ id, reason = "manual", urgency = null }) {
       };
     }
     const started = await working.start({
-      ticker: p.ticker, symbol: p.optionSymbol, qty: p.contracts, side: "sell",
+      ticker: p.ticker, symbol: p.optionSymbol, qty: sellQty ?? p.contracts, side: "sell",
       isOption: true, kind: "exit",
-      intent: { positionId: p.id, reason, quotedMid: optMid },
+      intent: { positionId: p.id, reason, quotedMid: optMid, partial: isPartial, moveStopToBreakeven },
     }, cfgX);
     if (started.started) {
       p.exitWorkingId = started.working.id;
@@ -883,7 +892,7 @@ export async function exitTrade({ id, reason = "manual", urgency = null }) {
   }
 
   const xexec = await execution.execute({
-    symbol: p.optionSymbol, qty: p.contracts, side: "sell",
+    symbol: p.optionSymbol, qty: sellQty ?? p.contracts, side: "sell",
     urgency: urg, isOption: true, cfg: cfgX,
   });
   if (!xexec.filled) {
@@ -892,6 +901,14 @@ export async function exitTrade({ id, reason = "manual", urgency = null }) {
       rungs: xexec.rungs, mid: xexec.mid, bid: xexec.bid, ask: xexec.ask,
       note: xexec.note || "exit ladder expired unfilled — position still OPEN, will retry",
     };
+  }
+  if (isPartial) {
+    const r = bookPartialExit(p, rows, {
+      qty: sellQty, exitPrice: xexec.price, reason, orderId: xexec.orderId,
+      mid: xexec.mid ?? optMid, rung: `${xexec.rung}/${xexec.of}`,
+    });
+    if (moveStopToBreakeven) { try { lockToBreakeven({ id: p.id }); } catch {} r.stopMovedToBreakeven = true; }
+    return r;
   }
   return finalizeOptionExit(p, rows, {
     exitPrice: xexec.price, mid: xexec.mid ?? optMid, vsMid: xexec.vsMid,
@@ -925,12 +942,70 @@ function finalizeOptionExit(p, rows, { exitPrice, mid, vsMid, vsCross, rung, urg
   return { status: "CLOSED", position: p, order: { id: orderId }, realizedPnl: p.realizedPnl, pnlIsEstimate: p.pnlIsEstimate };
 }
 
+// ---- Scale-out ------------------------------------------------------------
+// Sell most of the position at T1, move the stop to breakeven, and let the rest
+// run to T2. The appeal is asymmetry: you bank the move that actually happened
+// and the remainder becomes a free option — worst case it stops at entry.
+//
+// Two honest limits:
+//   * It needs at least 2 contracts. 80% of one contract is zero; you cannot
+//     sell part of a contract. With one contract we sell it all at T1 and say so.
+//   * Breakeven is not risk-free. The stop is on the UNDERLYING at your entry
+//     spot; the option can still be worth less there than you paid, because
+//     theta ran while you waited.
+//
+// Returns { first, runner } contract counts, or null when it can't apply.
+export function planScaleOut(contracts, cfg) {
+  const s = cfg.scaleOut || {};
+  if (s.enabled !== true) return null;
+  const n = Math.floor(contracts || 0);
+  if (n < 2) return null;                        // can't split one contract
+  const pct = Math.min(0.95, Math.max(0.05, s.firstPct ?? 0.8));
+  let first = Math.round(n * pct);
+  first = Math.min(n - 1, Math.max(1, first));   // always leave a runner, always take something
+  return { first, runner: n - first, pct };
+}
+
+// Book a partial close: `qty` contracts are gone at `exitPrice`, the position
+// stays OPEN with the remainder. Realized P&L accumulates across tranches.
+function bookPartialExit(p, rows, { qty, exitPrice, reason, orderId, mid, rung }) {
+  const pnl = p.entryPremium != null && exitPrice != null
+    ? +(((exitPrice - p.entryPremium) * qty * 100)).toFixed(2) : null;
+  p.scaleOuts = p.scaleOuts || [];
+  p.scaleOuts.push({
+    at: reason, contracts: qty, exitPremium: exitPrice, quotedMid: mid ?? null,
+    rung: rung ?? null, pnl, date: iso(new Date()), orderId: orderId ?? null,
+  });
+  p.contracts = Math.max(0, (p.contracts || 0) - qty);
+  p.realizedPnl = +(((p.realizedPnl || 0) + (pnl || 0))).toFixed(2);
+  // Scale-outs only ever fire at T1 in this design, so booking one means T1 is
+  // done. Without this the position would re-trigger T1_HIT on the next tick and
+  // keep selling the runner off a slice at a time.
+  p.t1Taken = true;
+  persist(rows);
+  return { status: "SCALED_OUT", position: p, soldContracts: qty, remaining: p.contracts, tranchePnl: pnl, realizedPnl: p.realizedPnl };
+}
+
 // Called by the auto-trader when a working EXIT order fills.
 export function finalizeExitFromWorking(w) {
   const rows = load();
   const p = rows.find((x) => x.id === w.intent?.positionId);
   if (!p) return { status: "NOT_FOUND", note: `no position ${w.intent?.positionId}` };
   if (p.status !== "OPEN") return { status: p.status, position: p, note: "already closed" };
+
+  // Partial tranche — position survives with the runner.
+  if (w.intent?.partial && w.qty < (p.contracts || 0)) {
+    const r = bookPartialExit(p, rows, {
+      qty: w.qty, exitPrice: w.filledPrice, reason: w.intent.reason || "scale-out",
+      orderId: w.orderId, mid: w.mid, rung: `${w.rung + 1}/${w.totalRungs}`,
+    });
+    if (w.intent.moveStopToBreakeven) {
+      try { lockToBreakeven({ id: p.id }); } catch {}
+      r.stopMovedToBreakeven = true;
+    }
+    return r;
+  }
+
   return finalizeOptionExit(p, rows, {
     exitPrice: w.filledPrice, mid: w.mid ?? w.intent?.quotedMid,
     vsMid: w.mid != null ? +(w.mid - w.filledPrice).toFixed(2) : null,

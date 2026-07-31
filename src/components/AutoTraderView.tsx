@@ -179,6 +179,43 @@ export default function AutoTraderView() {
               <option value="lock-and-ride">lock breakeven, ride to T2</option>
             </select>
           </label>
+          <label className="row">
+            Stops that trigger while closed fire&nbsp;
+            <input type="number" min={0} max={60} style={{ width: 44 }}
+              value={a.queuedExitDelayMin ?? 5}
+              onChange={(e) => patch({ automation: { queuedExitDelayMin: Math.max(0, +e.target.value) } })} />
+            &nbsp;min after the open
+          </label>
+          <p className="sub" style={{ margin: "0 0 4px 0" }}>
+            A queued stop crosses the book by design, and the opening auction carries the widest
+            spreads of the day — firing at 09:30:05 pays the worst spread available at the moment the
+            position is already in trouble. This waits for the book to settle. It does <b>not</b> improve
+            the price on a gap: the option is worth what it's worth. It only avoids paying an
+            opening-auction spread on top of the gap. Set 0 to fire immediately.
+          </p>
+          <label className="row">
+            <input type="checkbox" checked={cfg.scaleOut?.enabled === true}
+              onChange={(e) => patch({ scaleOut: { enabled: e.target.checked } })} />
+            Scale out — sell&nbsp;
+            <input type="number" min={5} max={95} step="5" style={{ width: 50 }}
+              disabled={cfg.scaleOut?.enabled !== true}
+              value={Math.round((cfg.scaleOut?.firstPct ?? 0.8) * 100)}
+              onChange={(e) => patch({ scaleOut: { firstPct: Math.min(95, Math.max(5, +e.target.value)) / 100 } })} />
+            % at T1, run the rest to T2
+          </label>
+          <label className="row" style={{ marginLeft: 22 }}>
+            <input type="checkbox" checked={cfg.scaleOut?.moveStopToBreakeven !== false}
+              disabled={cfg.scaleOut?.enabled !== true}
+              onChange={(e) => patch({ scaleOut: { moveStopToBreakeven: e.target.checked } })} />
+            …and move the stop to breakeven on the remainder
+          </label>
+          <p className="sub" style={{ margin: "0 0 4px 22px" }}>
+            Banks the move that actually happened and leaves a runner for the bigger target.
+            <b> Needs at least 2 contracts</b> — 80% of one contract is zero, and a contract can't be
+            split, so single-contract positions still close fully at T1. With 3 contracts it sells 2
+            and runs 1. Note that "breakeven" is the stop on the <i>underlying</i> at your entry price:
+            the option can still be worth less there than you paid, because theta ran while you waited.
+          </p>
           <div className="row">Poll&nbsp;<input type="number" value={a.pollSeconds} style={{ width: 60 }}
             onChange={(e) => patch({ automation: { pollSeconds: +e.target.value } })} />s ·
             max&nbsp;<input type="number" value={a.maxConcurrent} style={{ width: 44 }}

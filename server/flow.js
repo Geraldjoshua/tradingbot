@@ -36,6 +36,9 @@ const DEFAULTS = {
     //              crossing of the level, never merely "price is already past it"
     triggerMode: "open",
     intradayCutoffMin: 840,        // 14:00 ET — no new intraday triggers after this
+    // Queued (overnight) exits wait this many minutes after 09:30 before firing,
+    // so a stop that crosses the book does not do it into the opening auction.
+    queuedExitDelayMin: 5,
   },
   discovery: {
     enabled: true, shadowMode: false,
@@ -58,11 +61,11 @@ const DEFAULTS = {
     }, minTierScore: 1.0, maxTierScore: 20,
     keepUnsized: false, dollarVolRefBps: 20,
     tiers: {
-      micro: { enabled: false, refBps: 15, minPremium: 100000 },
-      small: { enabled: true, refBps: 8, minPremium: 250000 },
-      mid: { enabled: true, refBps: 4, minPremium: 500000 },
-      large: { enabled: true, refBps: 1.5, minPremium: 1000000 },
-      mega: { enabled: true, refBps: 0.3, minPremium: 2000000 },
+      micro: { enabled: false, refBps: 15, minPremium: 50000 },
+      small: { enabled: true, refBps: 8, minPremium: 100000 },
+      mid: { enabled: true, refBps: 4, minPremium: 250000 },
+      large: { enabled: true, refBps: 1.5, minPremium: 450000 },
+      mega: { enabled: true, refBps: 0.3, minPremium: 650000 },
     },
     acceptTags: ["CONFIRMED"],            // tradeable today
     seedTags: ["CONFIRMED", "PENDING"],   // worth observing
@@ -70,7 +73,7 @@ const DEFAULTS = {
     maxDte: 45, requireDeltaBalance: true, exclude: [], scanRetryMin: 30,
   },
   flow: {
-    enabled: true, mode: "size",
+    enabled: false, mode: "size",
     sources: { optionstrat: true, unusualwhales: false },
     optionstratDir: "",
     maxAgeDays: 3, staleAction: "warn",
@@ -116,6 +119,9 @@ const DEFAULTS = {
     minDistancePct: 0.015,   // a wall must be >=1.5% from spot to count
     weightByOi: false,       // rank by gamma x OI instead of gamma alone
   },
+  // Partial exit at T1: bank most of it, move the stop to entry, let the rest
+  // run to T2. Needs >= 2 contracts — you cannot sell 80% of one contract.
+  scaleOut: { enabled: false, firstPct: 0.8, moveStopToBreakeven: true },
   sides: { long: true, short: false },
   shares: {
     enabled: true, minShares: 1, maxNotionalPct: 0.10,
