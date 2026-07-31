@@ -186,6 +186,34 @@ export default function AutoTraderView() {
             <input type="number" value={a.maxDailyEntries} style={{ width: 44 }}
             onChange={(e) => patch({ automation: { maxDailyEntries: +e.target.value } })} />/day
           </div>
+          <label className="row">Entry trigger&nbsp;
+            <select value={a.triggerMode || "open"}
+              onChange={(e) => patch({ automation: { triggerMode: e.target.value } })}>
+              <option value="open">opening bar only (09:30–09:35)</option>
+              <option value="intraday">any 5-min bar that crosses the level</option>
+            </select>
+            {(a.triggerMode === "intraday") && (
+              <>&nbsp;· no new triggers after&nbsp;
+                <input type="number" value={Math.floor((a.intradayCutoffMin ?? 840) / 60)} style={{ width: 40 }}
+                  onChange={(e) => patch({ automation: { intradayCutoffMin: Math.max(10, +e.target.value) * 60 } })} />:00 ET
+              </>
+            )}
+          </label>
+          <p className="sub" style={{ margin: "0 0 4px 0" }}>
+            This does <b>not</b> limit trading to the first 5 minutes. The bot can buy at any hour the
+            market is open. What this sets is <i>when permission is decided</i>.
+            <br /><br />
+            <b>Opening bar only:</b> one price reading is taken at 09:35 and used all day. Above the
+            level → the name is allowed, and it may be bought at 10am, 1pm or 3pm once everything else
+            lines up. Below the level → that name is off the table until tomorrow, even if it climbs
+            above at noon.
+            <br /><br />
+            <b>Any 5-min bar:</b> a name that crosses the level later in the day earns permission then,
+            instead of being locked out at 09:35. It must be a real <i>crossing</i> — previous bar below,
+            this bar above — not merely "price happens to be above", which would be true on every bar of
+            a trending name and would duplicate what the CONFIRMED tag already checks. The cutoff stops
+            new permissions being granted late in the session.
+          </p>
           <hr style={{ border: 0, borderTop: "1px solid var(--border, #333)", margin: "10px 0 6px" }} />
           <h4 style={{ margin: "4px 0" }}>Sizing</h4>
 
@@ -339,6 +367,49 @@ export default function AutoTraderView() {
           min skew <input type="number" step="0.05" value={d.minScore} style={{ width: 54 }}
             onChange={(e) => patch({ discovery: { minScore: +e.target.value } })} />
         </div>
+
+        <label className="row">
+          <input type="checkbox" checked={(cfg.walls?.minDistancePct ?? 0.015) > 0}
+            onChange={(e) => patch({ walls: { minDistancePct: e.target.checked ? 0.015 : 0 } })} />
+          A wall must be at least&nbsp;
+          <input type="number" step="0.5" style={{ width: 50 }}
+            value={+(((cfg.walls?.minDistancePct ?? 0.015) * 100).toFixed(1))}
+            disabled={(cfg.walls?.minDistancePct ?? 0.015) <= 0}
+            onChange={(e) => patch({ walls: { minDistancePct: Math.max(0, +e.target.value) / 100 } })} />
+          % from spot
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Per-contract gamma peaks at-the-money, so ranking strikes by gamma alone returns the strike
+          <i> next to spot</i> almost every time. That strike becomes T1, your profit target — observed
+          live as GOOGL spot 349.99 → target 350.00, AMZN 271.66 → 272.50. A target 0.3% away can never
+          satisfy <code>rr&gt;=2</code>, so names were rejected for what looked like a market judgement
+          but was an artefact of the selection rule. This requires a wall to stand at a distance;
+          if nothing further out qualifies it relaxes rather than failing the scan.
+        </p>
+
+        <label className="row">
+          <input type="checkbox" checked={cfg.walls?.weightByOi === true}
+            onChange={(e) => patch({ walls: { weightByOi: e.target.checked } })} />
+          Rank walls by gamma × open interest instead of gamma alone
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Lets a large OI cluster further out beat the ATM strike's naturally-high gamma — closer to how
+          dealers describe a wall. Off by default: distance is the primary control, and a big
+          near-strike OI could still win. Try one change at a time.
+        </p>
+
+        <label className="row">
+          <input type="checkbox" checked={d.requireDeltaBalance !== false}
+            onChange={(e) => patch({ discovery: { requireDeltaBalance: e.target.checked } })} />
+          Require the delta-balance jump (<code>db_change</code>) as a hard filter
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Demands the call share of dealer gamma rise <b>0.50</b> in one session (0.30 on a perfect
+          11/11) — a violent repositioning, so it blocks most names most days. It also fails
+          automatically as <code>no_prior</code> when yesterday's snapshot is missing, which is every
+          restart on a host that wipes <code>data/</code>. Unticked, db_change still appears in the log
+          but doesn't block; grade ≥9, cushion, no-spike-crash and R/R ≥2 still apply.
+        </p>
 
         <label className="row">
           <input type="checkbox" checked={d.tierFloors !== false}

@@ -12,6 +12,8 @@
     "maxConcurrent": 5,
     "maxDailyEntries": 3,
     "entryCooldownMin": 30,
+    "triggerMode": "open",
+    "intradayCutoffMin": 840,
     "watchlist": []
   },
   "discovery": {
@@ -25,6 +27,7 @@
     "everyMinutes": 30,
     "maxScan": 8,
     "scanConcurrency": 2,
+    "scanStaggerMs": 400,
     "minPremium": 250000,
     "minScore": 0.3,
     "normalize": "marketcap",
@@ -34,10 +37,10 @@
       "useVol": false,
       "itmFactor": 1.7,
       "premiumPctOfSpot": 0.07,
-      "boost": 2.0,
+      "boost": 2,
       "penalty": 0.5
     },
-    "minTierScore": 1.0,
+    "minTierScore": 1,
     "maxTierScore": 20,
     "keepUnsized": false,
     "dollarVolRefBps": 20,
@@ -71,15 +74,16 @@
     "acceptTags": [
       "CONFIRMED"
     ],
-    "minGrade": 0,
-    "maxDte": 45,
-    "requireDeltaBalance": true,
-    "exclude": [],
     "seedTags": [
       "CONFIRMED",
       "PENDING"
     ],
-    "seedMinGrade": 0
+    "minGrade": 0,
+    "seedMinGrade": 0,
+    "maxDte": 45,
+    "requireDeltaBalance": true,
+    "exclude": [],
+    "scanRetryMin": 30
   },
   "flow": {
     "enabled": true,
@@ -92,7 +96,7 @@
     "maxAgeDays": 3,
     "staleAction": "warn",
     "sizing": {
-      "agree": 1.0,
+      "agree": 1,
       "neutral": 0.7,
       "disagree": 0.25
     },
@@ -102,9 +106,21 @@
       "knows": 0.15
     },
     "sourceWeights": {
-      "optionstrat": 1.0,
-      "unusualwhales": 1.0
+      "optionstrat": 1,
+      "unusualwhales": 1
     }
+  },
+  "observe": {
+    "maxObserving": 25,
+    "maxObserveDays": 10,
+    "dropOnFlowGone": true,
+    "dropOnFlowFlip": true,
+    "flowDecayRatio": 0.4,
+    "blockedStrikes": 3,
+    "requireTags": [
+      "CONFIRMED"
+    ],
+    "minGrade": 0
   },
   "contractSelection": {
     "mode": "rr",
@@ -122,23 +138,31 @@
     "requireBreakevenBelowTarget": true,
     "riskFreeRate": 0.04
   },
-  "observe": {
-    "maxObserving": 25,
-    "maxObserveDays": 10,
-    "dropOnFlowGone": true,
-    "dropOnFlowFlip": true,
-    "flowDecayRatio": 0.4,
-    "blockedStrikes": 3,
-    "requireTags": [
+  "execution": {
+    "enabled": true,
+    "patient": {
+      "steps": 4,
+      "stepSeconds": 90,
+      "startAtMidPct": 0
+    },
+    "maxWorkingMinutes": 12,
+    "urgent": {
+      "steps": 2,
+      "stepSeconds": 4,
+      "startAtMidPct": 0.5
+    },
+    "maxTotalSeconds": 20,
+    "minTickSize": 0.01
+  },
+  "entry": {
+    "requireTag": [
       "CONFIRMED"
     ],
     "minGrade": 0
   },
-  "retention": {
-    "snapshotDays": 30,
-    "snapshotsPerTicker": 40,
-    "keepClosedTrades": 200,
-    "maxDataMB": 200
+  "walls": {
+    "minDistancePct": 0.015,
+    "weightByOi": false
   },
   "sides": {
     "long": true,
@@ -163,26 +187,10 @@
     "overrunTolerance": 15,
     "findCheaper": true
   },
-  "entry": {
-    "requireTag": [
-      "CONFIRMED"
-    ],
-    "minGrade": 0
-  },
-  "execution": {
-    "enabled": true,
-    "patient": {
-      "steps": 4,
-      "stepSeconds": 90,
-      "startAtMidPct": 0.0
-    },
-    "maxWorkingMinutes": 12,
-    "urgent": {
-      "steps": 2,
-      "stepSeconds": 4,
-      "startAtMidPct": 0.5
-    },
-    "maxTotalSeconds": 20,
-    "minTickSize": 0.01
+  "retention": {
+    "snapshotDays": 30,
+    "snapshotsPerTicker": 40,
+    "keepClosedTrades": 200,
+    "maxDataMB": 200
   }
 }

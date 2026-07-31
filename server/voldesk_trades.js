@@ -84,18 +84,77 @@ async function selectPut(ticker, spot, { dteTarget = 45, moneyness = "ITM" } = {
     moneyness, bid: q?.bp ?? null, ask: q?.ap ?? null, mid };
 }
 
-// Close of the first regular-hours 5-min bar today (09:30-09:35 ET), or null.
-async function firstFiveMinClose(ticker) {
+// Today's regular-hours 5-min bars, in order.
+async function todays5MinBars(ticker) {
   const start = new Date(Date.now() - 2 * 864e5).toISOString();
   const end = new Date().toISOString();
   let bars;
-  try { bars = await alpaca.getBars(ticker, "5Min", start, end); } catch { return null; }
+  try { bars = await alpaca.getBars(ticker, "5Min", start, end); } catch { return []; }
   const todayET = etParts(new Date().toISOString()).date;
-  for (const b of bars) {
-    const { date, hm } = etParts(b.t);
-    if (date === todayET && hm === 570) return b.c; // 570 = 09:30
+  return bars
+    .map((b) => ({ ...b, ...etParts(b.t) }))
+    .filter((b) => b.date === todayET && b.hm >= 570 && b.hm < 960)   // 09:30-16:00
+    .sort((a, b) => a.hm - b.hm);
+}
+
+// Close of the first regular-hours 5-min bar today (09:30-09:35 ET), or null.
+async function firstFiveMinClose(ticker) {
+  const bars = await todays5MinBars(ticker);
+  const first = bars.find((b) => b.hm === 570);          // 570 = 09:30
+  return first ? first.c : null;
+}
+
+// ---- Entry trigger -------------------------------------------------------
+// Two modes.
+//
+// "open" (default, original): only the 09:30-09:35 close is ever tested. That
+// one number decides the whole session — a name that reclaims pTrans at 11:15
+// cannot be taken today no matter how it trades.
+//
+// "intraday": a later bar may trigger, but it must be a genuine CROSSING —
+// the previous bar at/below the level, this bar beyond it. That distinction
+// matters more than it looks: if we merely asked "is the latest close beyond
+// the trigger", the test would be true on every bar of an already-trending
+// name, and the trigger would collapse into "spot is past pTrans" — which is
+// exactly what the CONFIRMED tag already checks. We'd have deleted a gate
+// rather than relaxed it. Requiring the crossing keeps the trigger meaning
+// "it reclaimed the level", just no longer only at the open.
+//
+// `cutoffMin` stops new triggers late in the day (default 14:00 ET), because a
+// reclaim at 15:50 gives the thesis no time to work before the close.
+async function triggerBar(ticker, levels, cfg) {
+  const mode = cfg?.automation?.triggerMode || "open";
+  const bars = await todays5MinBars(ticker);
+  if (!bars.length) return { close: null, triggered: false, source: "no-bars" };
+
+  const open = bars.find((b) => b.hm === 570) || null;
+  const openClose = open ? open.c : null;
+
+  if (mode !== "intraday") {
+    return {
+      close: openClose,
+      triggered: playbook.triggerMet(openClose, levels),
+      source: "open-bar", at: open ? "09:30" : null,
+    };
   }
-  return null;
+
+  // The opening bar still counts first — an open-driven trigger is the cleanest.
+  if (playbook.triggerMet(openClose, levels)) {
+    return { close: openClose, triggered: true, source: "open-bar", at: "09:30" };
+  }
+
+  const cutoff = cfg?.automation?.intradayCutoffMin ?? 840;   // 14:00 ET
+  for (let i = 1; i < bars.length; i++) {
+    const prev = bars[i - 1], cur = bars[i];
+    if (cur.hm > cutoff) break;
+    if (!playbook.triggerMet(prev.c, levels) && playbook.triggerMet(cur.c, levels)) {
+      const hh = String(Math.floor(cur.hm / 60)).padStart(2, "0");
+      const mm = String(cur.hm % 60).padStart(2, "0");
+      return { close: cur.c, triggered: true, source: "intraday-cross", at: `${hh}:${mm}` };
+    }
+  }
+  const last = bars[bars.length - 1];
+  return { close: openClose ?? last.c, triggered: false, source: "intraday-no-cross" };
 }
 
 // Pick a call by DTE target + moneyness and return its symbol + quote.
@@ -234,12 +293,37 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   if (!snap) throw new Error(`no snapshot for ${ticker} — run a Vol Desk scan first`);
 
   const spot = await alpaca.getLatestTrade(ticker, "delayed_sip");
-  const fmc = await firstFiveMinClose(ticker);
 
   // Side-specific levels + trigger (long: reclaim pTrans; short: lose nTrans).
+  // Levels are resolved BEFORE the trigger now, because intraday mode needs the
+  // level to spot a crossing — it isn't just reading one fixed bar any more.
   const lv = playbook.levelsFor(snap, side);
   if (!lv) throw new Error(`snapshot for ${ticker} lacks usable levels`);
-  const triggered = playbook.triggerMet(fmc, lv);
+  const cfg0 = flow.loadConfig();
+  const trig = await triggerBar(ticker, lv, cfg0);
+  const fmc = trig.close;
+  const triggered = trig.triggered;
+
+  // ---- Is there any reward left? ------------------------------------------
+  // The trigger is decided from an earlier bar, but price keeps moving. If spot
+  // has already reached T1 by the time we get here, the target is behind us and
+  // there is nothing to capture — manage() will see spot >= t1 on its very next
+  // pass and immediately try to take profit. Observed live on NVDA: filled at
+  // 13:48:15, T1_HIT logged at 13:48:37, twenty-two seconds later, then the same
+  // thing again on a re-entry twenty minutes on. Both closed at a loss, because
+  // the only thing the position could do was pay the spread twice.
+  //
+  // Refuse the trade instead. This is not the same as the trigger check: the
+  // trigger asks "did it reclaim the level?", this asks "is the reward still
+  // ahead of us?".
+  if (!force && lv.t1 != null && playbook.favourable(side, spot, lv.t1)) {
+    return {
+      status: "NO_UPSIDE", ticker, side,
+      spot: +spot.toFixed(2), t1: lv.t1, trigger: lv.trigger,
+      note: `spot ${spot.toFixed(2)} has already reached T1 ${lv.t1} — no reward left to capture, `
+        + "the position would hit take-profit immediately. Skipping.",
+    };
+  }
 
   // --- SETUP QUALITY GATE ---------------------------------------------------
   // This check was missing, and the omission was serious: entry gated ONLY on the
@@ -251,7 +335,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   //
   // Now every entry is held to the same bar. Opt out per-call with ignoreSetup, or
   // globally with entry.requireTag = [] if you really want the old behaviour.
-  const cfg = flow.loadConfig();
+  const cfg = cfg0;
   const requireTags = force ? [] : (cfg.entry?.requireTag ?? ["CONFIRMED"]);
   const minGrade = cfg.entry?.minGrade ?? 0;
   if (!ignoreSetup && requireTags.length) {
@@ -448,10 +532,15 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   if (budgetClampedByCash) sizing.budgetClampedByCash = true;
 
   const triggerNote = triggered
-    ? `Trigger met (first 5-min close ${lv.triggerDir} ${lv.trigger}).`
-    : fmc == null
-      ? "No 09:30 5-min bar yet (market closed / pre-open) — placement needs Force or the open."
-      : `First 5-min close ${fmc} is not ${lv.triggerDir} ${lv.trigger}.`;
+    ? (trig.source === "intraday-cross"
+        ? `Trigger met — crossed ${lv.triggerDir} ${lv.trigger} on the ${trig.at} 5-min bar (close ${fmc}).`
+        : `Trigger met (09:30 5-min close ${fmc} ${lv.triggerDir} ${lv.trigger}).`)
+    : trig.source === "no-bars" || fmc == null
+      ? "No 5-min bars yet today (market closed / pre-open) — placement needs Force or the open."
+      : trig.source === "intraday-no-cross"
+        ? `No crossing ${lv.triggerDir} ${lv.trigger} on any 5-min bar today (before the `
+          + `${Math.floor((cfg.automation?.intradayCutoffMin ?? 840) / 60)}:00 cutoff).`
+        : `First 5-min close ${fmc} is not ${lv.triggerDir} ${lv.trigger}.`;
 
   const flowSummary = flowSummary0(decision, conviction);
 
@@ -746,42 +835,108 @@ export async function exitTrade({ id, reason = "manual", urgency = null }) {
     const q = (await alpaca.getOptionQuotes([p.optionSymbol]))[p.optionSymbol]?.latestQuote;
     if (q) { bid = q.bp; optMid = +(((q.bp + q.ap) / 2) || 0).toFixed(2); }
   } catch {}
+
+  // ---- PATIENT EXIT: non-blocking, same as entries -------------------------
+  // This used to call execution.execute() synchronously, and the interaction of
+  // two settings made it structurally unable to fill:
+  //
+  //   patient = { steps: 4, stepSeconds: 90 }   -> a 6-minute ladder
+  //   maxTotalSeconds = 20                      -> the whole call is capped at 20s
+  //
+  // execute() computes `budget = min(stepSeconds, deadline - now)` for each rung,
+  // so rung 1 sat at the mid for the entire 20-second allowance, failed, cancelled,
+  // hit `if (Date.now() >= deadline) break` and returned unfilled — having never
+  // reached rungs 2-4 and therefore never stepped toward the bid at all. The next
+  // 60s tick repeated the identical 20-second mid-post. Observed live: ten minutes
+  // of EXIT_NOT_FILLED on NVDA while the estimate swung from +33 to -180, finally
+  // closing at -45 only because the market came to us.
+  //
+  // Entries didn't suffer because they were already moved onto working_orders.js.
+  // Exits are now on the same path: post at the mid, advance one rung per tick,
+  // cross on the last rung. The loop never blocks, so dwell can be minutes.
+  //
+  // Stops stay synchronous and urgent below — for a stop, not filling is the
+  // expensive outcome, so paying the spread is correct.
+  if (urg === "patient" && cfgX.execution?.enabled !== false) {
+    const already = working.list().find(
+      (w) => w.status === "working" && w.kind === "exit" && w.intent?.positionId === p.id);
+    if (already) {
+      return {
+        status: "EXIT_WORKING", position: p, working: already,
+        note: `exit ladder already working (rung ${already.rung + 1}/${already.totalRungs}) — leaving it alone`,
+      };
+    }
+    const started = await working.start({
+      ticker: p.ticker, symbol: p.optionSymbol, qty: p.contracts, side: "sell",
+      isOption: true, kind: "exit",
+      intent: { positionId: p.id, reason, quotedMid: optMid },
+    }, cfgX);
+    if (started.started) {
+      p.exitWorkingId = started.working.id;
+      persist(rows);
+      return {
+        status: "EXIT_WORKING", position: p, working: started.working, firstRungPrice: started.price,
+        note: `patient exit ladder started at ${started.price} — repriced each tick until filled`,
+      };
+    }
+    // Couldn't place a resting order (no quote, etc.) — fall through and cross.
+  }
+
   const xexec = await execution.execute({
     symbol: p.optionSymbol, qty: p.contracts, side: "sell",
     urgency: urg, isOption: true, cfg: cfgX,
   });
   if (!xexec.filled) {
-    // Patient exits can wait for the next tick; an urgent one that still didn't
-    // fill is worth surfacing loudly rather than silently marking it closed.
     return {
       status: "EXIT_NOT_FILLED", position: p, urgency: urg,
       rungs: xexec.rungs, mid: xexec.mid, bid: xexec.bid, ask: xexec.ask,
       note: xexec.note || "exit ladder expired unfilled — position still OPEN, will retry",
     };
   }
-  const order = { id: xexec.orderId };
-  const xfill = { filled: true, price: xexec.price };
-  const exitPrice = xexec.price;
+  return finalizeOptionExit(p, rows, {
+    exitPrice: xexec.price, mid: xexec.mid ?? optMid, vsMid: xexec.vsMid,
+    vsCross: xexec.vsCross, rung: `${xexec.rung}/${xexec.of}`,
+    urgency: urg, orderId: xexec.orderId, reason,
+  });
+}
 
+// Write the close-out onto the position. Shared by the synchronous (urgent) path
+// and the working-order (patient) path so P&L is computed identically in both —
+// always from ACTUAL fill prices, never from quoted mids.
+function finalizeOptionExit(p, rows, { exitPrice, mid, vsMid, vsCross, rung, urgency, orderId, reason }) {
   p.status = "CLOSED";
   p.exitReason = reason;
   p.exitDate = iso(new Date());
   p.exitPremium = exitPrice;
-  p.exitQuotedMid = xexec.mid ?? optMid;
+  p.exitQuotedMid = mid ?? null;
   p.exitFilled = true;
-  p.exitSlippage = xexec.vsMid;          // + = sold below mid
-  p.exitSavedVsCross = xexec.vsCross;    // + = better than hitting the bid
-  p.exitRung = `${xexec.rung}/${xexec.of}`;
-  p.exitUrgency = urg;
-  p.exitOrderId = order.id;
-  // Realized P&L from ACTUAL fills on both legs. Long premium either way (a long
-  // call and a long put are both bought), so the formula is the same for both sides.
+  p.exitSlippage = vsMid ?? null;         // + = sold below mid
+  p.exitSavedVsCross = vsCross ?? null;   // + = better than hitting the bid
+  p.exitRung = rung ?? null;
+  p.exitUrgency = urgency;
+  p.exitOrderId = orderId ?? null;
+  // Long premium either way (a long call and a long put are both bought), so the
+  // formula is the same for both sides.
   p.realizedPnl = (p.entryPremium != null && exitPrice != null)
     ? +(((exitPrice - p.entryPremium) * (p.contracts || 0) * 100)).toFixed(2)
     : null;
-  p.pnlIsEstimate = !(p.entryFilled && xfill.filled);   // flag if either leg is a guess
+  p.pnlIsEstimate = !p.entryFilled;       // the exit leg definitely filled here
   persist(rows);
-  return { status: "CLOSED", position: p, order, realizedPnl: p.realizedPnl, pnlIsEstimate: p.pnlIsEstimate };
+  return { status: "CLOSED", position: p, order: { id: orderId }, realizedPnl: p.realizedPnl, pnlIsEstimate: p.pnlIsEstimate };
+}
+
+// Called by the auto-trader when a working EXIT order fills.
+export function finalizeExitFromWorking(w) {
+  const rows = load();
+  const p = rows.find((x) => x.id === w.intent?.positionId);
+  if (!p) return { status: "NOT_FOUND", note: `no position ${w.intent?.positionId}` };
+  if (p.status !== "OPEN") return { status: p.status, position: p, note: "already closed" };
+  return finalizeOptionExit(p, rows, {
+    exitPrice: w.filledPrice, mid: w.mid ?? w.intent?.quotedMid,
+    vsMid: w.mid != null ? +(w.mid - w.filledPrice).toFixed(2) : null,
+    vsCross: null, rung: `${w.rung + 1}/${w.totalRungs}`,
+    urgency: "patient", orderId: w.orderId, reason: w.intent?.reason || "patient exit",
+  });
 }
 
 // Lock stop to breakeven after T1 (records intent; the stop is enforced by evaluate/user).
@@ -790,10 +945,11 @@ export function lockToBreakeven({ id }) {
   const p = rows.find((x) => x.id === id && x.status === "OPEN");
   if (!p) throw new Error("open position not found");
 
-  // A stop-out is the one case where paying the spread beats not filling.
-  const isStop = /stop\s*[1-4]|stop:|below stop|above stop|10% adverse/i.test(reason);
-  const urg = urgency || (isStop ? "urgent" : "patient");
-  const cfgX = flow.loadConfig();
+  // (Three lines that belonged to exitTrade used to sit here — they referenced
+  // `reason` and `urgency`, which are not parameters of this function, so any
+  // call to lockToBreakeven threw ReferenceError. Only reachable with
+  // t1Action = "lock-and-ride", which is why it never surfaced.)
+
   // Move the stop to entry — for a short that means bringing it DOWN.
   p.lockedToBreakeven = true;
   const side = p.side || "long";

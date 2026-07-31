@@ -31,6 +31,11 @@ const DEFAULTS = {
     strategies: { voldesk: true, gapgo: false },
     marketHoursOnly: true, t1Action: "take-profit",
     maxConcurrent: 5, maxDailyEntries: 3, entryCooldownMin: 30, watchlist: [],
+    // "open"     — only the 09:30-09:35 close can trigger (original behaviour)
+    // "intraday" — a later 5-min bar may also trigger, but only on a genuine
+    //              crossing of the level, never merely "price is already past it"
+    triggerMode: "open",
+    intradayCutoffMin: 840,        // 14:00 ET — no new intraday triggers after this
   },
   discovery: {
     enabled: true, shadowMode: false,
@@ -104,6 +109,13 @@ const DEFAULTS = {
   // Which directions the bot may trade. Shorts (puts) are OPT-IN because the
   // bearish playbook is a mirror heuristic with far less forward-testing than
   // the long side — see server/playbook.js.
+  // GEX wall selection. Per-contract gamma peaks at-the-money, so ranking
+  // strikes by gamma alone hands back the strike nearest spot every time — the
+  // "call wall" (= T1 target) landed 0.3% away and rr>=2 could never pass.
+  walls: {
+    minDistancePct: 0.015,   // a wall must be >=1.5% from spot to count
+    weightByOi: false,       // rank by gamma x OI instead of gamma alone
+  },
   sides: { long: true, short: false },
   shares: {
     enabled: true, minShares: 1, maxNotionalPct: 0.10,
@@ -141,13 +153,25 @@ function deepMerge(base, over) {
   return out;
 }
 
+// The GEX scripts are separate Python processes spawned from several places
+// (discovery.js, observe.js, index.js), each with its own runPy. Rather than
+// thread wall settings through every call site as argv, publish them on
+// process.env — children inherit it — and let gexcore.py read them.
+function syncGexEnv(cfg) {
+  const w = cfg.walls || {};
+  process.env.WALL_MIN_DIST_PCT = String(w.minDistancePct ?? 0.015);
+  process.env.WALL_WEIGHT_BY_OI = w.weightByOi === true ? "1" : "0";
+}
+
 export function loadConfig() {
+  let cfg;
   try {
-    const raw = JSON.parse(fs.readFileSync(CONFIG_PATH));
-    return deepMerge(DEFAULTS, raw);
+    cfg = deepMerge(DEFAULTS, JSON.parse(fs.readFileSync(CONFIG_PATH)));
   } catch {
-    return deepMerge(DEFAULTS, {});
+    cfg = deepMerge(DEFAULTS, {});
   }
+  syncGexEnv(cfg);
+  return cfg;
 }
 
 export function saveConfig(partial) {

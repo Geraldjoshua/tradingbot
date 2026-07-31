@@ -76,9 +76,22 @@ async function advanceWorkingOrders(cfg) {
   try {
     const events = await working.process(cfg, {
       onFilled: async (w) => {
-        if (w.kind !== "entry") return;
-        const pos = vd.createPositionFromFill(w);
-        try { observe.markEntered(w.ticker, pos.id); } catch {}
+        if (w.kind === "entry") {
+          const pos = vd.createPositionFromFill(w);
+          try { observe.markEntered(w.ticker, pos.id); } catch {}
+          return;
+        }
+        if (w.kind === "exit") {
+          // Patient exits now ride the same ladder as entries, so the close-out
+          // is finalized here rather than inline in exitTrade.
+          const r = vd.finalizeExitFromWorking(w);
+          log("trade", "exit-filled", {
+            ticker: w.ticker, id: w.intent?.positionId, status: r.status,
+            price: w.filledPrice, realizedPnl: r.realizedPnl ?? null,
+            reason: w.intent?.reason || null,
+            ...(r.pnlIsEstimate ? { note: "P&L estimated — the entry leg had not filled" } : {}),
+          });
+        }
       },
     });
     for (const e of events) {
@@ -109,13 +122,22 @@ async function manage(cfg) {
           if (!p.lockedToBreakeven) { vd.lockToBreakeven({ id: p.id }); log("trade", "auto-lock-be", { ticker: p.ticker, id: p.id, t1: p.t1 }); }
         } else {
           const r = await vd.exitTrade({ id: p.id, reason: `auto: T1 take-profit @${p.t1}`, urgency: "patient" });
-          // realizedPnl comes from ACTUAL fills; optPnl was a mid-price estimate.
-          log("trade", "auto-take-profit", {
-            ticker: p.ticker, id: p.id, status: r.status, t1: p.t1,
-            realizedPnl: r.realizedPnl ?? null,
-            estimateWas: p.optPnl ?? null,
-            ...(r.pnlIsEstimate ? { note: "P&L estimated — a leg had not filled yet" } : {}),
-          });
+          // A patient exit returns EXIT_WORKING and then keeps returning it every
+          // tick while the ladder runs. Log the START of the ladder, not each
+          // re-confirmation — the old code logged one line a minute for ten
+          // minutes with a mid-price estimate swinging +33 to -180, which read
+          // like repeated failures rather than one order patiently working.
+          // The fill itself is logged by advanceWorkingOrders as `exit-filled`.
+          const quiet = r.status === "EXIT_WORKING" && !r.firstRungPrice;
+          if (!quiet) {
+            log("trade", "auto-take-profit", {
+              ticker: p.ticker, id: p.id, status: r.status, t1: p.t1,
+              ...(r.firstRungPrice ? { firstRung: r.firstRungPrice } : {}),
+              realizedPnl: r.realizedPnl ?? null,
+              estimateWas: p.optPnl ?? null,
+              ...(r.pnlIsEstimate ? { note: "P&L estimated — a leg had not filled yet" } : {}),
+            });
+          }
         }
       }
     } catch (e) {

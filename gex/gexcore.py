@@ -49,7 +49,7 @@ positioning and is the single biggest source of error here — more than any of 
 bugs above.
 """
 
-import math
+import math, os
 
 R = 0.04          # risk-free
 MULT = 100        # contract multiplier
@@ -61,6 +61,11 @@ IV_REL_MAX = 3.0       # reject IV > 3x that expiry's ATM IV
 IV_REL_MIN = 0.25      # reject IV < 0.25x that expiry's ATM IV
 WALL_MIN_OI = 100      # a strike needs this much OI to define a wall
 WALL_BAND_PCT = 0.20   # preferred band for walls (relaxed automatically if empty)
+# A wall must stand at least this far from spot, otherwise per-contract gamma
+# (which peaks ATM) simply hands us the next strike up every time. See the long
+# note in pick_walls. Env-overridable so the Node layer can drive it from config.
+WALL_MIN_DIST_PCT = float(os.environ.get("WALL_MIN_DIST_PCT", "0.015"))   # 1.5%
+WALL_WEIGHT_BY_OI = os.environ.get("WALL_WEIGHT_BY_OI", "0") == "1"
 # The relative-IV filter must never gut a chain — if it would keep fewer than
 # this, we assume the ATM baseline was bad and fall back to the absolute filter.
 MIN_KEEP = 8
@@ -148,12 +153,40 @@ def per_strike_gex(contracts, spot):
     return per
 
 
-def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI):
+def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI,
+               min_dist_pct=WALL_MIN_DIST_PCT, weight_by_oi=WALL_WEIGHT_BY_OI):
     """Call wall = biggest CALL gamma ABOVE spot. Put wall = biggest PUT gamma
     BELOW spot. Both restricted to a moneyness band and an OI floor.
 
     Returns (call_wall, put_wall, note) where each wall is
     {"strike", "gex", "oi"} or None when nothing qualifies.
+
+    ---- min_dist_pct: why a wall needs to be FAR from spot -------------------
+
+    Per-contract gamma is maximised at-the-money and decays away from spot. So
+    "largest call gamma above spot" almost always returns the strike immediately
+    above spot, whatever the open interest looks like. Observed live: GOOGL spot
+    349.99 -> wall 350, AMZN 271.66 -> 272.5, INTC 92.72 -> 93, DIS 95.86 -> 96.
+    Those aren't walls, they're just the next strike up.
+
+    That mattered because the call wall is T1, the profit target. A target 0.3%
+    away against a stop at the put wall can never satisfy the rr>=2 entry filter,
+    so the strategy rejected almost every name for a reason that was an artefact
+    of the selection rule rather than a fact about the market. (COIN was the
+    counter-example: genuine OI concentration at 160 with spot at 140, giving
+    R/R 39 — the mechanism works when a real wall exists.)
+
+    min_dist_pct excludes strikes within that fraction of spot, so a wall has to
+    stand at a distance to count. It is applied as a PREFERENCE inside the
+    progressive fallback: if nothing further out qualifies we relax it rather
+    than fail, because wall selection must never abort a scan.
+
+    ---- weight_by_oi --------------------------------------------------------
+
+    Off: rank by gamma alone (original). On: rank by gamma x open interest, so a
+    large OI cluster further out can outrank the ATM strike's naturally-high
+    gamma. Closer to how dealers describe a wall, but a big near-strike OI can
+    still win, which is why distance is the primary control.
     """
     notes = []
 
@@ -172,19 +205,26 @@ def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI):
             notes.append(f"no {side} strikes {'above' if side == 'call' else 'below'} spot at all")
             return None
 
+        d = max(0.0, float(min_dist_pct or 0.0))
+        far_enough = (lambda K: abs(K - spot) >= spot * d) if d > 0 else (lambda K: True)
+
         attempts = [
-            (band_pct, min_oi, None),
-            (band_pct, 0, f"{side} wall below OI floor {min_oi}"),
-            (band_pct * 2, 0, f"{side} wall outside {int(band_pct*100)}% band"),
-            (None, 0, f"{side} wall unrestricted (thin/unusual chain)"),
+            (band_pct, min_oi, far_enough, None),
+            (band_pct, 0, far_enough, f"{side} wall below OI floor {min_oi}"),
+            (band_pct * 2, 0, far_enough, f"{side} wall outside {int(band_pct*100)}% band"),
+            # Only now do we give up on distance — an ATM-hugging wall is poor,
+            # but it beats no wall and a dead scan.
+            (band_pct * 2, 0, lambda K: True,
+             f"{side} wall within {d*100:.1f}% of spot (nothing further out qualified)" if d > 0 else None),
+            (None, 0, lambda K: True, f"{side} wall unrestricted (thin/unusual chain)"),
         ]
-        for band, oi_floor, note in attempts:
+        for band, oi_floor, dist_ok, note in attempts:
             if band is None:
-                cands = [(K, e) for K, e in on_side if e[f"{side}Oi"] >= oi_floor]
+                cands = [(K, e) for K, e in on_side if e[f"{side}Oi"] >= oi_floor and dist_ok(K)]
             else:
                 lo, hi = spot * (1 - band), spot * (1 + band)
                 cands = [(K, e) for K, e in on_side
-                         if lo <= K <= hi and e[f"{side}Oi"] >= oi_floor]
+                         if lo <= K <= hi and e[f"{side}Oi"] >= oi_floor and dist_ok(K)]
             if cands:
                 if note:
                     notes.append(note)
@@ -197,8 +237,13 @@ def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI):
         return {"strike": K, "gex": round(e[side] if side == "call" else -e[side], 0),
                 "oi": int(e[f"{side}Oi"])}
 
-    call_wall = best("call", lambda K: K > spot, lambda kv: kv[1]["call"])
-    put_wall = best("put", lambda K: K < spot, lambda kv: kv[1]["put"])
+    def ranker(side):
+        if weight_by_oi:
+            return lambda kv: abs(kv[1][side]) * max(kv[1][f"{side}Oi"], 1)
+        return lambda kv: kv[1][side]
+
+    call_wall = best("call", lambda K: K > spot, ranker("call"))
+    put_wall = best("put", lambda K: K < spot, ranker("put"))
     return call_wall, put_wall, notes
 
 

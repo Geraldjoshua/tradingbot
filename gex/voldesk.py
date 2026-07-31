@@ -309,6 +309,25 @@ def main():
         downside = pTrans - nTrans
         rr = (upside / downside) if downside > 0 else 0.0
 
+        # ---- degenerate levels ----------------------------------------------
+        # When the put wall is the nearest strike below spot there is no strike
+        # left between it and spot for pTrans to occupy, so pTrans collapses onto
+        # nTrans: stop == entry, downside == 0, and rr is reported as 0.0. That
+        # reads like "this setup has terrible reward:risk" when the truth is
+        # "these levels are unusable" — a data problem wearing a market problem's
+        # clothes. Seen live on AMZN (270/270), GOOGL (347.5/347.5), DIS (95/95)
+        # and MARA (11.5/11.5) in a single scan.
+        #
+        # Say so explicitly instead. WALL_MIN_DIST_PCT should prevent most of
+        # these by pushing the walls off spot, but the check is the honest
+        # backstop for chains where it can't.
+        levels_bad = []
+        if downside <= 0:
+            levels_bad.append(f"stop {nTrans} is not below entry {pTrans}")
+        if upside <= 0:
+            levels_bad.append(f"target {plus_gex} is not above entry {pTrans}")
+        levels_usable = not levels_bad
+
         # spike-crash: is the +GEX target a recent spike high that sold off?
         # A real spike-crash: the +GEX target sits at a prior SWING high that was
         # reached by a sharp run-up (>=5% in a week) and then crashed (>=8% in 3 days).
@@ -356,6 +375,9 @@ def main():
         db_status = "exempt(pegged)" if pegged else ("no_prior" if db_change is None else ("pass" if db_pass else "fail"))
         cushion_threshold = 0.01 if (deep or (db_change or 0) >= 0.75) else 0.02
         filters = {
+            # Checked first so it reads before rr>=2 — if the levels are unusable,
+            # the R/R number downstream is meaningless rather than merely poor.
+            "levels_usable": levels_usable,
             "grade>=9": grade >= 9,
             "cushion": cushion >= cushion_threshold,
             "no_spike_crash": not spike_crash,
@@ -380,6 +402,11 @@ def main():
         reasons = [k for k, v in filters.items() if not v]
         if all_pass and tag == "BLOCKED":
             reasons.append(f"spot {round(spot,2)} >0.5% below pTrans {pTrans}")
+        if levels_bad:
+            # Replace the bare filter name with what's actually wrong, and drop
+            # rr>=2 — quoting a reward:risk computed from broken levels is noise.
+            reasons = [r for r in reasons if r not in ("levels_usable", "rr>=2")]
+            reasons.insert(0, "unusable levels: " + "; ".join(levels_bad))
 
         et_date = et_today()
         snapshot = {

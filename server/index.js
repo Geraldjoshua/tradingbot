@@ -234,7 +234,14 @@ app.post("/api/voldesk", async (req, res) => {
   try {
     const tickers = (req.body.tickers || []).map((t) => String(t).toUpperCase()).filter(Boolean);
     const maxDte = String(parseInt(req.body.maxDte) || 45);
-    const requireDb = req.body.requireDb === false ? "0" : "1";
+    // db_change requirement: an explicit requireDb in the body wins (the Vol Desk
+    // tab's dropdown sends one), otherwise fall back to the configured setting.
+    // It used to hardcode "1" when the body omitted it, so a manual re-scan
+    // silently re-applied db_change as a hard filter even after the user had
+    // turned discovery.requireDeltaBalance off — the toggle appeared not to work.
+    const requireDb = typeof req.body.requireDb === "boolean"
+      ? (req.body.requireDb ? "1" : "0")
+      : (flow.loadConfig().discovery?.requireDeltaBalance === false ? "0" : "1");
     if (!tickers.length) return res.status(400).json({ error: "no tickers" });
     const dataDir = path.join(PROJECT_ROOT, "data", "voldesk");
 
