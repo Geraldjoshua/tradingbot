@@ -77,6 +77,47 @@ def minervini(closes):
     return sum(c.values()), c
 
 
+# ---- JSON that Node can actually parse -------------------------------------
+# Python's json.dumps writes NaN / Infinity as BARE LITERALS. They're legal to
+# Python's own parser and illegal to everyone else's — JSON.parse rejects them
+# with "Unexpected token 'N'". The Node side then reported
+#   gex/voldesk.py failed (code 0): {"ticker...
+# i.e. the script succeeded, printed a full snapshot, and the whole scan was
+# discarded because one float deep inside it was NaN. Every ticker came back ERR
+# with no hint as to which field was at fault.
+#
+# So: replace non-finite floats with null, and RECORD WHERE THEY WERE. Silently
+# nulling them would fix the crash and hide the bug that produced a NaN in the
+# first place; `nonFinite` in the output names the offending fields.
+def scrub_nonfinite(obj, path="", found=None):
+    if found is None:
+        found = []
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            found.append(path or "(root)")
+            return None, found
+        return obj, found
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[k], found = scrub_nonfinite(v, f"{path}.{k}" if path else str(k), found)
+        return out, found
+    if isinstance(obj, (list, tuple)):
+        out = []
+        for i, v in enumerate(obj):
+            nv, found = scrub_nonfinite(v, f"{path}[{i}]", found)
+            out.append(nv)
+        return out, found
+    return obj, found
+
+
+def dumps_safe(obj):
+    clean, bad = scrub_nonfinite(obj)
+    if bad:
+        clean["nonFinite"] = sorted(set(bad))[:12]
+    return json.dumps(clean, allow_nan=False)
+
+
 def load_prior(data_dir, ticker):
     files = sorted(glob.glob(os.path.join(data_dir, ticker, "*.json")))
     today = et_today()
@@ -434,7 +475,7 @@ def main():
         with open(os.path.join(data_dir, ticker, f"{et_date}.json"), "w") as f:
             json.dump(snapshot, f, indent=2)
 
-        print(json.dumps(snapshot))
+        print(dumps_safe(snapshot))
     except Exception as e:
         import traceback
         print(json.dumps({"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-500:]}))

@@ -166,6 +166,56 @@ export async function waitForFill(id, { timeoutMs = 20000, pollMs = 1000 } = {})
   // will correct it on the next boot.
   return { filled: false, price: null, qty: 0, status: last?.status || "pending", timedOut: true };
 }
+// ---- Account activities (the broker's ledger) -----------------------------
+//
+// This is the only complete record of what actually happened on the account:
+// every fill, every option expiration, every assignment — including trades the
+// bot never knew about (placed by hand, or before the local store existed).
+// Positions and orders both forget; activities don't.
+//
+// Paging is by opaque `page_token` = the id of the last row you saw. A page that
+// comes back short of page_size is the last page.
+export async function getActivities({ types = [], after = null, until = null, pageSize = 100, maxPages = 100 } = {}) {
+  let all = [], pageToken = null, pages = 0;
+  do {
+    const u = new URL(`${TRADE}/v2/account/activities`);
+    if (types.length) u.searchParams.set("activity_types", types.join(","));
+    if (after) u.searchParams.set("after", after);
+    if (until) u.searchParams.set("until", until);
+    u.searchParams.set("direction", "asc");
+    u.searchParams.set("page_size", String(pageSize));
+    if (pageToken) u.searchParams.set("page_token", pageToken);
+    const j = await req(u);
+    const arr = Array.isArray(j) ? j : [];
+    all = all.concat(arr);
+    pageToken = arr.length === pageSize ? arr[arr.length - 1].id : null;
+  } while (pageToken && ++pages < maxPages);
+  return all;
+}
+
+// Paginated closed-order history — the fallback when activities are unavailable.
+// Orders page backwards from `until`, so we walk the window oldest-ward.
+export async function getClosedOrders({ after = null, maxPages = 20 } = {}) {
+  let all = [], until = null, pages = 0;
+  const seen = new Set();
+  do {
+    const u = new URL(`${TRADE}/v2/orders`);
+    u.searchParams.set("status", "closed");
+    u.searchParams.set("limit", "500");
+    u.searchParams.set("direction", "desc");
+    if (after) u.searchParams.set("after", after);
+    if (until) u.searchParams.set("until", until);
+    const page = await req(u);
+    if (!Array.isArray(page) || !page.length) break;
+    let added = 0;
+    for (const o of page) if (!seen.has(o.id)) { seen.add(o.id); all.push(o); added++; }
+    if (!added) break;                                    // same page again — stop
+    until = page[page.length - 1].submitted_at || page[page.length - 1].created_at;
+    if (page.length < 500) break;
+  } while (++pages < maxPages);
+  return all;
+}
+
 export async function cancelOrder(id) {
   return req(`${TRADE}/v2/orders/${id}`, { method: "DELETE" });
 }

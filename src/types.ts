@@ -175,6 +175,94 @@ export interface VolDeskPosition {
   lockedToBreakeven?: boolean;
 }
 
+// ---- Trade history --------------------------------------------------------
+export interface HistoryTrade {
+  id: string;
+  symbol: string;          // OCC contract symbol, or the ticker for equities
+  ticker: string;
+  side: "long" | "short";
+  qty: number;
+  assetClass: "option" | "equity";
+  contract: { underlying: string; expiry: string; type: "call" | "put"; strike: number } | null;
+  entryPrice: number | null;
+  exitPrice: number | null;
+  entryTime: string;
+  exitTime: string | null;
+  entryDate: string;
+  exitDate: string | null;
+  entryOrderId: string | null;
+  exitOrderId: string | null;
+  closedBy: "fill" | "expired" | "assigned" | "exercised" | "store" | null;
+  cost: number;
+  pnl: number | null;
+  pnlPct: number | null;
+  currentPrice?: number | null;
+  holdDays: number | null;
+  open: boolean;
+  origin: "broker" | "store";
+  // enrichment from the local Vol Desk store (absent for untracked trades)
+  strategy: "voldesk" | "manual";
+  tracked: boolean;
+  positionId?: string;
+  exitReason?: string | null;
+  triggeredBy?: string | null;
+  levels?: { trigger: number | null; stop: number | null; t1: number | null; t2: number | null } | null;
+  entrySpot?: number | null;
+  flowStance?: string | null;
+  storedPnl?: number | null;
+  pnlIsEstimate?: boolean;
+}
+
+export interface HistorySummary {
+  n: number; wins: number; losses: number; scratches: number;
+  winRate: number | null;
+  realizedPnl: number; grossWin: number; grossLoss: number;
+  avgWin: number | null; avgLoss: number | null;
+  profitFactor: number | null; expectancy: number | null;
+  totalCost: number; returnOnCost: number | null;
+  best: HistoryTrade | null; worst: HistoryTrade | null;
+  avgHoldDays: number | null;
+}
+
+// One calendar bucket (day / week / month). `opened` counts trades TAKEN in the
+// period; `realizedPnl` is what the period's EXITS banked — different dates, so
+// both are carried rather than conflated.
+export interface CalendarPeriod {
+  key: string;
+  label: string;
+  opened: number;
+  openedCost: number;
+  stillOpen: number;
+  closed: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  realizedPnl: number;
+  cumulativePnl: number;
+  tickers: string[];
+  openedIds: string[];
+  closedIds: string[];
+}
+
+export interface HistoryResponse {
+  since: string;
+  source: "activities" | "orders" | null;
+  errors: string[];
+  trades: HistoryTrade[];
+  openTrades: HistoryTrade[];
+  unfilled: { id: string; ticker: string; symbol: string; date: string; reason: string; quotedPrice: number | null; contracts: number | null }[];
+  summary: HistorySummary;
+  unrealizedPnl: number;
+  openCost: number;
+  fees: number;
+  equityCurve: { date: string; value: number }[];
+  bySymbol: { key: string; n: number; wins: number; pnl: number; winRate: number }[];
+  byDay: CalendarPeriod[];
+  byWeek: CalendarPeriod[];
+  byMonth: CalendarPeriod[];
+  counts: { fills: number; activities: number };
+}
+
 export interface FaberResult {
   symbol: string;
   smaMonths: number;

@@ -2,6 +2,19 @@ import type { BacktestParams, BacktestResponse } from "./types";
 
 async function j<T>(url: string, opts?: RequestInit): Promise<T> {
   const r = await fetch(url, opts);
+  // A missing API route falls through to the SPA handler and returns index.html,
+  // so .json() blows up with a browser-specific parser message ("The string did
+  // not match the expected pattern" on Safari) that says nothing about the cause.
+  // Check the content type first and name the real problem.
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    throw new Error(
+      r.status === 404 || ct.includes("text/html")
+        ? `${url} isn't served by the running backend (got ${r.status} ${ct.split(";")[0] || "no content-type"}). `
+          + "It's usually a server started before this route existed — restart it (npm run dev / npm start)."
+        : `${url} returned ${r.status} ${ct || "no content-type"} instead of JSON.`
+    );
+  }
   const data = await r.json();
   if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   return data as T;
@@ -56,6 +69,10 @@ export const voldeskPositions = () =>
   j<{ positions: import("./types").VolDeskPosition[] }>("/api/voldesk/positions");
 export const voldeskExit = (id: string, reason: string) => post("/api/voldesk/exit", { id, reason });
 export const voldeskLock = (id: string) => post("/api/voldesk/lock", { id });
+
+// Every executed trade on the account, round-tripped with realized P&L.
+export const getHistory = (days = 365) =>
+  j<import("./types").HistoryResponse>(`/api/history?days=${days}`);
 
 export const placeOrder = (body: any) =>
   j<any>("/api/orders", {

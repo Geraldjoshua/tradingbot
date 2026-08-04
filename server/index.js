@@ -15,6 +15,7 @@ import * as discovery from "./discovery.js";
 import * as housekeeping from "./housekeeping.js";
 import * as observe from "./observe.js";
 import * as diagnostics from "./diagnostics.js";
+import * as history from "./history.js";
 import { startKeepAlive, notePing, pingStatus } from "./keepalive.js";
 import * as localMode from "./local_mode.js";
 import * as reconcileMod from "./reconcile.js";
@@ -35,8 +36,18 @@ function runPy(script, args) {
     child.on("close", (code) => {
       try {
         resolve(JSON.parse(out));
-      } catch {
-        reject(new Error(`${script} failed (code ${code}): ${(err || out).slice(0, 400)}`));
+      } catch (parseErr) {
+        // A script can exit 0, print a complete document, and still fail here —
+        // Python writes NaN/Infinity as bare literals that JSON.parse rejects.
+        // Showing only the first 400 chars hid that completely: the head looked
+        // like perfectly good JSON and the offending token was 900 chars in.
+        // Name the actual reason, and show the tail as well as the head.
+        const bare = /(^|[[,:\s])(NaN|-?Infinity)([,}\]\s]|$)/.exec(out);
+        const detail = err ? `stderr: ${err.slice(0, 300)}`
+          : bare ? `stdout contains bare \`${bare[2]}\` at char ${bare.index}, which is valid Python `
+                   + `but NOT valid JSON — the script ran fine, the output just can't be parsed`
+          : `JSON.parse: ${parseErr.message}\n  head: ${out.slice(0, 200)}\n  tail: ${out.slice(-200)}`;
+        reject(new Error(`${script} failed (code ${code}): ${detail}`));
       }
     });
   });
@@ -330,6 +341,18 @@ app.post("/api/voldesk/exit", async (req, res) => {
 app.post("/api/voldesk/lock", (req, res) => {
   try { res.json(vdTrades.lockToBreakeven({ id: req.body.id })); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- Trade history --------------------------------------------------------
+// Every executed trade on the account (not just the bot's), FIFO-matched into
+// round trips with realized P&L, plus the still-open lots and the entries that
+// never filled. See history.js for why the broker ledger is the spine.
+app.get("/api/history", async (req, res) => {
+  try {
+    res.json(await history.tradeHistory({
+      days: Math.min(3650, Math.max(1, parseInt(req.query.days) || 365)),
+    }));
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 // ---- Flow conviction ------------------------------------------------------

@@ -5,8 +5,9 @@ import GexView from "./components/GexView";
 import VolDeskView from "./components/VolDeskView";
 import AutoTraderView from "./components/AutoTraderView";
 import FlowUploadView from "./components/FlowUploadView";
+import HistoryView from "./components/HistoryView";
 
-type Tab = "backtest" | "paper" | "gex" | "voldesk" | "auto" | "flow";
+type Tab = "backtest" | "paper" | "gex" | "voldesk" | "auto" | "flow" | "history";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("backtest");
@@ -21,10 +22,11 @@ export default function App() {
         <button className={`tab ${tab === "voldesk" ? "active" : ""}`} onClick={() => setTab("voldesk")}>Vol Desk</button>
         <button className={`tab ${tab === "auto" ? "active" : ""}`} onClick={() => setTab("auto")}>Auto-trader</button>
         <button className={`tab ${tab === "flow" ? "active" : ""}`} onClick={() => setTab("flow")}>Flow</button>
+        <button className={`tab ${tab === "history" ? "active" : ""}`} onClick={() => setTab("history")}>History</button>
       </div>
       {tab === "backtest" ? <FaberView /> : tab === "paper" ? <PaperTradingView /> :
        tab === "gex" ? <GexView /> : tab === "voldesk" ? <VolDeskView /> :
-       tab === "auto" ? <AutoTraderView /> : <FlowUploadView />}
+       tab === "auto" ? <AutoTraderView /> : tab === "flow" ? <FlowUploadView /> : <HistoryView />}
     </div>
   );
 }
