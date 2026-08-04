@@ -190,7 +190,7 @@ def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI,
     """
     notes = []
 
-    def best(side, predicate, key):
+    def best(side, predicate, key, dist_pct):
         """Degrade gracefully rather than fail closed.
 
         An earlier version returned None the moment the preferred band+OI filter
@@ -205,7 +205,7 @@ def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI,
             notes.append(f"no {side} strikes {'above' if side == 'call' else 'below'} spot at all")
             return None
 
-        d = max(0.0, float(min_dist_pct or 0.0))
+        d = max(0.0, float(dist_pct or 0.0))
         far_enough = (lambda K: abs(K - spot) >= spot * d) if d > 0 else (lambda K: True)
 
         attempts = [
@@ -242,8 +242,20 @@ def pick_walls(per, spot, band_pct=WALL_BAND_PCT, min_oi=WALL_MIN_OI,
             return lambda kv: abs(kv[1][side]) * max(kv[1][f"{side}Oi"], 1)
         return lambda kv: kv[1][side]
 
-    call_wall = best("call", lambda K: K > spot, ranker("call"))
-    put_wall = best("put", lambda K: K < spot, ranker("put"))
+    # The distance rule applies to the CALL wall only.
+    #
+    # It was written to stop the profit target landing on the strike next to spot.
+    # Applying the same rule to the put wall pushed the STOP far below spot, and
+    # because voldesk.py derived pTrans from nTrans, pTrans then collapsed onto
+    # nTrans + one strike: a $2.50 stop on a $487 name, and an R/R of 19 that came
+    # from a tiny denominator rather than a good setup.
+    #
+    # A put wall close to spot is not a defect — a tight structural stop is
+    # useful. What matters is that the stop sits a sensible distance BELOW THE
+    # ENTRY, which is a different question, and is now answered in voldesk.py
+    # where the entry level is actually known.
+    call_wall = best("call", lambda K: K > spot, ranker("call"), min_dist_pct)
+    put_wall = best("put", lambda K: K < spot, ranker("put"), 0.0)
     return call_wall, put_wall, notes
 
 

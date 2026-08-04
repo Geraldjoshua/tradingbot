@@ -318,16 +318,46 @@ def main():
 
         # ---- Vol Desk level mapping (approximations) ----
         zeroGEX = round(flip, 2)
-        nTrans = round(put_wall[0], 2)               # structural stop (below spot)
         plus_gex = round(call_wall[0], 2)            # T1 target (above spot)
-        # pTrans = reclaim/entry level: the gamma flip clamped into (nTrans, spot],
-        # snapped to the nearest actual strike, so nTrans < pTrans <= spot < +GEX.
-        cand = [k for k in strikes if nTrans < k <= spot]
-        if cand:
-            target = min(max(flip, nTrans), spot)
-            pTrans = round(min(cand, key=lambda k: abs(k - target)), 2)
+
+        # ---- pTrans: the gamma flip, and ONLY the gamma flip ------------------
+        # This used to be `min(max(flip, nTrans), spot)` — the flip clamped into
+        # the band (nTrans, spot]. The clamp was the bug. Once the wall rule moved
+        # the put wall further from spot, `max(flip, nTrans)` started returning
+        # nTrans on most names, so pTrans snapped to nTrans + one strike:
+        #
+        #   MSFT  spot 487.57   pTrans 452.50   nTrans 450.00   ->  stop 0.5% wide
+        #
+        # Two things were wrong with that. The stop became a strike increment
+        # rather than a level, which inflated R/R to 19 on a denominator of $2.50.
+        # And the ENTRY moved 7% below spot, so names were tagged CONFIRMED on a
+        # trigger price had cleared days earlier.
+        #
+        # pTrans means one thing: the level price must reclaim for dealers to flip
+        # long gamma. That's the flip. If it sits above spot, the name simply
+        # hasn't reclaimed yet — which the tag logic already expresses as
+        # PENDING/BLOCKED. Clamping it below spot forged a confirmation.
+        pTrans = round(min(strikes, key=lambda k: abs(k - flip)), 2) if strikes else round(flip, 2)
+
+        # ---- nTrans: the stop, measured from the ENTRY not from spot ----------
+        # A stop belongs a sensible distance below the level you enter on. Take
+        # the biggest put-gamma strike at least `stop_min_pct` below pTrans, so
+        # the risk leg can't collapse to one strike width. Falls back to the
+        # unrestricted put wall, and finally to a synthesised level, because a
+        # missing stop must never abort the scan.
+        stop_min_pct = float(os.environ.get("STOP_MIN_PCT", "0.01"))
+        gap = max(spot * stop_min_pct, 1e-9)
+        below = [(K, e) for K, e in per.items() if K <= pTrans - gap]
+        if below:
+            K, _ = max(below, key=lambda kv: kv[1]["put"])
+            nTrans = round(K, 2)
+        elif put_wall[0] < pTrans:
+            nTrans = round(put_wall[0], 2)
         else:
-            pTrans = round(min(spot, max(flip, nTrans)), 2)
+            # Nothing below the entry at all — synthesise so the scan completes,
+            # and let the levels_usable filter judge it.
+            nTrans = round(pTrans * (1 - max(stop_min_pct, 0.01)), 2)
+            wall_notes.append(f"no put strike {stop_min_pct*100:.1f}% below pTrans — synthesised stop {nTrans}")
         t2 = round(cotmc, 2)
 
         # delta/gamma balance in [0,1]
@@ -359,6 +389,13 @@ def main():
             levels_bad.append(f"stop {nTrans} is not below entry {pTrans}")
         if upside <= 0:
             levels_bad.append(f"target {plus_gex} is not above entry {pTrans}")
+        # A stop worth less than one strike-width isn't a level, it's a rounding
+        # artefact — and it inflates R/R by shrinking the denominator rather than
+        # by improving the trade. Reject rather than report R/R 19 on a $2.50 risk.
+        if downside > 0 and downside < spot * stop_min_pct * 0.9:
+            levels_bad.append(
+                f"stop {nTrans} is only {downside / spot * 100:.2f}% below entry {pTrans} "
+                f"(min {stop_min_pct * 100:.1f}%) — R/R would be inflated by a tiny denominator")
         levels_usable = not levels_bad
 
         # spike-crash: is the +GEX target a recent spike high that sold off?

@@ -163,7 +163,8 @@
   },
   "walls": {
     "minDistancePct": 0.015,
-    "weightByOi": false
+    "weightByOi": false,
+    "stopMinPct": 0.01
   },
   "data": {
     "provider": "alpaca"

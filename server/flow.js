@@ -116,8 +116,12 @@ const DEFAULTS = {
   // strikes by gamma alone hands back the strike nearest spot every time — the
   // "call wall" (= T1 target) landed 0.3% away and rr>=2 could never pass.
   walls: {
-    minDistancePct: 0.015,   // a wall must be >=1.5% from spot to count
+    minDistancePct: 0.015,   // CALL wall must be >=1.5% from spot (the target)
     weightByOi: false,       // rank by gamma x OI instead of gamma alone
+    // Minimum distance from the ENTRY down to the stop. Without this the stop
+    // collapses to one strike width and R/R is inflated by a tiny denominator
+    // rather than earned — MSFT showed R/R 19 on a $2.50 risk leg.
+    stopMinPct: 0.01,
   },
   // Where the GEX engine gets open interest, IV and bars. Alpaca is ~3 REST
   // calls per ticker against a generous limit; Yahoo is ~7 and rate-limits at
@@ -174,6 +178,7 @@ function syncGexEnv(cfg) {
   process.env.WALL_MIN_DIST_PCT = String(w.minDistancePct ?? 0.015);
   process.env.WALL_WEIGHT_BY_OI = w.weightByOi === true ? "1" : "0";
   process.env.GEX_DATA_PROVIDER = (cfg.data?.provider || "alpaca").toLowerCase();
+  process.env.STOP_MIN_PCT = String(cfg.walls?.stopMinPct ?? 0.01);
 }
 
 export function loadConfig() {

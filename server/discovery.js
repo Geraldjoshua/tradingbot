@@ -448,7 +448,12 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
   const qualified = [];
   const watch = [];
   const tagCounts = {};
-  for (const s of scans) {
+  // `let`, not `const`: the short branch below rebuilds `s` with the bearish tag,
+  // and reassigning a for-of `const` throws "Assignment to constant variable".
+  // That line is unreachable while sides.short is false, so the bug sat here
+  // silently until puts were switched on — at which point the FIRST bearish
+  // candidate killed the whole discovery run, and the upload path with it.
+  for (let s of scans) {
     if (s.error) continue;
     const c = byTicker[s.ticker] || {};
     const side = c.side || "long";
