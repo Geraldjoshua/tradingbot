@@ -169,8 +169,19 @@ def yf_retry(fn, what="yahoo call"):
     raise last
 
 
-def regime(yf, data_dir=None):
-    """Market regime read, CACHED — identical for every ticker in a run."""
+def regime(data_dir=None):
+    """Market regime read, CACHED — identical for every ticker in a run.
+
+    yfinance is imported HERE, and only on a cache miss. It used to be imported
+    unconditionally at the top of main(), which cost ~91 MB of resident memory
+    (pandas + numpy) in EVERY scan process. At 8 concurrent scans that's ~730 MB
+    on a 512 MB Render instance: the OOM killer took the whole app down and the
+    proxy answered 502 on the next request.
+
+    Nothing else needs yfinance once the Alpaca provider is in use, and the
+    regime is disk-cached for REGIME_TTL_SECONDS, so on a warm cache a scan now
+    imports nothing heavier than urllib.
+    """
     import time as _t
     cache_path = os.path.join(data_dir or ".", "_regime_cache.json")
     try:
@@ -179,6 +190,14 @@ def regime(yf, data_dir=None):
             return blob["regime"]
     except Exception:
         pass
+
+    try:
+        import yfinance as yf
+    except Exception as e:
+        # No regime read is survivable; a dead scan is not.
+        return {"spy_chg": None, "qqq_chg": None, "vix_chg": None,
+                "basket_gate": False, "vix_gate": False, "bull_bear_gate": None,
+                "gates_passed": 0, "gates_note": f"regime unavailable ({e})"}
 
     out = {}
     for sym in ("SPY", "QQQ", "^VIX"):
@@ -219,11 +238,11 @@ def main():
     # filter (useful on day 1 when no prior snapshot exists yet). Default: required.
     require_db = (sys.argv[4] != "0") if len(sys.argv) > 4 else True
 
-    try:
-        import yfinance as yf
-    except Exception as e:
-        print(json.dumps({"error": f"yfinance not installed: {e}"}))
-        return
+    # NOTE: yfinance is deliberately NOT imported here any more. It costs ~91 MB
+    # per process and is needed only by the Yahoo provider (which imports it
+    # itself) and by regime() on a cache miss (which now imports it lazily).
+    # Importing it unconditionally is what made 8 concurrent scans exceed the
+    # 512 MB Render instance and take the whole app down.
 
     try:
         # Provider abstraction: Alpaca by default, Yahoo as fallback. See
@@ -519,7 +538,7 @@ def main():
             "spike_crash": spike_crash,
             "call_oi": int(call_oi), "put_oi": int(put_oi), "total_gex": round(total_gex, 0),
             "filters": filters, "filter_reasons": reasons,
-            "regime": regime(yf, data_dir),
+            "regime": regime(data_dir),
             "require_db": require_db,
             # Which feed produced these levels, and how old the open interest is.
             # Yahoo never exposes an OI date, so until now we had no idea whether

@@ -388,7 +388,16 @@ async function scanAll(tickers, cfg) {
   const conc = Math.max(1, Math.min(cfg.discovery.scanConcurrency || (onAlpaca ? 8 : 2), capacity));
   const staggerMs = cfg.discovery.scanStaggerMs ?? (onAlpaca ? 60 : 400);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Warm the regime cache with ONE scan before fanning out. On a cold cache
+  // regime() imports yfinance (~91 MB); if 8 workers start together they all
+  // take that hit at once and a 512 MB box dies. One sequential scan populates
+  // the shared disk cache, after which the rest import nothing heavy.
   let i = 0;
+  if (tickers.length > 1 && conc > 2) {
+    const first = tickers[i++];
+    const r = await volDeskScan(first, cfg);
+    out.push(r && !r.error ? { ticker: first, ...r } : { ticker: first, error: r?.error || "scan failed" });
+  }
   async function worker(slot) {
     await sleep(slot * staggerMs);
     while (i < tickers.length) {

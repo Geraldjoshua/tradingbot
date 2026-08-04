@@ -27,7 +27,7 @@
     "uwFallbackOnly": true,
     "everyMinutes": 30,
     "maxScan": 60,
-    "scanConcurrency": 8,
+    "scanConcurrency": 4,
     "scanStaggerMs": 60,
     "minPremium": 150000,
     "minScore": 0.3,

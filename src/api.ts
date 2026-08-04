@@ -8,11 +8,19 @@ async function j<T>(url: string, opts?: RequestInit): Promise<T> {
   // Check the content type first and name the real problem.
   const ct = r.headers.get("content-type") || "";
   if (!ct.includes("application/json")) {
+    // 5xx and 404 mean very different things and the same message for both is
+    // actively misleading: a 502 was reported as "route doesn't exist, restart
+    // the server" when the real cause was the backend being OOM-killed mid-scan.
+    const gateway = r.status === 502 || r.status === 503 || r.status === 504;
     throw new Error(
-      r.status === 404 || ct.includes("text/html")
-        ? `${url} isn't served by the running backend (got ${r.status} ${ct.split(";")[0] || "no content-type"}). `
-          + "It's usually a server started before this route existed — restart it (npm run dev / npm start)."
-        : `${url} returned ${r.status} ${ct || "no content-type"} instead of JSON.`
+      gateway
+        ? `${url} — the backend didn't respond (${r.status}). The server is down, restarting, or was `
+          + "killed. On a small instance the usual cause is memory: several concurrent Vol Desk scans "
+          + "at once. Check the host logs, and lower discovery.scanConcurrency if it repeats."
+        : r.status === 404 || ct.includes("text/html")
+          ? `${url} isn't served by the running backend (got ${r.status} ${ct.split(";")[0] || "no content-type"}). `
+            + "It's usually a server started before this route existed — restart it (npm run dev / npm start)."
+          : `${url} returned ${r.status} ${ct || "no content-type"} instead of JSON.`
     );
   }
   const data = await r.json();
