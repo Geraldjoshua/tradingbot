@@ -391,9 +391,22 @@ export default function AutoTraderView() {
         <label className="row"><input type="checkbox" checked={d.shadowMode}
           onChange={(e) => patch({ discovery: { shadowMode: e.target.checked } })} /> Shadow mode (log picks, don't buy)</label>
         <label className="row"><input type="checkbox" checked={d.sources.optionstrat}
-          onChange={(e) => patch({ discovery: { sources: { optionstrat: e.target.checked } } })} /> from OptionStrat masters (local only)</label>
+          onChange={(e) => patch({ discovery: { sources: { optionstrat: e.target.checked } } })} />
+          <b>from OptionStrat masters</b> — the flow you upload or scrape</label>
         <label className="row"><input type="checkbox" checked={d.sources.unusualwhales}
-          onChange={(e) => patch({ discovery: { sources: { unusualwhales: e.target.checked } } })} /> from Unusual Whales (works in cloud)</label>
+          onChange={(e) => patch({ discovery: { sources: { unusualwhales: e.target.checked } } })} /> from Unusual Whales (needs UW_API_KEY)</label>
+        {d.sources.optionstrat === false && d.sources.unusualwhales === false && (
+          <p className="sub" style={{ color: "var(--warn, #d88)", margin: "0 0 6px 22px" }}>
+            <b>Both sources are off — discovery cannot find anything.</b> With neither ticked, no source
+            is even attempted: you'll see "sources: none · considered 0" no matter how good the uploaded
+            book is. Only the watchlist will trade.
+          </p>
+        )}
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          This used to be labelled "local only", which was wrong and worth correcting: the masters work
+          wherever they are, and the whole upload flow exists so a cloud deploy can use them. Uploading
+          <code> flow_master.xlsx</code> on the Flow tab builds the same cache the local scraper would.
+        </p>
         <div className="row">
           every <input type="number" value={d.everyMinutes} style={{ width: 54 }}
             onChange={(e) => patch({ discovery: { everyMinutes: +e.target.value } })} />min ·
@@ -404,6 +417,23 @@ export default function AutoTraderView() {
           min skew <input type="number" step="0.05" value={d.minScore} style={{ width: 54 }}
             onChange={(e) => patch({ discovery: { minScore: +e.target.value } })} />
         </div>
+
+        <label className="row">GEX data source&nbsp;
+          <select value={cfg.data?.provider || "alpaca"}
+            onChange={(e) => patch({ data: { provider: e.target.value } })}>
+            <option value="alpaca">Alpaca — OI + IV + bars over REST</option>
+            <option value="yahoo">Yahoo (yfinance) — fallback</option>
+          </select>
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Alpaca needs ~<b>3</b> calls per ticker; Yahoo needs ~<b>7</b> and rate-limits at roughly 19
+          tickers in a burst — which is the only reason "scan top" sits at 8. Alpaca also returns
+          <code> open_interest_date</code>, so you can finally see how stale the OI behind your gamma is;
+          Yahoo never tells you. If Alpaca keys are missing or the API errors, it falls back to Yahoo
+          automatically rather than aborting the scan — a data outage should degrade a scan, not leave
+          the trader with no snapshot. The source used is recorded on every snapshot as
+          <code> data_source</code>.
+        </p>
 
         <label className="row">
           <input type="checkbox" checked={(cfg.walls?.minDistancePct ?? 0.015) > 0}
@@ -563,8 +593,56 @@ export default function AutoTraderView() {
                 </tbody>
               </table>
             )}
+            {/* What actually got scanned, and why each one didn't make it.
+                The old build printed only "rejected by Vol Desk: NVDA(BLOCKED), …",
+                which tells you nothing on a 0-qualified day — and 0 qualified is
+                the NORMAL outcome most days, so that's exactly when you need detail. */}
+            {!!(disc.watch || []).length && (
+              <>
+                <p className="sub" style={{ marginBottom: 4 }}>
+                  <b>Scanned {disc.scanned} of {disc.considered} candidates.</b>{" "}
+                  {disc.tagCounts && Object.entries(disc.tagCounts)
+                    .map(([t, n]: any) => `${n} ${t}`).join(" · ")}
+                  {" — "}these are on the observe list and get re-checked daily.
+                </p>
+                <table className="tbl">
+                  <thead><tr>
+                    <th>ticker</th><th>side</th><th>tag</th><th>grade</th><th>R/R</th>
+                    <th>tier</th><th>score</th><th>net premium</th><th>what's blocking it</th>
+                  </tr></thead>
+                  <tbody>
+                    {disc.watch.map((w: any) => (
+                      <tr key={`${w.ticker}-${w.side}`} className={w.tag === "CONFIRMED" ? "confirmed" : undefined}>
+                        <td><b>{w.ticker}</b></td>
+                        <td>{w.side === "short" ? "put" : "call"}</td>
+                        <td>{w.tag}</td>
+                        <td>{w.grade != null ? `${w.grade}/11` : "—"}</td>
+                        <td>{w.rr != null ? Number(w.rr).toFixed(2) : "—"}</td>
+                        <td>{w.tierLabel || "—"}</td>
+                        <td>{w.tierScore != null ? `${w.tierScore.toFixed(2)}×` : "—"}</td>
+                        <td>${(Math.abs(w.netPremium) / 1000).toFixed(0)}k</td>
+                        <td className="sub">{(w.blockers || []).join(", ") || "nothing — tradeable"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            )}
             {!!(disc.rejected || []).length && (
-              <p className="sub">rejected by Vol Desk: {disc.rejected.map((r: any) => `${r.ticker}(${r.tag})`).join(", ")}</p>
+              <p className="sub" style={{ marginTop: 6 }}>
+                scanned but not even watchable:{" "}
+                {disc.rejected
+                  .filter((r: any) => !(disc.watch || []).find((w: any) => w.ticker === r.ticker))
+                  .map((r: any) => `${r.ticker} (${r.tag}${r.grade != null ? ` ${r.grade}/11` : ""})`)
+                  .join(", ") || "none"}
+              </p>
+            )}
+            {!(disc.watch || []).length && !!disc.scanned && (
+              <p className="sub">
+                All {disc.scanned} scanned names came back BLOCKED — none reached CONFIRMED or PENDING,
+                so nothing was added to the observe list. That is a normal outcome: a name only becomes
+                watchable once its structure lines up.
+              </p>
             )}
           </div>
         )}

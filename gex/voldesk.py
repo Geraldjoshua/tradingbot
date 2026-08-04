@@ -185,29 +185,25 @@ def main():
         return
 
     try:
-        tk = yf.Ticker(ticker)
-        hist = yf_retry(lambda: tk.history(period="1y"), f"{ticker} history")
-        if hist.empty:
-            print(json.dumps({"error": f"no price history for {ticker}"}))
+        # Provider abstraction: Alpaca by default, Yahoo as fallback. See
+        # gex/dataprovider.py — Alpaca serves OI, IV, greeks and bars over REST
+        # in ~3 calls per ticker instead of Yahoo's ~7, which is what made
+        # scanning more than 8 names at a time impossible.
+        import dataprovider as dp
+        provider = dp.get_provider()
+
+        closes, highs = provider.history(ticker)
+        if not closes:
+            print(json.dumps({"error": f"no price history for {ticker} (provider {provider.name})"}))
             return
-        closes = [float(x) for x in hist["Close"].tolist()]
-        highs = [float(x) for x in hist["High"].tolist()]
         spot = closes[-1]
 
         # ---- option chain -> per-strike GEX ----
-        exps = yf_retry(lambda: list(tk.options), f"{ticker} expiries")
-        now = datetime.now(timezone.utc)
-        chosen = []
-        for e in exps:
-            exp_dt = datetime.strptime(e, "%Y-%m-%d").replace(hour=20, tzinfo=timezone.utc)
-            d = (exp_dt - now).total_seconds() / 86400
-            if 0 < d <= max_dte:
-                chosen.append((e, d))
-            if len(chosen) >= 4:
-                break
-        if not chosen:
-            print(json.dumps({"error": f"no expiries within {max_dte} DTE"}))
+        chains = provider.chains(ticker, max_dte=max_dte)
+        if not chains:
+            print(json.dumps({"error": f"no expiries within {max_dte} DTE (provider {provider.name})"}))
             return
+        now = datetime.now(timezone.utc)
 
         # Fetch each expiry's chain ONCE into a cached contract list:
         #   contracts = [(K, T, iv, oi, is_call), ...]
@@ -215,26 +211,22 @@ def main():
         call_g = put_g = call_oi = put_oi = 0.0
         cw_num = cw_den = pw_num = pw_den = 0.0
         iv_dropped = 0
-        for e, d in chosen:
-            oc = yf_retry(lambda: tk.option_chain(e), f"{ticker} chain {e}")
+        for e in sorted(chains.keys())[:4]:
+            exp_dt = datetime.strptime(e, "%Y-%m-%d").replace(hour=20, tzinfo=timezone.utc)
+            d = (exp_dt - now).total_seconds() / 86400
+            if d <= 0:
+                continue
             T = d / 365.0
             rows = []
-            for df, is_call in ((oc.calls, True), (oc.puts, False)):
-                for _, row in df.iterrows():
-                    K, oi, iv = row.get("strike"), row.get("openInterest"), row.get("impliedVolatility")
-                    if not K or oi is None:
-                        continue
-                    if (isinstance(oi, float) and math.isnan(oi)) or oi <= 0:
-                        continue
-                    K, oi = float(K), float(oi)
-                    # OI-weighted centers (COTMC/COTMP) use OI regardless of IV validity
-                    if is_call:
-                        cw_num += K * oi; cw_den += oi; call_oi += oi
-                    else:
-                        pw_num += K * oi; pw_den += oi; put_oi += oi
-                    if iv is None or (isinstance(iv, float) and math.isnan(iv)) or iv <= 0:
-                        continue
-                    rows.append((K, T, float(iv), oi, is_call))
+            for (K, oi, iv, is_call) in chains[e]:
+                # OI-weighted centers (COTMC/COTMP) use OI regardless of IV validity
+                if is_call:
+                    cw_num += K * oi; cw_den += oi; call_oi += oi
+                else:
+                    pw_num += K * oi; pw_den += oi; put_oi += oi
+                if not iv or iv <= 0:
+                    continue
+                rows.append((K, T, float(iv), oi, is_call))
             # Reject Yahoo's garbage IVs before they manufacture fake gamma at
             # far strikes — those fake-gamma strikes were winning the wall vote
             # and therefore SETTING THE STOP (nTrans). See gex/gexcore.py.
@@ -429,6 +421,11 @@ def main():
             "filters": filters, "filter_reasons": reasons,
             "regime": regime(yf, data_dir),
             "require_db": require_db,
+            # Which feed produced these levels, and how old the open interest is.
+            # Yahoo never exposes an OI date, so until now we had no idea whether
+            # the gamma was computed from yesterday's book or last week's.
+            "data_source": provider.name,
+            "oi_date": getattr(provider, "last_oi_date", None),
             "tag": tag,
         }
 

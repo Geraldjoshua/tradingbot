@@ -120,7 +120,17 @@ export async function harvest(cfg) {
   }
 
   const candidates = [...merged.values()].sort((a, b) => b.rank - a.rank);
-  return { sources: used, candidates };
+  // "sources: none" is ambiguous on its own — it looks identical whether a source
+  // ran and found nothing or was never switched on. Say which. Turning both
+  // sources off silently reduces the bot to the watchlist, which is a very easy
+  // mistake to make and a very hard one to spot.
+  const why = [];
+  if (!useOS) why.push("OptionStrat source is OFF (discovery.sources.optionstrat)");
+  if (!useUW) why.push("Unusual Whales source is OFF");
+  return {
+    sources: used, candidates,
+    ...(used.length ? {} : { sourcesOff: why, floorUsed: floor, direction }),
+  };
 }
 
 // ---- 1b. NORMALIZE by company size / liquidity ----------------------------
@@ -397,10 +407,18 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
   const d = cfg.discovery;
   if (!d.enabled) return { enabled: false, qualified: [] };
 
-  const { sources, candidates: raw } = await harvest(cfg);
+  const h = await harvest(cfg);
+  const { sources, candidates: raw } = h;
   if (!raw.length) {
     return { enabled: true, sources, considered: 0, scanned: 0, qualified: [],
-      note: "no flow candidates (OptionStrat masters missing and/or UW off)" };
+      ...(h.sourcesOff ? { sourcesOff: h.sourcesOff } : {}),
+      note: h.sourcesOff?.length
+        // The distinction that matters: nothing was attempted, vs attempted and empty.
+        ? `NO SOURCE ENABLED — ${h.sourcesOff.join("; ")}. Nothing was read, so the uploaded `
+          + "book is irrelevant until one is switched on. Only the watchlist can trade."
+        : `source ran but returned nothing above the floor ($${(h.floorUsed ?? 0).toLocaleString()} `
+          + `net premium, ${cfg.discovery.minScore} skew, direction ${h.direction}). `
+          + "Either the cache is empty/stale, or the thresholds are above everything in the book." };
   }
 
   // Size-normalize BEFORE trimming, so a small-cap with a big relative

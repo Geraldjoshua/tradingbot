@@ -12,9 +12,9 @@
     "maxConcurrent": 5,
     "maxDailyEntries": 3,
     "entryCooldownMin": 30,
+    "watchlist": [],
     "triggerMode": "open",
     "intradayCutoffMin": 840,
-    "watchlist": [],
     "queuedExitDelayMin": 5
   },
   "discovery": {
@@ -82,7 +82,7 @@
     "minGrade": 0,
     "seedMinGrade": 0,
     "maxDte": 45,
-    "requireDeltaBalance": true,
+    "requireDeltaBalance": false,
     "exclude": [],
     "scanRetryMin": 30
   },
@@ -165,9 +165,17 @@
     "minDistancePct": 0.015,
     "weightByOi": false
   },
+  "data": {
+    "provider": "alpaca"
+  },
+  "scaleOut": {
+    "enabled": false,
+    "firstPct": 0.8,
+    "moveStopToBreakeven": true
+  },
   "sides": {
     "long": true,
-    "short": false
+    "short": true
   },
   "shares": {
     "enabled": true,
@@ -193,10 +201,5 @@
     "snapshotsPerTicker": 40,
     "keepClosedTrades": 200,
     "maxDataMB": 200
-  },
-  "scaleOut": {
-    "enabled": false,
-    "firstPct": 0.8,
-    "moveStopToBreakeven": true
   }
 }

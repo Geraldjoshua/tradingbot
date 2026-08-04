@@ -119,6 +119,12 @@ const DEFAULTS = {
     minDistancePct: 0.015,   // a wall must be >=1.5% from spot to count
     weightByOi: false,       // rank by gamma x OI instead of gamma alone
   },
+  // Where the GEX engine gets open interest, IV and bars. Alpaca is ~3 REST
+  // calls per ticker against a generous limit; Yahoo is ~7 and rate-limits at
+  // around 19 tickers. Yahoo stays as an automatic fallback when Alpaca keys
+  // are missing or the API is down — a data outage should degrade the scan,
+  // not abort it and leave the trader with no snapshot at all.
+  data: { provider: "alpaca" },
   // Partial exit at T1: bank most of it, move the stop to entry, let the rest
   // run to T2. Needs >= 2 contracts — you cannot sell 80% of one contract.
   scaleOut: { enabled: false, firstPct: 0.8, moveStopToBreakeven: true },
@@ -167,6 +173,7 @@ function syncGexEnv(cfg) {
   const w = cfg.walls || {};
   process.env.WALL_MIN_DIST_PCT = String(w.minDistancePct ?? 0.015);
   process.env.WALL_WEIGHT_BY_OI = w.weightByOi === true ? "1" : "0";
+  process.env.GEX_DATA_PROVIDER = (cfg.data?.provider || "alpaca").toLowerCase();
 }
 
 export function loadConfig() {

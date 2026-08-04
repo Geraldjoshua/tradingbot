@@ -104,12 +104,33 @@ def read_aggregate(path):
     return out
 
 
+def find_master(d, wanted):
+    """Locate a master workbook, ignoring case.
+
+    Linux filesystems are case-sensitive but the upload validator is not, so
+    `Flow_Master.xlsx` uploads happily and is then silently invisible to an
+    exact-name lookup — you get a cache with 0 tickers and no explanation.
+    Match case-insensitively instead, and only fall back to the exact name so
+    callers still get a sensible path to report as missing.
+    """
+    exact = d / wanted
+    if exact.exists():
+        return exact
+    if d.is_dir():
+        low = wanted.lower()
+        for f in d.iterdir():
+            if f.name.lower() == low:
+                return f
+    return exact
+
+
 def build(directory="."):
     d = Path(directory)
     t0 = datetime.now()
-    live = read_aggregate(d / MASTERS["live"])
-    unusual = set(read_aggregate(d / MASTERS["unusual"]).keys())
-    knows = set(read_aggregate(d / MASTERS["knows"]).keys())
+    paths = {k: find_master(d, v) for k, v in MASTERS.items()}
+    live = read_aggregate(paths["live"])
+    unusual = set(read_aggregate(paths["unusual"]).keys())
+    knows = set(read_aggregate(paths["knows"]).keys())
 
     tickers = {}
     for t, (bull, bear, cw, pw) in live.items():
