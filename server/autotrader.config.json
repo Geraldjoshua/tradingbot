@@ -202,5 +202,8 @@
     "snapshotsPerTicker": 40,
     "keepClosedTrades": 200,
     "maxDataMB": 200
+  },
+  "setup": {
+    "minRR": 2.0
   }
 }

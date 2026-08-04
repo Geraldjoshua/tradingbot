@@ -109,6 +109,10 @@ const DEFAULTS = {
   // Entry quality gate — applies to EVERY entry path (discovery, observe list and
   // the manual watchlist alike). Previously only discovery names were vetted.
   entry: { requireTag: ["CONFIRMED"], minGrade: 0 },
+  // The tradeable reward:risk bar for the SETUP (not for picking the contract —
+  // that's contractSelection.minRR). Measured from where you'd actually fill, so
+  // 2.0 is a real 2:1. Exposed so it can be tested against logged outcomes.
+  setup: { minRR: 2.0 },
   // Which directions the bot may trade. Shorts (puts) are OPT-IN because the
   // bearish playbook is a mirror heuristic with far less forward-testing than
   // the long side — see server/playbook.js.
@@ -179,6 +183,7 @@ function syncGexEnv(cfg) {
   process.env.WALL_WEIGHT_BY_OI = w.weightByOi === true ? "1" : "0";
   process.env.GEX_DATA_PROVIDER = (cfg.data?.provider || "alpaca").toLowerCase();
   process.env.STOP_MIN_PCT = String(cfg.walls?.stopMinPct ?? 0.01);
+  process.env.SETUP_MIN_RR = String(cfg.setup?.minRR ?? 2.0);
 }
 
 export function loadConfig() {

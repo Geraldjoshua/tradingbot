@@ -204,8 +204,13 @@ def regime(data_dir=None):
         try:
             h = yf_retry(lambda: yf.Ticker(sym).history(period="5d"), f"regime {sym}")
             if len(h) >= 2:
-                chg = (h["Close"].iloc[-1] / h["Close"].iloc[-2] - 1) * 100
-                out[sym] = round(float(chg), 2)
+                prev = float(h["Close"].iloc[-2])
+                last = float(h["Close"].iloc[-1])
+                # A NaN or zero close from a partial Yahoo response makes chg NaN.
+                # Reject it here rather than storing it: once in the cache it
+                # survives the whole TTL and poisons every snapshot written.
+                chg = ((last / prev) - 1) * 100 if (prev and math.isfinite(prev) and math.isfinite(last)) else None
+                out[sym] = round(chg, 2) if chg is not None and math.isfinite(chg) else None
         except Exception:
             out[sym] = None
     basket = (out.get("SPY") or -9) > 0.5 or (out.get("QQQ") or -9) > 0.5
@@ -221,7 +226,10 @@ def regime(data_dir=None):
     # Persist so sibling ticker scans in this run reuse it instead of refetching.
     try:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        json.dump({"ts": _t.time(), "regime": result}, open(cache_path, "w"))
+        # Also scrubbed: this cache is the SOURCE of the NaN. A failed Yahoo
+        # fetch leaves a NaN close, chg comes out NaN, and it then persists for
+        # the whole TTL and contaminates every snapshot written in that window.
+        open(cache_path, "w").write(dumps_safe({"ts": _t.time(), "regime": result}))
     except Exception:
         pass
     return result
@@ -435,6 +443,14 @@ def main():
                 f"(min {stop_min_pct * 100:.1f}%) — R/R would be inflated by a tiny denominator")
         levels_usable = not levels_bad
 
+        # The tradeable R/R bar, configurable so it can be tested against logged
+        # results rather than argued about. NOTE this changes only the FILTER —
+        # the identically-named criterion inside the 11-point grade stays at 2.0
+        # on purpose, so a grade means the same thing across time and remains
+        # comparable to snapshots taken before the bar was moved.
+        min_rr = float(os.environ.get("SETUP_MIN_RR", "2.0"))
+        rr_key = f"rr>={min_rr:g}"
+
         # spike-crash: is the +GEX target a recent spike high that sold off?
         # A real spike-crash: the +GEX target sits at a prior SWING high that was
         # reached by a sharp run-up (>=5% in a week) and then crashed (>=8% in 3 days).
@@ -488,7 +504,7 @@ def main():
             "grade>=9": grade >= 9,
             "cushion": cushion >= cushion_threshold,
             "no_spike_crash": not spike_crash,
-            "rr>=2": rr >= 2.0,
+            rr_key: rr >= min_rr,
         }
         if require_db:
             filters["db_change"] = db_pass          # faithful mode: db_change is a hard filter
@@ -512,7 +528,7 @@ def main():
         if levels_bad:
             # Replace the bare filter name with what's actually wrong, and drop
             # rr>=2 — quoting a reward:risk computed from broken levels is noise.
-            reasons = [r for r in reasons if r not in ("levels_usable", "rr>=2")]
+            reasons = [r for r in reasons if r not in ("levels_usable", rr_key)]
             reasons.insert(0, "unusable levels: " + "; ".join(levels_bad))
 
         et_date = et_today()
@@ -551,7 +567,13 @@ def main():
         # persist
         os.makedirs(os.path.join(data_dir, ticker), exist_ok=True)
         with open(os.path.join(data_dir, ticker, f"{et_date}.json"), "w") as f:
-            json.dump(snapshot, f, indent=2)
+            # dumps_safe, not json.dump — the SNAPSHOT FILE is read back by
+            # voldesk_trades.latestSnapshot() with JSON.parse on every entry
+            # attempt. Scrubbing only the stdout copy fixed the scan and left the
+            # file poisoned: `"spy_chg": NaN` from a failed regime fetch made
+            # every subsequent entry die with "Unexpected token 'N'" — one bad
+            # float in a field the trade logic never even reads.
+            f.write(dumps_safe(snapshot))
 
         print(dumps_safe(snapshot))
     except Exception as e:

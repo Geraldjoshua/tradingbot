@@ -46,7 +46,21 @@ export function latestSnapshot(ticker) {
   if (!fs.existsSync(dir)) return null;
   const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
   if (!files.length) return null;
-  return JSON.parse(fs.readFileSync(path.join(dir, files[files.length - 1])));
+  // Walk backwards from the newest and skip anything unparseable instead of
+  // throwing. A single corrupt file used to kill every entry attempt forever
+  // ("Unexpected token 'N'" from a NaN written by an older build), and because
+  // the file existed, ensureSnapshot() saw no reason to re-scan — a permanent
+  // deadlock over one bad float. Falling back to an older snapshot, or to null
+  // (which triggers a fresh scan), both recover on their own.
+  for (let i = files.length - 1; i >= 0; i--) {
+    const p = path.join(dir, files[i]);
+    try {
+      return JSON.parse(fs.readFileSync(p));
+    } catch {
+      try { fs.unlinkSync(p); } catch {}   // poison: drop it so it can be rebuilt
+    }
+  }
+  return null;
 }
 
 // Compact flow record stamped onto positions and returned to callers.
