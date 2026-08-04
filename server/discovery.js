@@ -377,8 +377,16 @@ async function scanAll(tickers, cfg) {
   const out = [];
   // Paced, not bursty — see the note in server/index.js. Yahoo throttles on
   // request RATE, so concurrency alone isn't the knob; the stagger matters too.
-  const conc = Math.max(1, Math.min(cfg.discovery.scanConcurrency || 2, 4));
-  const staggerMs = cfg.discovery.scanStaggerMs ?? 400;
+  // The 4-worker cap and 400ms stagger were sized for Yahoo, which rate-limited
+  // at ~19 tickers in a burst. Alpaca doesn't, so the cap now depends on the
+  // provider — otherwise a 200-name scan would take 3-5 minutes, and because
+  // discovery runs inside the trader tick, that's 3-5 minutes with NO STOP
+  // MANAGEMENT. The pacing isn't politeness here, it's how long the loop is
+  // blocked for.
+  const onAlpaca = (cfg.data?.provider || "alpaca").toLowerCase() === "alpaca";
+  const capacity = onAlpaca ? 12 : 4;
+  const conc = Math.max(1, Math.min(cfg.discovery.scanConcurrency || (onAlpaca ? 8 : 2), capacity));
+  const staggerMs = cfg.discovery.scanStaggerMs ?? (onAlpaca ? 60 : 400);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let i = 0;
   async function worker(slot) {
