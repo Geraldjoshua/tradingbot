@@ -367,10 +367,28 @@ def main():
         m_count, m_detail = minervini(closes)
         cushion = (spot - cotmp) / spot  # COTMP cushion
 
-        # R/R to +GEX vs down to pTrans (entry assumed at pTrans)
-        upside = plus_gex - pTrans
-        downside = pTrans - nTrans
+        # ---- R/R measured from where you would ACTUALLY buy -------------------
+        # This was `(plus_gex - pTrans) / (pTrans - nTrans)` — reward and risk
+        # both measured from the trigger. That is only honest if you can transact
+        # at the trigger, which was roughly true while pTrans hugged spot.
+        #
+        # Once pTrans became the real gamma flip it moved well below spot, and the
+        # formula started reporting fiction: MSFT showed R/R 11 with the flip at
+        # 445 and the stock at 487.57. You cannot buy at 445. Buying at market
+        # gives risk 47.57 and reward 12.43 — a real R/R of 0.26. Every CONFIRMED
+        # name in that scan was under 2.0 once measured this way.
+        #
+        # So: if price has already reclaimed the trigger, the entry is SPOT. If it
+        # hasn't, the entry is the trigger, because that's where the order fires.
+        entry_ref = max(spot, pTrans)          # longs: you can't buy below the market
+        upside = plus_gex - entry_ref
+        downside = entry_ref - nTrans
         rr = (upside / downside) if downside > 0 else 0.0
+        # How far past the trigger price has already run. A reclaim setup is about
+        # catching the flip; 15% above it, the move being traded already happened.
+        # Reported rather than filtered — poor R/R already rejects the stale ones,
+        # and this says *why* at a glance.
+        extension_pct = ((spot - pTrans) / pTrans * 100) if pTrans else 0.0
 
         # ---- degenerate levels ----------------------------------------------
         # When the put wall is the nearest strike below spot there is no strike
@@ -494,6 +512,10 @@ def main():
             "grade": grade, "grade_rules": rules, "deep": deep,
             "minervini": m_count, "minervini_detail": m_detail,
             "cushion_pct": round(cushion * 100, 2), "rr": round(rr, 2),
+            # Where the R/R above was measured from, and how far price has already
+            # run past the trigger. Both exist so a reported R/R can be checked
+            # rather than trusted.
+            "entry_ref": round(entry_ref, 2), "extension_pct": round(extension_pct, 2),
             "spike_crash": spike_crash,
             "call_oi": int(call_oi), "put_oi": int(put_oi), "total_gex": round(total_gex, 0),
             "filters": filters, "filter_reasons": reasons,

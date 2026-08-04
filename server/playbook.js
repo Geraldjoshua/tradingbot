@@ -83,8 +83,15 @@ export function assessShort(snap, spot, levels, { pendingPct = 0.005, minRR = 1.
   const near = spot <= levels.trigger * (1 + pendingPct);
   if (!near) reasons.push(`spot ${spot.toFixed(2)} >${(pendingPct * 100).toFixed(1)}% above put wall ${levels.trigger}`);
 
-  const risk = levels.stop - levels.trigger;      // adverse move to invalidation
-  const reward = levels.trigger - levels.t1;      // favourable move to target
+  // Measured from where the order would actually fill, not from the trigger.
+  // Selling above the market isn't possible, so once price is already through
+  // the put wall the entry is spot. The long side had exactly this bug and it
+  // was severe there (R/R 11 reported vs 0.26 real) because nothing kept spot
+  // near the trigger. Here the `near` check above bounds the gap to pendingPct,
+  // so the error was small — but there's no reason to carry it.
+  const entryRef = Math.min(spot, levels.trigger);
+  const risk = levels.stop - entryRef;            // adverse move to invalidation
+  const reward = entryRef - levels.t1;            // favourable move to target
   const rr = risk > 0 ? +(reward / risk).toFixed(2) : null;
   if (!(reward > 0)) reasons.push("no downside target below the put wall");
   if (rr != null && rr < minRR) reasons.push(`R/R ${rr} < ${minRR}`);
