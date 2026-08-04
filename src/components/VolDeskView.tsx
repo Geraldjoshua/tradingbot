@@ -271,7 +271,22 @@ export default function VolDeskView() {
               ))}
               <div className="k" style={{ margin: "12px 0 6px" }}>REGIME GATES ({sel.regime.gates_passed}/3)</div>
               <div style={{ display: "flex", justifyContent: "space-between" }}><span>basket (SPY {sel.regime.spy_chg}% / QQQ {sel.regime.qqq_chg}%)</span><span className={sel.regime.basket_gate ? "pos" : "neg"}>{sel.regime.basket_gate ? "PASS" : "FAIL"}</span></div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}><span>VIX ({sel.regime.vix_chg}%)</span><span className={sel.regime.vix_gate ? "pos" : "neg"}>{sel.regime.vix_gate ? "PASS" : "FAIL"}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span>VIX ({sel.regime.vix_chg ?? "—"}%)</span><span className={sel.regime.vix_gate ? "pos" : "neg"}>{sel.regime.vix_gate ? "PASS" : "FAIL"}</span></div>
+              {/* Which VIX you actually got. The proxy is a different number
+                  from the index, so a reading that silently swapped sources
+                  would be misleading rather than merely approximate. */}
+              {sel.regime.vix_source && sel.regime.vix_source !== "yahoo ^VIX" && (
+                <div className="hint" style={{ margin: "2px 0 0 0", fontSize: 11 }}>
+                  ⚠ {sel.regime.vix_source}
+                  {String(sel.regime.vix_source).startsWith("VIXY") &&
+                    " — a VIX futures ETF, so this % includes roll decay and is not the index's move. Direction is what the gate tests."}
+                </div>
+              )}
+              {sel.regime.regime_source && sel.regime.regime_source !== "alpaca" && (
+                <div className="hint" style={{ margin: "2px 0 0 0", fontSize: 11 }}>
+                  ⚠ basket from {sel.regime.regime_source}
+                </div>
+              )}
               <div style={{ display: "flex", justifyContent: "space-between" }}><span>bull:bear (700 names)</span><span className="hint">n/a</span></div>
             </div>
           </div>

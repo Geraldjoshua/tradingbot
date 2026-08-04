@@ -196,6 +196,9 @@ function syncGexEnv(cfg) {
   process.env.SETUP_MIN_RR = String(cfg.setup?.minRR ?? 2.0);
   process.env.MAX_EXTENSION_PCT = String(cfg.setup?.maxExtensionPct ?? 3.0);
   process.env.MIN_REGIME_GATES = String(cfg.setup?.minRegimeGates ?? 2);
+  // "yahoo" = real ^VIX but costs a yfinance import on a cache miss;
+  // "vixy" = Alpaca ETF proxy over plain urllib, no pandas. See voldesk.regime().
+  process.env.REGIME_VIX_SOURCE = String(cfg.setup?.vixSource ?? "yahoo");
 }
 
 export function loadConfig() {

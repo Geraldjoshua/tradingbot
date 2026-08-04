@@ -531,6 +531,23 @@ export default function AutoTraderView() {
         </p>
 
         <label className="row">
+          VIX source&nbsp;
+          <select value={cfg.setup?.vixSource ?? "yahoo"}
+            onChange={(e) => patch({ setup: { vixSource: e.target.value } })}>
+            <option value="yahoo">Yahoo ^VIX — the real index</option>
+            <option value="vixy">VIXY (Alpaca) — proxy, lowest memory</option>
+          </select>
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          VIX is an index, not a security, so Alpaca has no <code>^VIX</code> — Yahoo is the only
+          source for the real number. VIXY is a VIX <i>futures</i> ETF: its daily % includes roll
+          decay and is not the index's move, though the gate only tests direction. Reading Yahoo costs
+          a <code>yfinance</code> import (~91 MB of pandas) on a cache miss, so a lock ensures only
+          <b> one</b> scan can ever do it at a time — the rest use VIXY automatically. Pick VIXY here
+          only if you want that import to never happen. The panel shows which one you actually got.
+        </p>
+
+        <label className="row">
           <input type="checkbox" checked={d.tierFloors !== false}
             onChange={(e) => patch({ discovery: { tierFloors: e.target.checked } })} />
           Let smaller companies in — use each tier's own min premium

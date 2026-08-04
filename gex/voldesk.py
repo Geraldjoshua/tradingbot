@@ -22,6 +22,7 @@ IMPORTANT — these are RAW-GEX APPROXIMATIONS, not the proprietary Vol Desk fee
 Usage: voldesk.py TICKER DATA_DIR [max_dte_days]
 """
 import sys, json, math, os
+import time as _t_mod
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gexcore as gc, os, glob
 from datetime import datetime, timezone, timedelta
@@ -169,6 +170,50 @@ def yf_retry(fn, what="yahoo call"):
     raise last
 
 
+YAHOO_LOCK_STALE_SECONDS = 90
+
+
+def _claim_yahoo_lock(cache_path):
+    """True if THIS process may import yfinance. False means someone else is.
+
+    O_CREAT|O_EXCL is atomic on every filesystem we care about, so two processes
+    racing cannot both win. Deliberately non-blocking: a loser returns
+    immediately and uses the cheap VIXY path rather than waiting, because the
+    point is to cap peak memory, and a queue of processes each about to import
+    pandas is exactly the peak we're avoiding.
+
+    A stale lock is stolen after YAHOO_LOCK_STALE_SECONDS — a process OOM-killed
+    mid-fetch would otherwise leave the file behind and pin every future scan to
+    the proxy forever, silently.
+    """
+    lock = os.path.join(os.path.dirname(cache_path) or ".", "_regime_yahoo.lock")
+    try:
+        os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)
+        try:
+            age = _t_mod.time() - os.path.getmtime(lock)
+            if age > YAHOO_LOCK_STALE_SECONDS:
+                os.unlink(lock)
+        except FileNotFoundError:
+            pass
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        # Read-only or otherwise unusable dir: don't let locking break the scan.
+        # Falling through to True keeps behaviour identical to no-lock.
+        return True
+
+
+def _release_yahoo_lock(cache_path):
+    try:
+        os.unlink(os.path.join(os.path.dirname(cache_path) or ".", "_regime_yahoo.lock"))
+    except Exception:
+        pass
+
+
 def regime(data_dir=None):
     """Market regime read, CACHED — identical for every ticker in a run.
 
@@ -191,28 +236,125 @@ def regime(data_dir=None):
     except Exception:
         pass
 
-    try:
-        import yfinance as yf
-    except Exception as e:
-        # No regime read is survivable; a dead scan is not.
-        return {"spy_chg": None, "qqq_chg": None, "vix_chg": None,
-                "basket_gate": False, "vix_gate": False, "bull_bear_gate": None,
-                "gates_passed": 0, "gates_note": f"regime unavailable ({e})"}
-
-    out = {}
-    for sym in ("SPY", "QQQ", "^VIX"):
+    def _chg(prev, last):
+        """Percent change, or None. Never NaN — see the note below."""
         try:
-            h = yf_retry(lambda: yf.Ticker(sym).history(period="5d"), f"regime {sym}")
-            if len(h) >= 2:
-                prev = float(h["Close"].iloc[-2])
-                last = float(h["Close"].iloc[-1])
-                # A NaN or zero close from a partial Yahoo response makes chg NaN.
-                # Reject it here rather than storing it: once in the cache it
-                # survives the whole TTL and poisons every snapshot written.
-                chg = ((last / prev) - 1) * 100 if (prev and math.isfinite(prev) and math.isfinite(last)) else None
-                out[sym] = round(chg, 2) if chg is not None and math.isfinite(chg) else None
+            prev, last = float(prev), float(last)
+        except (TypeError, ValueError):
+            return None
+        if not (prev and math.isfinite(prev) and math.isfinite(last)):
+            return None
+        c = ((last / prev) - 1) * 100
+        # A NaN or zero close from a partial response makes chg NaN. Reject it
+        # here rather than storing it: once in the cache it survives the whole
+        # TTL and poisons every snapshot written. This is the `"spy_chg": NaN`
+        # that broke entries, and NaN >= threshold is False, so an unchecked NaN
+        # doesn't error — it silently blocks every name while looking decided.
+        return round(c, 2) if math.isfinite(c) else None
+
+    out, src, vix_src = {}, None, None
+
+    def _yahoo_chg(sym):
+        """One symbol from Yahoo. Import stays inside so callers that never
+        reach Yahoo never pay for pandas+numpy."""
+        import yfinance as yf
+        h = yf_retry(lambda: yf.Ticker(sym).history(period="5d"), f"regime {sym}")
+        return _chg(h["Close"].iloc[-2], h["Close"].iloc[-1]) if len(h) >= 2 else None
+
+    # --- basket: Alpaca first ------------------------------------------------
+    # SPY and QQQ are ordinary equities and the options data already comes from
+    # here, so the basket rode on a SECOND, flakier feed for no reason — Yahoo is
+    # what returned the NaN that broke entries.
+    try:
+        from dataprovider import AlpacaProvider
+        ap = AlpacaProvider()
+        if ap.available():
+            for sym in ("SPY", "QQQ"):
+                try:
+                    closes, _ = ap.history(sym, days=10)
+                    out[sym] = _chg(closes[-2], closes[-1]) if len(closes) >= 2 else None
+                except Exception:
+                    out[sym] = None
+            if out.get("SPY") is not None or out.get("QQQ") is not None:
+                src = "alpaca"
+            else:
+                out = {}          # nothing usable — let Yahoo try below
+    except Exception:
+        out = {}
+
+    if not out:
+        try:
+            for sym in ("SPY", "QQQ"):
+                try:
+                    out[sym] = _yahoo_chg(sym)
+                except Exception:
+                    out[sym] = None
+            src = "yahoo"
         except Exception:
-            out[sym] = None
+            out, src = {"SPY": None, "QQQ": None}, "none"
+
+    # --- VIX: the real index first, VIXY only if it fails --------------------
+    # VIX is an index, not a security, so Alpaca has no ^VIX — Yahoo is the only
+    # source for the actual number. VIXY (short-term VIX futures ETF) is the
+    # tradeable stand-in: it tracks the DIRECTION of vol, which is all this gate
+    # asks (a sign test, < 0), but it carries roll decay, so on the fallback path
+    # vix_chg is NOT the VIX's daily change. vix_source records which you got so
+    # a proxy reading is never mistaken for the index.
+    #
+    # Cost of preferring Yahoo here: a cache miss now imports yfinance (~91 MB of
+    # pandas+numpy) even when Alpaca is healthy. The regime is disk-cached for
+    # REGIME_TTL_SECONDS so one process per TTL pays it, not every scan — but on
+    # a 512 MB box with several scans missing the cache at once, that is the
+    # memory that caused the OOM. Set REGIME_VIX_SOURCE=vixy to skip Yahoo.
+    prefer = os.environ.get("REGIME_VIX_SOURCE", "yahoo").strip().lower()
+    lock_lost = prefer != "vixy" and not _claim_yahoo_lock(cache_path)
+    if prefer != "vixy" and not lock_lost:
+        # SINGLE-FLIGHT. The lock is what makes the memory cost bounded: at most
+        # ONE process in the box holds it, so at most one pays the pandas
+        # import. Concurrent scans that miss the cache at the same moment don't
+        # queue and don't fetch — they fall straight through to the VIXY branch
+        # below, which is plain urllib. Worst case is therefore 1 × 91 MB, not
+        # scanConcurrency × 91 MB, which is the arithmetic that OOM'd the box.
+        try:
+            v = _yahoo_chg("^VIX")
+            if v is not None:
+                out["^VIX"], vix_src = v, "yahoo ^VIX"
+        except Exception:
+            pass
+        finally:
+            _release_yahoo_lock(cache_path)
+
+    if out.get("^VIX") is None:
+        try:
+            from dataprovider import AlpacaProvider as _AP
+            _ap = _AP()
+            if _ap.available():
+                closes, _ = _ap.history("VIXY", days=10)
+                if len(closes) >= 2:
+                    out["^VIX"] = _chg(closes[-2], closes[-1])
+                    if out.get("^VIX") is not None:
+                        # Say WHY the proxy is in use. "Yahoo unavailable" when
+                        # Yahoo was never asked would send you debugging a feed
+                        # that is fine.
+                        vix_src = ("VIXY proxy (forced by REGIME_VIX_SOURCE)" if prefer == "vixy"
+                                   else "VIXY proxy (another scan held the Yahoo lock)" if lock_lost
+                                   else "VIXY proxy (Yahoo ^VIX unavailable)")
+        except Exception:
+            pass
+
+    if out.get("^VIX") is None:
+        vix_src = "unavailable — vix gate cannot pass"
+
+    # Both basket feeds down. Return early and DON'T cache it — a transient
+    # outage shouldn't be pinned for the whole TTL. Callers read an all-None
+    # basket as UNREADABLE and stop enforcing the gate, so this degrades to
+    # "don't judge the tape" rather than "block everything".
+    if out.get("SPY") is None and out.get("QQQ") is None:
+        return {"spy_chg": None, "qqq_chg": None, "vix_chg": out.get("^VIX"),
+                "basket_gate": False, "vix_gate": False, "bull_bear_gate": None,
+                "gates_passed": 0, "regime_source": "none", "vix_source": vix_src,
+                "gates_note": "regime unavailable — no basket feed (Alpaca and Yahoo both failed)"}
+
     basket = (out.get("SPY") or -9) > 0.5 or (out.get("QQQ") or -9) > 0.5
     vix_ok = (out.get("^VIX") if out.get("^VIX") is not None else 9) < 0  # vol down = bullish
     result = {
@@ -221,7 +363,11 @@ def regime(data_dir=None):
         "vix_gate": bool(vix_ok),
         "bull_bear_gate": None,  # needs full 700-name universe — not computed
         "gates_passed": int(bool(basket)) + int(bool(vix_ok)),
-        "gates_note": "bull:bear across 700 names not computed (needs universe); basket+vix only",
+        "regime_source": src,
+        "vix_source": vix_src,
+        "gates_note": ("bull:bear across 700 names not computed (needs universe); basket+vix only"
+                       + (f" · basket from {src}" if src else "")
+                       + (f" · VIX from {vix_src}" if vix_src else "")),
     }
     # Persist so sibling ticker scans in this run reuse it instead of refetching.
     try:

@@ -206,6 +206,7 @@
   "setup": {
     "minRR": 2.0,
     "maxExtensionPct": 3.0,
-    "minRegimeGates": 2
+    "minRegimeGates": 2,
+    "vixSource": "yahoo"
   }
 }

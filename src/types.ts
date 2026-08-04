@@ -144,6 +144,10 @@ export interface VolDeskSnapshot {
     spy_chg: number | null; qqq_chg: number | null; vix_chg: number | null;
     basket_gate: boolean; vix_gate: boolean; bull_bear_gate: boolean | null;
     gates_passed: number; gates_note: string;
+    // Which feed each half came from. Optional: snapshots written before the
+    // Alpaca/Yahoo split don't carry them.
+    regime_source?: string | null;   // "alpaca" | "yahoo" | "none"
+    vix_source?: string | null;      // "yahoo ^VIX" | "VIXY proxy (...)" | unavailable
   };
   error?: string;
 }
