@@ -407,7 +407,22 @@ def main():
         #
         # So: if price has already reclaimed the trigger, the entry is SPOT. If it
         # hasn't, the entry is the trigger, because that's where the order fires.
-        entry_ref = max(spot, pTrans)          # longs: you can't buy below the market
+        # Measured from pTrans, because that is where the system ENTERS: on the
+        # first 5-min close above the level, while spot is still at it.
+        #
+        # I briefly changed this to max(spot, pTrans) after seeing R/R 19 on
+        # setups that were plainly bad. The measurement was right and the
+        # diagnosis was wrong: the real fault is that we were accepting names
+        # 8-25% ABOVE pTrans, where no reasonable entry exists. Measuring from
+        # spot made the number honest for a trade that should never be taken,
+        # and hid the actual defect. The extension filter below rejects those
+        # names outright, which is the correct place to fix it — and once a name
+        # is near its trigger, spot and pTrans agree anyway.
+        #
+        # It also matters enormously for the instrument: reward from pTrans
+        # averages 15.2% on the current book vs 5.0% from spot, and options only
+        # clear their frictions above ~8%.
+        entry_ref = pTrans
         upside = plus_gex - entry_ref
         downside = entry_ref - nTrans
         rr = (upside / downside) if downside > 0 else 0.0
@@ -450,6 +465,28 @@ def main():
         # comparable to snapshots taken before the bar was moved.
         min_rr = float(os.environ.get("SETUP_MIN_RR", "2.0"))
         rr_key = f"rr>={min_rr:g}"
+        # How far past the trigger price may already have run, and how many of
+        # the three regime gates must pass. Both are read once here so the filter
+        # labels carry their own thresholds — a blocker reading "ext<=3%" says
+        # what it wanted, where "extension" would not.
+        max_ext_pct = float(os.environ.get("MAX_EXTENSION_PCT", "3.0"))
+        min_gates = int(os.environ.get("MIN_REGIME_GATES", "2"))
+        ext_key = f"ext<={max_ext_pct:g}%"
+        gate_key = f"regime>={min_gates}/3"
+        regime_read = regime(data_dir)
+        # "Unavailable" means we got no usable index reads at all — distinct from
+        # "read fine, the tape is weak". Both would otherwise show up as the same
+        # blocker and send you looking at the market instead of at the feed.
+        # NaN counts as missing, not as a number. A partial Yahoo response gives
+        # NaN rather than None (that is exactly what produced `"spy_chg": NaN`),
+        # and NaN >= anything is False, so without this a half-failed read would
+        # silently block every name while looking like a legitimate reading.
+        def _missing(v):
+            return v is None or (isinstance(v, float) and v != v)
+        regime_unavailable = (_missing(regime_read.get("spy_chg"))
+                              and _missing(regime_read.get("qqq_chg")))
+        if regime_unavailable:
+            gate_key = "regime UNREADABLE (not enforced)"
 
         # spike-crash: is the +GEX target a recent spike high that sold off?
         # A real spike-crash: the +GEX target sits at a prior SWING high that was
@@ -505,6 +542,27 @@ def main():
             "cushion": cushion >= cushion_threshold,
             "no_spike_crash": not spike_crash,
             rr_key: rr >= min_rr,
+            # FRESHNESS. The setup is "price reclaims pTrans", entered on the
+            # first 5-min close above it. `spot >= pTrans` alone does not express
+            # that — after a rally it is true of nearly everything, and we were
+            # tagging names CONFIRMED 8-25% past a trigger they cleared weeks
+            # ago. The reclaim had long since happened; the move was gone.
+            #
+            # The short side always had this guard (assessShort's `near` check,
+            # 0.5%); the long side never did, which is why only longs produced
+            # stale entries.
+            ext_key: extension_pct <= max_ext_pct,
+            # REGIME. Computed since day one and never enforced — the gates were
+            # written to the snapshot and then ignored, so entries were taken in
+            # tapes the system's own overlay said to sit out.
+            # If the regime could not be READ at all, that is a data failure, not
+            # a market call — and blocking every name on it would look identical
+            # to "the tape is bad" while actually meaning "Yahoo timed out".
+            # The regime read still uses Yahoo (SPY/QQQ/VIX) even though the GEX
+            # data moved to Alpaca, and Yahoo is exactly what was returning NaN
+            # for spy_chg this morning. So: unreadable regime passes, and says so.
+            gate_key: True if regime_unavailable else
+                      (regime_read.get("gates_passed") or 0) >= min_gates,
         }
         if require_db:
             filters["db_change"] = db_pass          # faithful mode: db_change is a hard filter
@@ -554,7 +612,7 @@ def main():
             "spike_crash": spike_crash,
             "call_oi": int(call_oi), "put_oi": int(put_oi), "total_gex": round(total_gex, 0),
             "filters": filters, "filter_reasons": reasons,
-            "regime": regime(data_dir),
+            "regime": regime_read,
             "require_db": require_db,
             # Which feed produced these levels, and how old the open interest is.
             # Yahoo never exposes an OI date, so until now we had no idea whether

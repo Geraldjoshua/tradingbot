@@ -478,6 +478,58 @@ export default function AutoTraderView() {
           but doesn't block; grade ≥9, cushion, no-spike-crash and R/R ≥2 still apply.
         </p>
 
+        <h4 style={{ margin: "14px 0 4px" }}>Setup quality</h4>
+
+        <label className="row">
+          Minimum R/R&nbsp;
+          <input type="number" step="0.25" min="0" style={{ width: 60 }}
+            value={cfg.setup?.minRR ?? 2}
+            onChange={(e) => patch({ setup: { minRR: Math.max(0, +e.target.value) } })} />
+          &nbsp;: 1
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Reward is <code>T1 − pTrans</code>, risk is <code>pTrans − nTrans</code> — both measured from
+          the <b>trigger</b>, not from wherever price happens to be. Raise it for fewer, better setups;
+          lower it to see more. Set <b>0</b> to disable the filter entirely. Changing this does not
+          change what the trade is worth — only which ones qualify — so if lowering it is what makes
+          names appear, those names were always the marginal ones.
+        </p>
+
+        <label className="row">
+          <input type="checkbox" checked={(cfg.setup?.maxExtensionPct ?? 3) > 0}
+            onChange={(e) => patch({ setup: { maxExtensionPct: e.target.checked ? 3 : 0 } })} />
+          Reject names already more than&nbsp;
+          <input type="number" step="0.5" min="0" style={{ width: 55 }}
+            value={cfg.setup?.maxExtensionPct ?? 3}
+            disabled={(cfg.setup?.maxExtensionPct ?? 3) <= 0}
+            onChange={(e) => patch({ setup: { maxExtensionPct: Math.max(0, +e.target.value) } })} />
+          % past pTrans
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          The single biggest difference from the reference system: it enters names that have{" "}
+          <i>just</i> crossed pTrans, while we were entering ones 8–25% past it. Reward measured from
+          pTrans averaged <b>15.2%</b>; from where we actually entered, <b>5.0%</b> — and 5% doesn't
+          cover an option's spread and theta. This is the freshness gate. Blocked names now report{" "}
+          <code>ext&lt;=3%</code>, so an extended name says so instead of failing a mangled R/R test.
+        </p>
+
+        <label className="row">
+          Require&nbsp;
+          <input type="number" step="1" min="0" max="3" style={{ width: 45 }}
+            value={cfg.setup?.minRegimeGates ?? 2}
+            onChange={(e) => patch({ setup: { minRegimeGates: Math.max(0, Math.min(3, Math.round(+e.target.value))) } })} />
+          &nbsp;of 3 regime gates
+        </label>
+        <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+          Basket (SPY/QQQ up 0.5%), VIX falling, and bull:bear 3:1 across the universe. <b>The third is
+          not computed yet</b> — it needs a 700-name sweep we don't run — so in practice a setting of 2
+          means <i>both</i> remaining gates, which is stricter than the reference system's "2 of 3".
+          Use 1 if that proves too tight. Set 0 to compute-and-ignore, which is what the system did
+          before today. If the regime feed can't be read at all the filter reports{" "}
+          <code>regime UNREADABLE</code> and passes rather than blocking — a Yahoo outage shouldn't
+          masquerade as a market call.
+        </p>
+
         <label className="row">
           <input type="checkbox" checked={d.tierFloors !== false}
             onChange={(e) => patch({ discovery: { tierFloors: e.target.checked } })} />

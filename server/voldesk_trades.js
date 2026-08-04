@@ -704,6 +704,20 @@ export async function evaluatePositions() {
     const favourable = (lvl) => playbook.favourable(side, spot, lvl);
     const drawdownHit = side === "short" ? spot >= p.entrySpot * 1.1 : spot <= p.entrySpot * 0.9;
 
+    // Stop 4 needs progress HISTORY, not just today's number, so each evaluation
+    // appends today's reading. Three consecutive sessions under 10%/day is the
+    // stall signal. Stored on the position so it survives restarts.
+    const today = iso(new Date());
+    p.progressLog = (p.progressLog || []).filter((e) => e.d !== today);
+    p.progressLog.push({ d: today, p: +(progress * 100).toFixed(1) });
+    p.progressLog = p.progressLog.slice(-6);
+    let stalled = false;
+    if (p.progressLog.length >= 4 && daysHeld >= 3) {
+      const last4 = p.progressLog.slice(-4);
+      const gains = last4.slice(1).map((e, i) => e.p - last4[i].p);
+      stalled = gains.length === 3 && gains.every((g) => g < 10);
+    }
+
     let action = "HOLD", reason = "", urgent = false;
     if (spot != null) {
       if (adverse(stopLevel)) {
@@ -715,6 +729,14 @@ export async function evaluatePositions() {
       } else if (daysHeld >= 7 && progress < 0.5) {
         action = "EXIT"; urgent = true;
         reason = `Stop 3: day ${daysHeld}, only ${(progress * 100).toFixed(0)}% to T1`;
+      } else if (stalled) {
+        // Stop 4 — the stalling rule, which was missing. Under 10% progress per
+        // day for three consecutive sessions means the thesis isn't playing out,
+        // and waiting for Stop 3 on day 7 spends four more days of theta finding
+        // that out. Capital tied to a position going nowhere is the quiet cost
+        // that doesn't show up as a loss until expiry.
+        action = "EXIT"; urgent = true;
+        reason = `Stop 4: stalled — under 10%/day progress for 3 sessions (now ${(progress * 100).toFixed(0)}% to T1)`;
       } else if (p.t1 != null && favourable(p.t1) && !p.t1Taken) {
         action = "T1_HIT";
         reason = `T1 reached (${p.t1}) — take profit, or lock stop to entry and ride to T2 ${p.t2}`;

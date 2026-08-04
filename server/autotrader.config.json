@@ -204,6 +204,8 @@
     "maxDataMB": 200
   },
   "setup": {
-    "minRR": 2.0
+    "minRR": 2.0,
+    "maxExtensionPct": 3.0,
+    "minRegimeGates": 2
   }
 }

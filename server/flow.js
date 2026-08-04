@@ -112,7 +112,17 @@ const DEFAULTS = {
   // The tradeable reward:risk bar for the SETUP (not for picking the contract —
   // that's contractSelection.minRR). Measured from where you'd actually fill, so
   // 2.0 is a real 2:1. Exposed so it can be tested against logged outcomes.
-  setup: { minRR: 2.0 },
+  setup: {
+    minRR: 2.0,
+    // How far past pTrans price may have run and still count as a reclaim.
+    // `spot >= pTrans` alone tagged names CONFIRMED 8-25% beyond a trigger they
+    // cleared weeks ago — the move was already gone. The short side always had
+    // this guard at 0.5%; the long side never did.
+    maxExtensionPct: 3.0,
+    // Regime gates required (0-3). These were computed and written to every
+    // snapshot from the start, and never actually enforced.
+    minRegimeGates: 2,
+  },
   // Which directions the bot may trade. Shorts (puts) are OPT-IN because the
   // bearish playbook is a mirror heuristic with far less forward-testing than
   // the long side — see server/playbook.js.
@@ -184,6 +194,8 @@ function syncGexEnv(cfg) {
   process.env.GEX_DATA_PROVIDER = (cfg.data?.provider || "alpaca").toLowerCase();
   process.env.STOP_MIN_PCT = String(cfg.walls?.stopMinPct ?? 0.01);
   process.env.SETUP_MIN_RR = String(cfg.setup?.minRR ?? 2.0);
+  process.env.MAX_EXTENSION_PCT = String(cfg.setup?.maxExtensionPct ?? 3.0);
+  process.env.MIN_REGIME_GATES = String(cfg.setup?.minRegimeGates ?? 2);
 }
 
 export function loadConfig() {
