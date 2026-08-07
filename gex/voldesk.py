@@ -119,6 +119,39 @@ def dumps_safe(obj):
     return json.dumps(clean, allow_nan=False)
 
 
+def oi_age_business_days(oi_date):
+    """How many TRADING days old the open interest is, or None if unknown.
+
+    Alpaca publishes open interest from the OCC file, so a lag of one business
+    day is normal and expected — OI for today's session simply does not exist
+    yet. What is NOT normal is three or four, which is what you get after a
+    holiday, a feed hiccup, or a contract set that stopped updating.
+
+    This matters more than it sounds. pTrans, nTrans and +GEX ARE the trade —
+    they are the entry, the stop and the target. Computing them from a stale OI
+    file means trading last week's dealer map with this week's price, and
+    nothing in the system could previously tell the difference: `oi_date` was
+    written into every snapshot and then never read, exactly like the regime
+    gates were before they were enforced.
+    """
+    if not oi_date:
+        return None
+    try:
+        d = datetime.strptime(str(oi_date)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    today = datetime.strptime(et_today(), "%Y-%m-%d").date()
+    if d >= today:
+        return 0
+    n = 0
+    cur = d
+    while cur < today:
+        cur += timedelta(days=1)
+        if cur.weekday() < 5:      # Mon-Fri; holidays are not modelled, so this
+            n += 1                 # slightly OVER-counts age after a holiday,
+    return n                       # which errs toward caution. Correct direction.
+
+
 def load_prior(data_dir, ticker):
     files = sorted(glob.glob(os.path.join(data_dir, ticker, "*.json")))
     today = et_today()
@@ -578,6 +611,22 @@ def main():
         # and this says *why* at a glance.
         extension_pct = ((spot - pTrans) / pTrans * 100) if pTrans else 0.0
 
+        # The same ratio measured from the price you would ACTUALLY PAY. `rr`
+        # above prices the trade the reference system takes — entered at the
+        # reclaim. We scan at the open and fill at spot, so whenever spot has run
+        # past pTrans this is the number that describes your position.
+        #
+        # Extension hurts twice: it shrinks the distance to T1 and lengthens the
+        # distance to the stop at once, so the ratio falls much faster than the
+        # extension itself. Observed live: GOOGL 2.77% extended turned a stated
+        # 4.33 into 1.26, AAPL 1.42% turned 3.00 into 1.14 — because when the
+        # risk leg is thin (nTrans ~1.5% under pTrans) there is little room to
+        # give away. Reported, NOT filtered: it is a diagnostic for whether the
+        # entry timing is working, and filtering on it would block good setups
+        # to compensate for entering them late instead of entering them on time.
+        _fill_down = spot - nTrans
+        rr_at_fill = ((plus_gex - spot) / _fill_down) if _fill_down > 0 else 0.0
+
         # ---- degenerate levels ----------------------------------------------
         # When the put wall is the nearest strike below spot there is no strike
         # left between it and spot for pTrans to occupy, so pTrans collapses onto
@@ -675,6 +724,22 @@ def main():
         grade = sum(rules.values())
         deep = grade == 11
 
+        # ---- open-interest freshness ----------------------------------------
+        # Enforced, not merely reported. See oi_age_business_days() above: every
+        # level this system trades is derived from OI, so stale OI is not a
+        # degraded signal, it is a different market's signal.
+        #
+        # Unknown age PASSES and says so — same principle as the regime gate.
+        # Yahoo never exposes an OI date, and blocking every name because the
+        # fallback provider is quiet would look identical to "the whole book is
+        # stale" while actually meaning "we are on the backup feed".
+        oi_max_age = int(os.environ.get("OI_MAX_AGE_DAYS", "3"))
+        oi_date_val = getattr(provider, "last_oi_date", None)
+        oi_age = oi_age_business_days(oi_date_val)
+        oi_key = f"oi_age<={oi_max_age}d"
+        if oi_age is None:
+            oi_key = "oi_age UNKNOWN (not enforced)"
+
         # ---- filters (with documented exceptions) ----
         db_threshold = 0.30 if deep else 0.50
         db_pass = pegged or (db_change is not None and db_change >= db_threshold)
@@ -709,6 +774,7 @@ def main():
             # for spy_chg this morning. So: unreadable regime passes, and says so.
             gate_key: True if regime_unavailable else
                       (regime_read.get("gates_passed") or 0) >= min_gates,
+            oi_key: True if oi_age is None else oi_age <= oi_max_age,
         }
         if require_db:
             filters["db_change"] = db_pass          # faithful mode: db_change is a hard filter
@@ -755,6 +821,7 @@ def main():
             # run past the trigger. Both exist so a reported R/R can be checked
             # rather than trusted.
             "entry_ref": round(entry_ref, 2), "extension_pct": round(extension_pct, 2),
+            "rr_at_fill": round(rr_at_fill, 2),
             "spike_crash": spike_crash,
             "call_oi": int(call_oi), "put_oi": int(put_oi), "total_gex": round(total_gex, 0),
             "filters": filters, "filter_reasons": reasons,
@@ -764,7 +831,8 @@ def main():
             # Yahoo never exposes an OI date, so until now we had no idea whether
             # the gamma was computed from yesterday's book or last week's.
             "data_source": provider.name,
-            "oi_date": getattr(provider, "last_oi_date", None),
+            "oi_date": oi_date_val,
+            "oi_age_days": oi_age,
             "tag": tag,
         }
 

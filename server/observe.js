@@ -113,6 +113,38 @@ function daysSince(iso) {
   return Math.floor((Date.now() - Date.parse(iso)) / 864e5);
 }
 
+// Grade ONE side of a scan. voldesk.py's tag/grade are computed for LONGS ONLY
+// (the tag literally tests spot >= pTrans), so a short cannot reuse them — it
+// gets the mirrored assessment from playbook.assessShort instead. Pulling this
+// out of the loop is what makes re-reading a name as the OTHER side possible at
+// all: before, the long branch and the short branch were inline and the row's
+// side was decided before either ran.
+async function gradeSide(scan, spot, side, cfg, o) {
+  const lv = playbook.levelsFor(scan, side);
+  if (!lv) return { ok: false, tag: "BLOCKED", grade: null, rr: null, levels: null,
+    reasons: ["no usable levels for this side"] };
+
+  if (side === "short") {
+    const a = playbook.assessShort(scan, spot, lv,
+      { minRR: cfg.contractSelection?.minRR ?? 1.5 });
+    return {
+      ok: a.tag !== "BLOCKED", tag: a.tag, grade: null, rr: a.rr, levels: lv,
+      reasons: a.reasons || [],
+    };
+  }
+  const reasons = [];
+  const tagOK = (o.requireTags || ["CONFIRMED"]).includes(scan.tag);
+  const gradeOK = (scan.grade ?? 0) >= (o.minGrade ?? 0);
+  if (!tagOK) reasons.push(`tag ${scan.tag}`);
+  if (!gradeOK) reasons.push(`grade ${scan.grade} < ${o.minGrade}`);
+  return { ok: scan.tag !== "BLOCKED", tag: scan.tag, grade: scan.grade ?? null,
+    rr: scan.rr ?? null, levels: lv, reasons };
+}
+
+const opposite = (side) => (side === "short" ? "long" : "short");
+const sideEnabled = (side, cfg) =>
+  side === "short" ? cfg.sides?.short === true : cfg.sides?.long !== false;
+
 export async function assessAll(cfg = flow.loadConfig(), { force = false } = {}) {
   const o = cfgFor(cfg);
   const rows = load();
@@ -126,98 +158,158 @@ export async function assessAll(cfg = flow.loadConfig(), { force = false } = {})
   const cacheState = flow.cacheStatus(cfg);
   const guardOn = (cfg.flow.staleAction || "warn") !== "off";
   const flowStale = guardOn && cacheState.stale && !(cfg.flow.sources.unusualwhales);
+  const flowOn = cfg.flow?.enabled !== false;
+  const gapMs = Math.max(1, o.assessEveryMinutes ?? 60) * 60 * 1000;
 
   for (const r of active) {
-    if (!force && r.lastAssessed === today()) { results.push({ ticker: r.ticker, skipped: "already assessed today" }); continue; }
+    // Cadence, not calendar. The old test was `r.lastAssessed === today()`, which
+    // meant a name could be re-read exactly once per day: something that firmed
+    // up at 10:15 sat as OBSERVING until tomorrow, by which point the reclaim we
+    // were waiting for had already happened. Discovery runs every 30 minutes;
+    // the assessment it feeds was the bottleneck.
+    const since = r.lastAssessedAt ? Date.now() - Date.parse(r.lastAssessedAt) : Infinity;
+    if (!force && since < gapMs) {
+      results.push({ ticker: r.ticker, skipped: `assessed ${Math.round(since / 60000)}m ago` });
+      continue;
+    }
 
+    let side = r.side || "long";
     const reasons = [];
     let drop = null;
+    let flipNote = null;
 
-    // 1) Is the flow still behind it?
-    const side = r.side || "long";
-    const conv = await flow.getConviction(r.ticker, cfg);
-    const decision = flow.decideForTrade(conv, cfg, side);
-    // With flow conviction switched off, getConviction() legitimately returns
-    // found:false. Dropping every name as "flow gone" in that case would empty
-    // the list the moment you toggle flow off — so skip the flow rules entirely.
-    const flowOn = cfg.flow?.enabled !== false;
+    // ---- 1. Structure first ------------------------------------------------
+    // The scan now runs BEFORE the flow rules rather than after, and only
+    // because of them. To decide whether a name that flow abandoned should be
+    // dropped or re-read as the other side, we need the structural picture in
+    // hand at the moment we make that call — the old order (flow decides, then
+    // maybe scan) made the flip physically impossible to evaluate.
+    const scan = await volDeskScan(r.ticker, cfg);
+    let spot = null;
+    try { spot = await alpaca.getLatestTrade(r.ticker, "delayed_sip"); } catch {}
+
+    if (!scan || scan.error) {
+      // A failed scan is missing information, not bad news. Record and wait.
+      reasons.push(`scan failed: ${scan?.error || "no data"}`);
+      r.lastAssessed = today();
+      r.lastAssessedAt = new Date().toISOString();
+      const rec = { date: today(), verdict: "WAIT", reasons, tag: null, grade: null };
+      r.assessments = [...(r.assessments || []).slice(-9), rec];
+      results.push({ ticker: r.ticker, side, status: r.status, ...rec });
+      continue;
+    }
+
+    let graded = await gradeSide(scan, spot, side, cfg, o);
+    let conv = await flow.getConviction(r.ticker, cfg);
+    let decision = flow.decideForTrade(conv, cfg, side);
+
+    // ---- 2. Is this side structurally dead? --------------------------------
+    // Spot already past the stop means there is no entry left, not a worse one.
+    const structDead = Boolean(
+      graded.levels && spot != null && playbook.adverse(side, spot, graded.levels.stop));
+
+    // ---- 3. Flow verdict ---------------------------------------------------
+    let flowKill = null;
     if (!flowOn) {
       // no flow input: structure alone decides
     } else if (flowStale) {
       // Missed upload — freeze judgement rather than punish the list.
       reasons.push(`flow stale ${cacheState.ageDays}d — upload to refresh`);
     } else if (!conv.found) {
-      if (o.dropOnFlowGone) drop = "flow gone (not in latest upload)";
+      if (o.dropOnFlowGone) flowKill = "flow gone (not in latest upload)";
       else reasons.push("no current flow");
-    } else if (flowOn && o.dropOnFlowFlip &&
+    } else if (o.dropOnFlowFlip &&
                ((side === "long" && conv.direction === "bearish") ||
                 (side === "short" && conv.direction === "bullish"))) {
-      drop = `flow flipped ${conv.direction} against a ${side} (score ${conv.combinedScore})`;
-    } else if (flowOn && r.seed.flowScore && conv.combinedScore < r.seed.flowScore * o.flowDecayRatio) {
-      drop = `flow decayed ${r.seed.flowScore} -> ${conv.combinedScore}`;
+      flowKill = `flow flipped ${conv.direction} against a ${side} (score ${conv.combinedScore})`;
+    } else if (r.seed.flowScore && conv.combinedScore < r.seed.flowScore * o.flowDecayRatio) {
+      flowKill = `flow decayed ${r.seed.flowScore} -> ${conv.combinedScore}`;
     }
 
-    // 2) Does the structure still grade out?
-    let scan = null;
-    if (!drop) {
-      scan = await volDeskScan(r.ticker, cfg);
-      if (!scan || scan.error) {
-        reasons.push(`scan failed: ${scan?.error || "no data"}`);
-      } else {
-        // voldesk.py's tag/grade are LONG-only. For shorts use the mirrored gate.
-        let effTag = scan.tag, effGrade = scan.grade;
-        if (side === "short") {
-          let sp = null;
-          try { sp = await alpaca.getLatestTrade(r.ticker, "delayed_sip"); } catch {}
-          const a = playbook.assessShort(scan, sp, playbook.levelsFor(scan, "short"),
-            { minRR: cfg.contractSelection?.minRR ?? 1.5 });
-          effTag = a.tag; effGrade = o.minGrade ?? 0;      // R/R is the bar, not grade
-          if (a.reasons.length) reasons.push(...a.reasons);
-        }
-        const tagOK = (o.requireTags || ["CONFIRMED"]).includes(effTag);
-        const gradeOK = (effGrade ?? 0) >= (o.minGrade ?? 0);
-        scan = { ...scan, tag: effTag };
-        if (scan.tag === "BLOCKED") {
-          r.blockedRun = (r.blockedRun || 0) + 1;
-          if (r.blockedRun >= o.blockedStrikes) drop = `BLOCKED ${r.blockedRun} scans running`;
-        } else {
-          r.blockedRun = 0;
-        }
-        if (!tagOK) reasons.push(`tag ${scan.tag}`);
-        if (!gradeOK) reasons.push(`grade ${scan.grade} < ${o.minGrade}`);
-
-        // 3) Structure invalidated outright — spot already under the stop.
-        if (!drop && scan.levels) {
-          try {
-            const lv = playbook.levelsFor(scan, side);
-            const spot = await alpaca.getLatestTrade(r.ticker, "delayed_sip");
-            if (spot && lv && playbook.adverse(side, spot, lv.stop)) {
-              drop = `spot ${spot.toFixed(2)} already past the ${side} stop ${lv.stop} pre-entry`;
-            }
-            if (!drop && lv) r.pendingLevels = lv;
-          } catch {}
+    // ---- 4. SIDE UNFREEZING -------------------------------------------------
+    // Side was stamped once at seed time and never revisited, so a long that
+    // broke its stop was DROPPED — throwing the name away at precisely the
+    // moment it became interesting, because a failed long IS the setup that
+    // most reliably produces a good short. Same for flow reversing on us: the
+    // old code read that as "this idea is over" when it plainly means "this
+    // idea may have changed direction".
+    //
+    // The flip is deliberately narrow. It requires the current side to be dead
+    // (structurally, or abandoned by flow) AND the opposite side to grade out on
+    // its own merits on the SAME scan. Flow widens the search; it never decides
+    // direction by itself, because flow disagreeing with structure is a reason
+    // to stand aside, not a reason to reverse. One flip per row — a name that
+    // wants to reverse twice is chop, and chop is not a setup.
+    if ((structDead || flowKill) && o.allowSideFlip !== false) {
+      const opp = opposite(side);
+      const flipsUsed = r.sideFlips || 0;
+      if (sideEnabled(opp, cfg) && flipsUsed < (o.maxSideFlips ?? 1)) {
+        const oppGraded = await gradeSide(scan, spot, opp, cfg, o);
+        const oppAlive = oppGraded.levels && spot != null
+          && !playbook.adverse(opp, spot, oppGraded.levels.stop);
+        const oppOK = oppAlive && ["CONFIRMED", "PENDING"].includes(oppGraded.tag);
+        if (oppOK) {
+          const oppDecision = flow.decideForTrade(conv, cfg, opp);
+          // Don't flip into a direction the flow gate would immediately block.
+          if (!oppDecision.block) {
+            flipNote = `flipped ${side} -> ${opp}: ${structDead
+              ? `spot ${spot?.toFixed(2)} broke the ${side} stop ${graded.levels?.stop}`
+              : flowKill} — ${opp} grades ${oppGraded.tag}`;
+            side = opp;
+            r.side = opp;
+            r.sideFlips = flipsUsed + 1;
+            r.flipHistory = [...(r.flipHistory || []), { on: today(), note: flipNote }];
+            r.blockedRun = 0;
+            graded = oppGraded;
+            decision = oppDecision;
+            flowKill = null;
+            reasons.push(flipNote);
+          }
         }
       }
     }
 
-    // 4) Went stale without ever being tradeable.
+    // ---- 5. Resolve --------------------------------------------------------
+    if (flowKill) drop = flowKill;
+    if (!drop && structDead && !flipNote) {
+      drop = `spot ${spot?.toFixed(2)} already past the ${side} stop ${graded.levels?.stop} pre-entry`;
+    }
+
+    if (!drop) {
+      if (graded.tag === "BLOCKED") {
+        r.blockedRun = (r.blockedRun || 0) + 1;
+        if (r.blockedRun >= o.blockedStrikes) drop = `BLOCKED ${r.blockedRun} scans running`;
+      } else {
+        r.blockedRun = 0;
+      }
+      if (graded.reasons.length) reasons.push(...graded.reasons);
+      if (graded.levels) r.pendingLevels = graded.levels;
+    }
+
+    // Went stale without ever being tradeable.
     if (!drop && r.status === "OBSERVING" && daysSince(r.addedAt) >= o.maxObserveDays) {
       drop = `stale ${daysSince(r.addedAt)}d without qualifying`;
     }
 
-    const ready = !drop && reasons.length === 0 && !decision.block;
     if (decision.block) reasons.push(`flow gate: ${decision.stance}`);
+    // A flip note is an explanation, not a defect — it must not by itself keep a
+    // freshly-flipped name out of READY.
+    const blocking = reasons.filter((x) => x !== flipNote);
+    const ready = !drop && blocking.length === 0 && !decision.block;
 
     const record = {
       date: today(),
       verdict: drop ? "DROP" : ready ? "READY" : "WAIT",
-      tag: scan?.tag ?? null, grade: scan?.grade ?? null, rr: scan?.rr ?? null,
+      side,
+      tag: graded.tag ?? null, grade: graded.grade ?? null, rr: graded.rr ?? null,
       flowDir: conv.direction, flowScore: conv.combinedScore,
       sizeMult: decision.sizeMultiplier,
+      ...(flipNote ? { flipped: flipNote } : {}),
       reasons: drop ? [drop] : reasons,
     };
     r.assessments = [...(r.assessments || []).slice(-9), record];
     r.lastAssessed = today();
+    r.lastAssessedAt = new Date().toISOString();
 
     if (drop) {
       r.status = "DROPPED"; r.dropReason = drop; r.droppedOn = today();
@@ -230,8 +322,10 @@ export async function assessAll(cfg = flow.loadConfig(), { force = false } = {})
 
   save(rows);
   return {
-    assessed: results.length,
+    assessed: results.filter((x) => !x.skipped).length,
+    skipped: results.filter((x) => x.skipped).length,
     ready: results.filter((x) => x.status === "READY").map((x) => x.ticker),
+    flipped: results.filter((x) => x.flipped).map((x) => `${x.ticker}->${x.side}`),
     dropped: results.filter((x) => x.status === "DROPPED").map((x) => ({ ticker: x.ticker, reason: x.reasons?.[0] })),
     results,
   };

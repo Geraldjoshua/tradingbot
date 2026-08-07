@@ -209,7 +209,7 @@ export default function VolDeskView() {
               <thead>
                 <tr>
                   <th>#</th><th>Ticker</th><th>Tag</th><th>Spot</th><th>pTrans</th><th>nTrans</th>
-                  <th>+GEX/T1</th><th>Grade</th><th>R/R</th><th>Cush%</th><th>db→Δ</th><th>Mnv</th><th>Why blocked</th>
+                  <th>+GEX/T1</th><th>Grade</th><th>R/R</th><th title="R/R measured from spot — the price you would actually fill at, rather than from pTrans">R/R fill</th><th>Ext%</th><th>Cush%</th><th>db→Δ</th><th>Mnv</th><th>Why blocked</th>
                 </tr>
               </thead>
               <tbody>
@@ -224,6 +224,16 @@ export default function VolDeskView() {
                     <td>{r.levels?.plusGEX_T1}</td>
                     <td>{r.grade}/11{r.deep ? " D" : ""}</td>
                     <td>{r.rr}</td>
+                    {/* Red once the fill ratio drops under 2: at that point the
+                        trade you'd get is not the trade the row is advertising,
+                        and on an option the gap is where the expectancy goes. */}
+                    <td style={{ color: r.rr_at_fill == null ? undefined
+                      : r.rr_at_fill < 2 ? "var(--red)" : "var(--green)" }}>
+                      {r.rr_at_fill ?? "—"}
+                    </td>
+                    <td style={{ color: (r.extension_pct ?? 0) > 3 ? "var(--red)" : undefined }}>
+                      {r.extension_pct ?? "—"}
+                    </td>
                     <td>{r.cushion_pct}</td>
                     <td>{r.db?.toFixed(2)}{r.db_change != null ? ` (${r.db_change >= 0 ? "+" : ""}${r.db_change.toFixed(2)})` : " (—)"}</td>
                     <td>{r.minervini}/8</td>

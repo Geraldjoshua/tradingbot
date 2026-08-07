@@ -86,6 +86,25 @@ const DEFAULTS = {
     maxObserving: 25, maxObserveDays: 10,
     dropOnFlowGone: true, dropOnFlowFlip: true, flowDecayRatio: 0.4,
     blockedStrikes: 3, requireTags: ["CONFIRMED"], minGrade: 0,
+    // How often the list is re-vetted. This was hard-wired to once per calendar
+    // day, which meant a name that firmed up at 10:15 could not become READY
+    // until tomorrow -- by which point the reclaim it was waiting for had
+    // happened without us. Discovery already runs every 30 minutes; the
+    // assessment it feeds was the bottleneck, not the scan.
+    assessEveryMinutes: 60,
+    // ---- SIDE IS A CONCLUSION, NOT AN IDENTITY ------------------------------
+    // A row used to be stamped `side` once at seed time and never revisited, so
+    // a long whose structure broke was DROPPED rather than re-read as a short --
+    // and the setup that most reliably produces a good short is a failed long.
+    // We threw away the signal at exactly the moment it became informative.
+    //
+    // Flipping is deliberately narrow. It fires only when the CURRENT side is
+    // structurally dead AND the opposite side independently grades out on the
+    // same scan. Flow can widen the search; it cannot on its own decide
+    // direction, because flow disagreeing with structure is a reason to stand
+    // aside, not a reason to reverse.
+    allowSideFlip: true,
+    maxSideFlips: 1,           // one reversal per row, then it is just noise
   },
   contractSelection: {
     mode: "rr", dteMin: 21, dteMax: 75, dteTarget: 45,
@@ -93,6 +112,29 @@ const DEFAULTS = {
     expectedDaysToTarget: 14, minRR: 1.5, maxSpreadPct: 0.15,
     minDelta: 0.35, maxDelta: 0.90,
     requireBreakevenBelowTarget: true, riskFreeRate: 0.04,
+    // Liquidity floor for a strike to be considered at all. The contracts
+    // endpoint already returns open_interest; selection simply never read it,
+    // so a tight-quoting but empty strike was indistinguishable from a real one.
+    // Lower it for small-caps if you see "chain too thin" on names you want.
+    minOpenInterest: 250,
+    // WHAT HAPPENS WHEN NOTHING IN THE CHAIN CLEARS THE BAR.
+    // This used to be undefined behaviour with a very bad answer. The R/R
+    // selector would reject every contract, a second naive picker would then
+    // grab one by DTE/moneyness, and the ONLY thing standing between that pick
+    // and a real order was a spread check. A contract the selector had just
+    // refused at 0.4:1 got bought anyway. Every filter described as the safety
+    // net -- minRR, delta band, breakeven-below-target -- was unreachable on
+    // that path, which is the single most likely explanation for a run of poor
+    // fills on days the bot did trade.
+    //
+    //   "shares"   route the thesis into stock instead (default). No spread
+    //              problem, no theta, and sizing is risk-based off the stop, so
+    //              a full stop-out costs about the same as the premium budget.
+    //   "skip"     take no trade at all. Strictest.
+    //   "fallback" allow the naive picker -- but it is now SCORED through the
+    //              same evaluate() as the grid, so it still has to pass minRR.
+    //              This is no longer a bypass, just a second way to nominate.
+    onNoQualifyingContract: "shares",
   },
   // Order execution — how hard we work to avoid paying the bid/ask spread.
   execution: {
@@ -114,6 +156,26 @@ const DEFAULTS = {
   // 2.0 is a real 2:1. Exposed so it can be tested against logged outcomes.
   setup: {
     minRR: 2.0,
+    // ---- LIVE ENTRY GATES (anti-chase) --------------------------------------
+    // Everything above is computed at SCAN time and cached in the daily
+    // snapshot. Entry can happen hours later, after the name has run. The
+    // snapshot still says the setup is 1% extended; you are buying it 6%
+    // extended. These two gates are re-evaluated against LIVE spot at the
+    // moment of entry, which is the only place the question can be answered
+    // honestly.
+    //
+    // minRRAtFill -- reward:risk measured from where the order will actually
+    // fill (spot), not from pTrans. Extension hurts twice: it shortens the run
+    // to T1 and lengthens the fall to the stop, so this ratio collapses much
+    // faster than the extension percentage does. It is the real anti-chase
+    // gate; maxExtensionPct is the scan-time approximation of it.
+    minRRAtFill: 1.5,
+    // minUpsidePctForOptions -- how far T1 has to be from live spot before
+    // BUYING PREMIUM makes sense at all. Under this, spread and theta eat the
+    // whole move: a 3% run to target cannot pay for a 45-DTE option no matter
+    // how clean the structure is. Below the line the trade routes to shares,
+    // where there is no spread problem and no clock. 0 disables.
+    minUpsidePctForOptions: 0.05,
     // How far past pTrans price may have run and still count as a reclaim.
     // `spot >= pTrans` alone tagged names CONFIRMED 8-25% beyond a trigger they
     // cleared weeks ago — the move was already gone. The short side always had
@@ -146,12 +208,47 @@ const DEFAULTS = {
   // Partial exit at T1: bank most of it, move the stop to entry, let the rest
   // run to T2. Needs >= 2 contracts — you cannot sell 80% of one contract.
   scaleOut: { enabled: false, firstPct: 0.8, moveStopToBreakeven: true },
+  // ---- OPEN-POSITION MANAGEMENT --------------------------------------------
+  // The original exit framework was all-or-nothing: the stop sat at nTrans from
+  // entry to exit, so a position could travel 80% of the way to T1 and then give
+  // the entire move back through its original stop. Stops 1-4 govern when to
+  // abandon a loser; nothing governed protecting a winner.
+  management: {
+    // Progressive stop ratchet. Each rung fires once progress toward T1 reaches
+    // `at`, and locks `lock` of the entry->T1 span. lock 0 = breakeven.
+    // The stop only ever TIGHTENS -- a rung can never loosen a stop that some
+    // other rule already moved up.
+    //
+    // Honest limit, same as the scale-out note: breakeven on the UNDERLYING is
+    // not breakeven on the OPTION. Theta ran while you waited, so a stop-out at
+    // your entry spot still books a premium loss. It caps the damage; it does
+    // not eliminate it.
+    stopRatchet: [
+      { at: 0.50, lock: 0.00 },   // half way -> stop to entry
+      { at: 0.75, lock: 0.40 },   // three quarters -> lock 40% of the move
+    ],
+    // Catastrophic premium backstop. Stops 1-4 are all measured on the
+    // UNDERLYING, which is correct for the thesis but blind to what the option
+    // is worth. A vol crush or a gap can halve the premium while spot is still
+    // comfortably above nTrans. This is a backstop, not a strategy stop -- set
+    // wide enough that structure gets to be wrong first. 0 disables.
+    maxPremiumLossPct: 0.60,
+    // Never carry a long-premium position into the gamma/theta cliff. If the
+    // thesis needed 45 days and has had 35 of them, it isn't working.
+    minDteExit: 10,
+  },
   sides: { long: true, short: false },
   shares: {
     enabled: true, minShares: 1, maxNotionalPct: 0.10,
     allowShort: true, requireEasyToBorrow: true,
   },
   risk: {
+    // Daily realized-loss circuit breaker. maxDailyEntries caps how many trades
+    // can be opened; nothing capped how much could be LOST before opening the
+    // next one. On a day where the tape is simply wrong for the system, three
+    // stop-outs in a row is a signal to stop trading, not a reason to place the
+    // fourth. Dollars, positive number. 0 disables.
+    maxDailyLoss: 600,
     // (a) The budget, and whether it actually binds. Buying power is checked
     //     separately and ALWAYS binds — we never order what the account can't pay for.
     basePremium: 300,          // $ of premium to deploy per trade (before flow sizing)
@@ -163,7 +260,14 @@ const DEFAULTS = {
     //   allowBudgetOverrun true  -> buy 1 anyway (old behaviour, logged loudly)
     //   allowBudgetOverrun false -> skip the trade as TOO_EXPENSIVE
     allowBudgetOverrun: true,
-    overrunTolerance: 15,      // with overrun allowed, still refuse beyond this multiple
+    // With overrun allowed, still refuse beyond this multiple. This was 15,
+    // which quietly made every other sizing control decorative: a $300 budget
+    // could buy a $4,500 contract, so the budget, the flow size multipliers and
+    // the daily loss cap were all describing a position ten times smaller than
+    // the one actually held. findCheaper already re-ranks the chain for
+    // affordability before this ever binds, so a tight tolerance costs far less
+    // participation than it looks like it should.
+    overrunTolerance: 2,
     // (d) Before giving up on price, re-rank the chain with the budget as a
     //     per-contract ceiling and take the best contract that FITS. If nothing
     //     fits, the trade is skipped and the loop moves to the next ticker.

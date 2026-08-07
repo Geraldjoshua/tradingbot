@@ -339,6 +339,36 @@ async function enter(cfg) {
   let st = loadState();
   if (st.entries >= a.maxDailyEntries) return;
 
+  // ---- DAILY LOSS CIRCUIT BREAKER -----------------------------------------
+  // maxDailyEntries caps how many trades can be OPENED. Nothing capped how much
+  // could be lost before opening the next one, so three stop-outs in a row was
+  // not an input to the decision to place the fourth. On a day where the tape is
+  // simply wrong for a gamma-reclaim system — and there are such days; that is
+  // what "bad days" means — the entries cap lets it keep paying to find out.
+  //
+  // Realized only. Open drawdown is noise until it closes, and marking it would
+  // halt entries every time an existing position breathed.
+  const maxLoss = Math.abs(cfg.risk?.maxDailyLoss ?? 0);
+  if (maxLoss > 0) {
+    let realizedToday = 0;
+    try {
+      realizedToday = vd.listAll()
+        .filter((p) => p.exitDate === todayISO() && Number.isFinite(p.realizedPnl))
+        .reduce((acc, p) => acc + p.realizedPnl, 0);
+    } catch {}
+    if (realizedToday <= -maxLoss) {
+      if (st.lossHaltDay !== todayISO()) {
+        st.lossHaltDay = todayISO(); saveState(st);
+        log("trade", "daily-loss-halt", {
+          realizedToday: Math.round(realizedToday), limit: -maxLoss,
+          note: "no new entries for the rest of the session. Open positions are still "
+            + "managed normally — this stops adding risk, it does not stop exits.",
+        });
+      }
+      return;
+    }
+  }
+
   let openRows = [];
   try { openRows = vd.listAll().filter((p) => p.status === "OPEN"); } catch {}
   const openTickers = new Set(openRows.map((p) => p.ticker));
@@ -417,8 +447,29 @@ async function enter(cfg) {
         // NOT_TRIGGERED / FLOW_BLOCKED — normal, quiet. Cooldown so we don't
         // re-price the same reject every single poll.
         st.cooldown[ticker] = now; saveState(st);
+        // A broken structure is not a "try again in 30 minutes" — spot is
+        // through the stop, so there is no entry left at any price today. Leaving
+        // it on the observe list just re-prices a dead setup every cooldown.
+        if (r.status === "STRUCTURE_BROKEN") {
+          try { observe.drop(ticker, r.note || "structure broken pre-entry"); } catch {}
+        }
         log("info", "entry-skip", {
           ticker, side, status: r.status,
+          // The anti-chase and instrument-routing rejections carry the numbers
+          // that explain them. Logging the status alone turns a diagnosis into a
+          // shrug, and these are exactly the ones worth reading back over a week
+          // to see whether the thresholds are set right.
+          ...(r.status === "CHASED"
+            ? { rrAtFill: r.rrAtFill, floor: r.minRRAtFill, extension: `${r.extensionPct}%`,
+                spot: r.spot, trigger: r.trigger, t1: r.t1 }
+            : {}),
+          ...(r.status === "STRUCTURE_BROKEN" ? { spot: r.spot, stop: r.stop } : {}),
+          ...(r.status === "NO_QUALIFYING_CONTRACT"
+            ? { evaluated: r.evaluated ?? 0, rrAtFill: r.rrAtFill,
+                whyRejected: (r.rejected || []).slice(0, 3)
+                  .map((x) => `${x.strike}:${(x.reasons || []).join("/")}`).join(" | ") || "-" }
+            : {}),
+          ...(r.status === "NO_UPSIDE" ? { spot: r.spot, t1: r.t1 } : {}),
           ...(r.status === "TOO_EXPENSIVE" || r.status === "INSUFFICIENT_FUNDS"
             ? {
                 costPerContract: r.costPerContract, budget: r.budget,
@@ -439,25 +490,44 @@ async function enter(cfg) {
   }
 }
 
-// ---- Daily observe-list re-assessment --------------------------------------
-// Runs once per day, pre-open if possible, so READY/DROPPED status is fresh
-// before the trigger window. This is the "next day, if it still meets every
-// requirement, take it — otherwise don't" step.
+// ---- Observe-list re-assessment --------------------------------------------
+// This used to be gated by `st.lastAssessDay === todayISO()` — once per calendar
+// day, full stop. That single line was the reason the list felt frozen: a name
+// that firmed up at 10:15 could not be promoted to READY until tomorrow, and by
+// tomorrow the reclaim it was waiting for had happened without us. Discovery was
+// already running every 30 minutes and feeding an assessment that ran once.
+//
+// Now it runs on a cadence. observe.assessAll() does its own per-row throttling
+// (observe.assessEveryMinutes), so calling it more often is cheap — rows that
+// were read recently return "skipped" without spawning a scan. The gate here
+// only exists to keep the log readable and to leave headroom in the tick.
 async function maybeAssess(cfg) {
   try {
     const st = loadState();
-    if (st.lastAssessDay === todayISO()) return;
+    const rowGap = cfg.observe?.assessEveryMinutes ?? 60;
+    const gapMs = Math.max(5, Math.floor(rowGap / 2)) * 60 * 1000;
+    if (st.lastAssessAt && Date.now() - st.lastAssessAt < gapMs) return;
     if (!observe.activeList().length) return;
+
     const r = await observe.assessAll(cfg);
     const st2 = loadState();
+    st2.lastAssessAt = Date.now();
+    const firstToday = st2.lastAssessDay !== todayISO();
     st2.lastAssessDay = todayISO();
     saveState(st2);
-    log("info", "observe-assessed", {
-      assessed: r.assessed,
-      ready: r.ready.join(",") || "-",
-      dropped: r.dropped.map((d) => `${d.ticker}(${d.reason})`).join("; ") || "-",
-    });
-    observe.prune(30);
+
+    // Silence when nothing moved. A pass where every row was throttled is not
+    // news, and burying real drops under identical hourly lines is how you stop
+    // reading the log.
+    if (r.assessed || r.dropped.length || r.flipped.length) {
+      log("info", "observe-assessed", {
+        assessed: r.assessed, skipped: r.skipped ?? 0,
+        ready: r.ready.join(",") || "-",
+        ...(r.flipped.length ? { SIDE_FLIPPED: r.flipped.join(" ") } : {}),
+        dropped: r.dropped.map((d) => `${d.ticker}(${d.reason})`).join("; ") || "-",
+      });
+    }
+    if (firstToday) observe.prune(30);
   } catch (e) {
     log("error", "observe-assess-failed", { error: String(e.message || e) });
   }

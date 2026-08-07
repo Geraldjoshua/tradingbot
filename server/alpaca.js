@@ -70,6 +70,34 @@ export async function getMostActives(top = 25) {
   return (j.most_actives || []).map((m) => m.symbol);
 }
 
+// Every tradable asset. Needed by the scanner: you cannot find a small cap on a
+// most-actives leaderboard, because not being on one is what makes it small.
+export async function getAssets({ status = "active", assetClass = "us_equity" } = {}) {
+  const u = new URL(`${TRADE}/v2/assets`);
+  u.searchParams.set("status", status);
+  u.searchParams.set("asset_class", assetClass);
+  return req(u);
+}
+
+// Snapshots for an arbitrarily large symbol list. The API is fine with volume;
+// the URL length is the real limit, so chunk it. A failed chunk is skipped
+// rather than fatal — a scan that returns 90% of the market beats one that
+// returns an error.
+export async function getSnapshotsChunked(symbols, feed = FEED, size = 400) {
+  const out = {};
+  for (let i = 0; i < symbols.length; i += size) {
+    const group = symbols.slice(i, i + size);
+    try {
+      const u = new URL(`${DATA}/v2/stocks/snapshots`);
+      u.searchParams.set("symbols", group.join(","));
+      u.searchParams.set("feed", feed);
+      const j = await req(u);
+      Object.assign(out, j.snapshots || j);
+    } catch { /* skip the chunk, keep the scan */ }
+  }
+  return out;
+}
+
 export async function getSnapshots(symbols) {
   if (!symbols.length) return {};
   const u = new URL(`${DATA}/v2/stocks/snapshots`);

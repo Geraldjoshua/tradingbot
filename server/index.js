@@ -6,6 +6,8 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import * as alpaca from "./alpaca.js";
+import * as scanner from "./scanner.js";
+import * as news from "./news.js";
 import { runBacktest, computeStats } from "./backtest.js";
 import { optionOverlay } from "./options.js";
 import * as vdTrades from "./voldesk_trades.js";
@@ -111,37 +113,49 @@ app.post("/api/backtest", async (req, res) => {
   }
 });
 
-// ---- Live scanner (today's qualifying gappers) ----------------------------
+// ---- Live scanner --------------------------------------------------------
+// Now session-aware (premarket / regular / post-market) and sourced from the
+// whole tradable universe rather than a most-actives leaderboard. See
+// server/scanner.js for why both of those were blocking small-cap scanning.
+//
+// The legacy gapMin/gapMax params still work: they were expressed as fractions
+// (0.01 = 1%), so they are converted rather than reinterpreted. Old callers keep
+// working, they just no longer get a mega-cap-only list.
 app.get("/api/scan", async (req, res) => {
   try {
-    const gapMin = parseFloat(req.query.gapMin) || 0.01;
-    const gapMax = parseFloat(req.query.gapMax) || 0.025;
-    const symbols = await alpaca.getMostActives(40);
-    const snaps = await alpaca.getSnapshots(symbols);
-    const rows = [];
-    for (const sym of symbols) {
-      const s = snaps[sym];
-      if (!s || !s.prevDailyBar || !s.dailyBar) continue;
-      const prevClose = s.prevDailyBar.c;
-      const open = s.dailyBar.o;
-      const last = s.latestTrade ? s.latestTrade.p : s.dailyBar.c;
-      const gapOpen = (open - prevClose) / prevClose;
-      const gapNow = (last - prevClose) / prevClose;
-      rows.push({
-        symbol: sym,
-        prevClose,
-        open,
-        last,
-        gapOpen: +(gapOpen * 100).toFixed(2),
-        gapNow: +(gapNow * 100).toFixed(2),
-        volume: s.dailyBar.v,
-        qualifies:
-          Math.abs(gapOpen) >= gapMin && Math.abs(gapOpen) <= gapMax,
-        side: gapOpen > 0 ? "long" : "short",
-      });
+    const q = req.query;
+    const legacyGapMin = q.gapMin != null ? parseFloat(q.gapMin) * 100 : null;
+    const out = await scanner.scan({
+      minPrice: q.minPrice != null ? parseFloat(q.minPrice) : 1,
+      maxPrice: q.maxPrice != null ? parseFloat(q.maxPrice) : 20,
+      minGapPct: q.minGapPct != null ? parseFloat(q.minGapPct)
+        : (legacyGapMin != null ? legacyGapMin : 5),
+      minDollarVolume: q.minDollarVolume != null ? parseFloat(q.minDollarVolume) : 250000,
+      top: q.top != null ? parseInt(q.top, 10) : 40,
+      withNews: q.news !== "0",
+      universeMode: q.universe === "actives" ? "actives" : "all",
+    });
+    // `qualifies` is kept so the existing UI table keeps rendering; everything
+    // that reaches this point has already passed the filters.
+    out.rows = out.rows.map((r) => ({ ...r, qualifies: true, gapOpen: r.gapPct, gapNow: r.gapPct }));
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ---- News (free, Benzinga via Alpaca) -------------------------------------
+app.get("/api/news", async (req, res) => {
+  try {
+    const symbols = String(req.query.symbols || "").split(",")
+      .map((x) => x.trim().toUpperCase()).filter(Boolean);
+    const hours = parseInt(req.query.hours, 10) || 24;
+    if (!news.newsEnabled()) {
+      return res.json({ enabled: false, items: [],
+        note: "Alpaca keys not set — the news API needs the same credentials as market data." });
     }
-    rows.sort((a, b) => Number(b.qualifies) - Number(a.qualifies) || Math.abs(b.gapOpen) - Math.abs(a.gapOpen));
-    res.json({ rows });
+    const items = await news.fetchNews({ symbols, hours, limit: 50 });
+    res.json({ enabled: true, hours, symbols, count: items.length, items });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }

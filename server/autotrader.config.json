@@ -13,7 +13,7 @@
     "maxDailyEntries": 3,
     "entryCooldownMin": 30,
     "watchlist": [],
-    "triggerMode": "open",
+    "triggerMode": "intraday",
     "intradayCutoffMin": 840,
     "queuedExitDelayMin": 5
   },
@@ -121,7 +121,10 @@
     "requireTags": [
       "CONFIRMED"
     ],
-    "minGrade": 0
+    "minGrade": 0,
+    "assessEveryMinutes": 60,
+    "allowSideFlip": true,
+    "maxSideFlips": 1
   },
   "contractSelection": {
     "mode": "rr",
@@ -137,7 +140,9 @@
     "minDelta": 0.35,
     "maxDelta": 0.9,
     "requireBreakevenBelowTarget": true,
-    "riskFreeRate": 0.04
+    "riskFreeRate": 0.04,
+    "minOpenInterest": 250,
+    "onNoQualifyingContract": "shares"
   },
   "execution": {
     "enabled": true,
@@ -161,6 +166,14 @@
     ],
     "minGrade": 0
   },
+  "setup": {
+    "minRR": 2,
+    "minRRAtFill": 1.5,
+    "minUpsidePctForOptions": 0.05,
+    "maxExtensionPct": 3,
+    "minRegimeGates": 2,
+    "vixSource": "yahoo"
+  },
   "walls": {
     "minDistancePct": 0.015,
     "weightByOi": false,
@@ -174,6 +187,20 @@
     "firstPct": 0.8,
     "moveStopToBreakeven": true
   },
+  "management": {
+    "stopRatchet": [
+      {
+        "at": 0.5,
+        "lock": 0
+      },
+      {
+        "at": 0.75,
+        "lock": 0.4
+      }
+    ],
+    "maxPremiumLossPct": 0.6,
+    "minDteExit": 10
+  },
   "sides": {
     "long": true,
     "short": true
@@ -186,6 +213,7 @@
     "requireEasyToBorrow": true
   },
   "risk": {
+    "maxDailyLoss": 600,
     "basePremium": 300,
     "enforceBudget": true,
     "fixedContracts": {
@@ -194,7 +222,7 @@
     },
     "maxContracts": 10,
     "allowBudgetOverrun": true,
-    "overrunTolerance": 15,
+    "overrunTolerance": 2,
     "findCheaper": true
   },
   "retention": {
@@ -202,11 +230,5 @@
     "snapshotsPerTicker": 40,
     "keepClosedTrades": 200,
     "maxDataMB": 200
-  },
-  "setup": {
-    "minRR": 2.0,
-    "maxExtensionPct": 3.0,
-    "minRegimeGates": 2,
-    "vixSource": "yahoo"
   }
 }

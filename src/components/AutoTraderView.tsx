@@ -227,9 +227,9 @@ export default function AutoTraderView() {
             <select value={a.triggerMode || "open"}
               onChange={(e) => patch({ automation: { triggerMode: e.target.value } })}>
               <option value="open">opening bar only (09:30–09:35)</option>
-              <option value="intraday">any 5-min bar that crosses the level</option>
+              <option value="intraday">opening bar + any 5-min bar that crosses the level</option>
             </select>
-            {(a.triggerMode === "intraday") && (
+            {(a.triggerMode === "intraday" || a.triggerMode === "both") && (
               <>&nbsp;· no new triggers after&nbsp;
                 <input type="number" value={Math.floor((a.intradayCutoffMin ?? 840) / 60)} style={{ width: 40 }}
                   onChange={(e) => patch({ automation: { intradayCutoffMin: Math.max(10, +e.target.value) * 60 } })} />:00 ET
@@ -245,11 +245,19 @@ export default function AutoTraderView() {
             lines up. Below the level → that name is off the table until tomorrow, even if it climbs
             above at noon.
             <br /><br />
-            <b>Any 5-min bar:</b> a name that crosses the level later in the day earns permission then,
-            instead of being locked out at 09:35. It must be a real <i>crossing</i> — previous bar below,
-            this bar above — not merely "price happens to be above", which would be true on every bar of
-            a trending name and would duplicate what the CONFIRMED tag already checks. The cutoff stops
-            new permissions being granted late in the session.
+            <b>Opening bar + any 5-min bar:</b> these are not alternatives — the second setting
+            <i> includes</i> the first. The 09:35 reading is still tested first and still wins when it
+            passes; only if it fails does the scan look for a later crossing, so a name locked out at
+            09:35 can earn permission at noon instead of waiting for tomorrow. It must be a real
+            <i> crossing</i> — previous bar below, this bar above — not merely "price happens to be
+            above", which would be true on every bar of a trending name and would duplicate what the
+            CONFIRMED tag already checks. The cutoff stops new permissions being granted late.
+            <br /><br />
+            This is also the setting that should close the gap between the <code>R/R</code> and
+            <code> R/R fill</code> columns in Vol Desk. Deciding at 09:35 means buying whatever the name
+            did overnight — GOOGL's stated 4.33 was 1.26 at the price you'd have paid. Catching the
+            crossing nearer to when it happens means spot is closer to pTrans when you buy, so the two
+            numbers converge. Watch those columns to see whether it is actually working.
           </p>
           <hr style={{ border: 0, borderTop: "1px solid var(--border, #333)", margin: "10px 0 6px" }} />
           <h4 style={{ margin: "4px 0" }}>Sizing</h4>

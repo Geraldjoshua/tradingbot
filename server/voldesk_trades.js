@@ -137,7 +137,14 @@ async function firstFiveMinClose(ticker) {
 // `cutoffMin` stops new triggers late in the day (default 14:00 ET), because a
 // reclaim at 15:50 gives the thesis no time to work before the close.
 async function triggerBar(ticker, levels, cfg) {
-  const mode = cfg?.automation?.triggerMode || "open";
+  // "both" and "intraday" are the same setting. The intraday path has ALWAYS
+  // checked the opening bar first and only scanned 5-min crossings if that
+  // failed, so it was never an alternative to the open trigger — it was the
+  // open trigger plus a fallback. "intraday" as a name hid that, and reading
+  // the dropdown as either/or is the natural mistake. Accepting "both" lets
+  // the config say what the code does.
+  const raw = cfg?.automation?.triggerMode || "open";
+  const mode = raw === "both" ? "intraday" : raw;
   const bars = await todays5MinBars(ticker);
   if (!bars.length) return { close: null, triggered: false, source: "no-bars" };
 
@@ -339,6 +346,62 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
     };
   }
 
+  // ---- LIVE ENTRY GATES: is this still the trade we graded? ----------------
+  // Every number the setup was approved on -- extension, R/R, cushion -- was
+  // computed by voldesk.py at SCAN time and frozen into the daily snapshot.
+  // Entry happens later, sometimes hours later, and price does not wait. The
+  // snapshot can honestly report a 1% extension on a name we are about to buy
+  // 6% extended, because the snapshot is describing a moment that has passed.
+  //
+  // The scan-time filters cannot fix this; only a check against live spot at the
+  // moment of entry can. These three are that check.
+  const stopDist = Math.abs(spot - lv.stop);
+  const upsideAbs = lv.t1 != null ? Math.abs(lv.t1 - spot) : null;
+  const rrAtFill = stopDist > 0 && upsideAbs != null ? +(upsideAbs / stopDist).toFixed(2) : null;
+  const upsidePct = upsideAbs != null && spot > 0 ? upsideAbs / spot : null;
+
+  // 1. Spot is already through the stop. The setup is dead, not late -- there is
+  //    no version of this trade left. Cheap to check and it catches the case
+  //    where a name gapped down between the scan and the trigger window.
+  if (!force && playbook.adverse(side, spot, lv.stop)) {
+    return {
+      status: "STRUCTURE_BROKEN", ticker, side,
+      spot: +spot.toFixed(2), stop: lv.stop, t1: lv.t1,
+      note: `spot ${spot.toFixed(2)} is already ${side === "short" ? "above" : "below"} the stop `
+        + `${lv.stop} — the setup is invalidated, not merely late. Not entering.`,
+    };
+  }
+
+  // 2. THE ANTI-CHASE GATE. Extension is the symptom; this is the disease.
+  //    Running past the trigger costs twice over -- it shortens the distance to
+  //    T1 and lengthens the distance to the stop at the same time -- so the
+  //    ratio you actually own falls far faster than the extension suggests.
+  //    voldesk.py already records this as `rr_at_fill` and explicitly declines
+  //    to filter on it, on the reasoning that filtering would mask bad entry
+  //    TIMING rather than fix it. That reasoning is right about the scan and
+  //    wrong about the order: at scan time it is a diagnostic, but at the
+  //    instant of committing capital it is simply the trade's reward:risk, and
+  //    refusing a 1.1:1 is not masking anything.
+  const minRRFill = cfg0.setup?.minRRAtFill ?? 1.5;
+  if (!force && minRRFill > 0 && rrAtFill != null && rrAtFill < minRRFill) {
+    return {
+      status: "CHASED", ticker, side,
+      spot: +spot.toFixed(2), trigger: lv.trigger, stop: lv.stop, t1: lv.t1,
+      rrAtFill, minRRAtFill: minRRFill,
+      extensionPct: lv.trigger ? +(((spot - lv.trigger) / lv.trigger) * 100).toFixed(2) : null,
+      note: `R/R from the actual fill is ${rrAtFill}:1 against a ${minRRFill}:1 floor — price has `
+        + `run too far past ${lv.trigger} for the remaining move to pay for the risk. `
+        + "The setup was valid; the entry is not.",
+    };
+  }
+
+  // 3. Is there enough move here to justify BUYING PREMIUM at all? A 3% run to
+  //    target is a fine share trade and a losing option trade: spread and theta
+  //    take the whole thing. This is the cleanest signal we have for when the
+  //    share path is the right instrument rather than a consolation prize.
+  const minUpside = cfg0.setup?.minUpsidePctForOptions ?? 0;
+  const thinForOptions = minUpside > 0 && upsidePct != null && upsidePct < minUpside;
+
   // --- SETUP QUALITY GATE ---------------------------------------------------
   // This check was missing, and the omission was serious: entry gated ONLY on the
   // flow decision and the price trigger, never on the Vol Desk verdict. Discovery
@@ -416,8 +479,11 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   const wantContracts = fixedOn ? fixedN : 1;
   const priceCeiling = enforceBudget && findCheaper ? budgetForSizing / wantContracts : 0;
 
-  let call = null, rrPick = null, cheaperSearch = null;
-  if (csMode === "rr") {
+  let call = null, rrPick = null, cheaperSearch = null, selectionPath = null;
+  // `thinForOptions` short-circuits the whole chain fetch: if T1 is too close to
+  // pay for premium, no strike in the chain can rescue it, so there is nothing
+  // to evaluate. Skipping straight to shares also saves a quote burst per name.
+  if (csMode === "rr" && !thinForOptions) {
     try {
       rrPick = await contractSelect.selectByRiskReward(
         ticker, spot, { target: lv.t1, stop: lv.stop }, cfg, optType,
@@ -439,6 +505,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         }
       }
       if (rrPick.best) {
+        selectionPath = "rr";
         call = {
           symbol: rrPick.best.symbol, strike: rrPick.best.strike, expiry: rrPick.best.expiry,
           dte: rrPick.best.dte,
@@ -452,35 +519,60 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       rrPick = { best: null, note: `R/R selection failed: ${String(e.message || e)}` };
     }
   }
-  // Simple picker as the second choice: nearest DTE target, ~5% in/out of the
-  // money. It does no scoring at all — which is how a contract with a 31% spread
-  // (bid 19.80 / ask 27.20) got bought on GOOGL. The R/R path rejects anything
-  // over maxSpreadPct; this path had no such check, so "we couldn't find a good
-  // contract" silently became "buy an arbitrary one".
+  // ---- WHAT HAPPENS WHEN NOTHING CLEARS THE BAR ---------------------------
+  // This is where the system was leaking, and it leaked quietly.
   //
-  // The spread check now applies to BOTH paths. If the fallback's pick is also
-  // unacceptable we take no option at all and let the share fallback decide —
-  // paying a third of the premium to the market maker is not a fallback, it's a
-  // worse trade than not trading.
-  if (!call) {
+  // The R/R selector rejects a contract for good reasons: reward:risk under
+  // minRR, delta outside the band, breakeven sitting past our own target, a
+  // spread that eats the edge twice. When it came back empty, a SECOND picker
+  // then chose a contract by DTE and moneyness alone, and the only thing
+  // checked before that contract was sized and ordered was its spread. So a
+  // contract the selector had just refused at 0.4:1 was bought thirty lines
+  // later at 0.4:1. Every filter described as the safety net was, on that path,
+  // decorative.
+  //
+  // Worse, it was the path that ran most often. `noOption` below tested whether
+  // a contract with a quote EXISTED, and on any liquid name one always does --
+  // so the share fallback it guarded was structurally unreachable, and the
+  // bypass fired instead. "We could not find a good contract" silently became
+  // "buy an arbitrary one".
+  //
+  // Three honest answers now, chosen by contractSelection.onNoQualifyingContract:
+  //   shares    express the same thesis in stock (default). No spread, no theta,
+  //             sized off the distance to the stop.
+  //   skip      take nothing. The strictest reading, and defensible: if the
+  //             chain cannot pay you for this risk, that IS the answer.
+  //   fallback  let the legacy picker nominate -- but its pick is now scored
+  //             through the same evaluate() as the grid and must pass minRR.
+  //             A nomination, not a pardon.
+  const onNone = cfg.contractSelection?.onNoQualifyingContract || "shares";
+  if (!call && !thinForOptions && onNone === "fallback") {
     try {
       const pick = optType === "put"
         ? await selectPut(ticker, spot, { dteTarget, moneyness })
         : await selectCall(ticker, spot, { dteTarget, moneyness });
-      const maxSpread = cfg.contractSelection?.maxSpreadPct ?? 0.15;
-      const mid = pick?.mid || pick?.ask;
-      const sp = pick && pick.bid > 0 && mid > 0 ? (pick.ask - pick.bid) / mid : null;
-      if (pick && sp != null && sp > maxSpread) {
-        rrPick = rrPick || {};
-        rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback pick ${pick.strike} ${pick.expiry} `
-          + `rejected: spread ${(sp * 100).toFixed(0)}% > ${(maxSpread * 100).toFixed(0)}%`;
-        rrPick.fallbackRejected = { symbol: pick.symbol, spreadPct: +(sp * 100).toFixed(1) };
-      } else if (pick && sp == null) {
-        rrPick = rrPick || {};
+      const verdict = contractSelect.evaluatePick(pick, {
+        spot, target: lv.t1, stop: lv.stop, type: optType, cfg,
+        maxPremium: priceCeiling,
+      });
+      rrPick = rrPick || {};
+      if (!verdict) {
         rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback pick has no two-sided market — rejected`;
+      } else if (!verdict.ok) {
+        // Say WHICH bar it failed. "no contract" is unactionable; "every strike
+        // breaks even past T1" tells you the target is too close for premium.
+        rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback pick ${pick.strike} `
+          + `${pick.expiry} rejected: ${verdict.reasons.join(", ")}`;
+        rrPick.fallbackRejected = {
+          symbol: pick.symbol, rr: verdict.rr,
+          spreadPct: verdict.spreadPct, reasons: verdict.reasons,
+        };
       } else {
-        call = pick;
-        if (call) { call.spreadPct = sp != null ? +(sp * 100).toFixed(1) : null; call.viaFallback = true; }
+        selectionPath = "fallback-scored";
+        call = { ...pick, spreadPct: verdict.spreadPct, viaFallback: true };
+        rrPick.best = verdict;
+        rrPick.note = `${rrPick.note ? rrPick.note + "; " : ""}fallback pick passed scoring `
+          + `(R/R ${verdict.rr}, delta ${verdict.delta})`;
       }
     } catch (e) {
       rrPick = rrPick || {};
@@ -492,9 +584,49 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   // No usable contract (no chain, no quotes, nothing clears R/R). Express the
   // same thesis in stock, sized off the distance to the stop.
   const shareCfg = { ...shares.DEFAULTS, ...(cfg.shares || {}) };
-  const noOption = !call || !(call.mid || call.ask);
-  if (noOption) {
-    if (!shareCfg.enabled) throw new Error(`no usable ${optType} contract and share fallback disabled`);
+  // The old test was `!call || !(call.mid || call.ask)` — "does a contract with a
+  // quote exist at all". On a liquid name that is always true, so this branch
+  // never ran and the bypass above ran instead. The question that matters is not
+  // whether a contract exists; it is whether one QUALIFIES.
+  const needShares = !call || !(call.mid || call.ask);
+  const shareReason = thinForOptions
+    ? `T1 is only ${(upsidePct * 100).toFixed(1)}% from spot — under the `
+      + `${(minUpside * 100).toFixed(1)}% floor where option frictions can be paid for`
+    : `no ${optType} contract cleared the R/R bar`;
+
+  // "skip" means skip. Do not quietly become a share trade because the option
+  // route failed — that is a different trade with a different risk profile, and
+  // it should be a choice, not a consolation.
+  if (needShares && onNone === "skip" && !thinForOptions) {
+    return {
+      status: "NO_QUALIFYING_CONTRACT", ticker, side,
+      spot: +spot.toFixed(2), t1: lv.t1, stop: lv.stop, rrAtFill,
+      evaluated: rrPick?.evaluated ?? 0,
+      rejected: rrPick?.rejected || [],
+      note: `${shareReason} and onNoQualifyingContract="skip". `
+        + (rrPick?.note || "No trade."),
+    };
+  }
+
+  if (needShares) {
+    if (!shareCfg.enabled) {
+      return {
+        status: "NO_QUALIFYING_CONTRACT", ticker, side,
+        spot: +spot.toFixed(2), t1: lv.t1, stop: lv.stop, rrAtFill,
+        note: `${shareReason}, and the share route is disabled. No trade.`,
+      };
+    }
+    // A short expressed in stock needs borrow, and shares.allowShort is off by
+    // default. Refusing here — before the trigger and sizing work — keeps the
+    // log honest: the reason is "cannot short this", not "order rejected".
+    if (side === "short" && shareCfg.allowShort === false) {
+      return {
+        status: "NO_QUALIFYING_CONTRACT", ticker, side,
+        spot: +spot.toFixed(2), t1: lv.t1, stop: lv.stop, rrAtFill,
+        note: `${shareReason}, and short stock is disabled (shares.allowShort). `
+          + "A bearish thesis with no usable put is no trade.",
+      };
+    }
     if (!confirm) {
       const sized = shares.size(spot, lv.stop, riskPremium * flowMult, buyingPower, cfg);
       return {
@@ -503,8 +635,13 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         triggerNote: `${side} trigger: ${lv.triggerDir} ${lv.trigger}`,
         levels: lv, shares: sized,
         flow: decision ? { stance: decision.stance, sizeMultiplier: decision.sizeMultiplier } : null,
-        note: `no usable ${optType} contract — would trade shares instead`,
-        selection: { mode: csMode, note: rrPick?.note || null, usedFallback: true },
+        note: `${shareReason} — would trade shares instead`,
+        rrAtFill,
+        selection: {
+          mode: csMode, note: rrPick?.note || null, routedToShares: true,
+          reason: shareReason, evaluated: rrPick?.evaluated ?? 0,
+          rejected: rrPick?.rejected || [],
+        },
       };
     }
     if (flowBlock) return { status: "FLOW_BLOCKED", ticker, side, flow: flowSummary0(decision, conviction) };
@@ -526,6 +663,11 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       triggeredBy: triggered ? "5min-close" : "forced",
       entryBudget: riskPremium, flowMult, flowAtEntry: flowSummary0(decision, conviction),
       riskAtStop: res.sized.riskAtStop,
+      // Why this is stock and not an option. Without it the trade log cannot
+      // distinguish "we chose shares" from "the option leg silently failed",
+      // and those two need very different follow-up.
+      selection: { mode: "shares", reason: shareReason, rrAtFill },
+      rrAtFill,
     };
     const rows0 = load(); rows0.push(pos); persist(rows0);
     return { status: "ENTERED", instrument: "shares", position: pos, order: res.order };
@@ -576,7 +718,8 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         mode: csMode, note: rrPick.note, evaluated: rrPick.evaluated ?? 0,
         best: rrPick.best, alternatives: rrPick.alternatives || [],
         rejected: rrPick.rejected || [],
-        usedFallback: !rrPick.best,
+        path: selectionPath || "none",
+        rrAtFill,
       } : { mode: "legacy" },
       side, instrument: "option",
       levels: { ...lv, pTrans: snap.levels.pTrans, nTrans: snap.levels.nTrans },
@@ -612,9 +755,11 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       entryBudget: riskPremium, effectiveBudget, flowMult,
       flowAtEntry: flowSummary,
       triggeredBy: triggered ? "5min-close" : "forced",
+      rrAtFill,
       selection: rrPick?.best ? {
-        mode: "rr", rr: rrPick.best.rr, delta: rrPick.best.delta, iv: rrPick.best.iv,
-        breakeven: rrPick.best.breakeven, spreadPct: rrPick.best.spreadPct,
+        mode: selectionPath || "rr", rr: rrPick.best.rr, delta: rrPick.best.delta,
+        iv: rrPick.best.iv, breakeven: rrPick.best.breakeven,
+        spreadPct: rrPick.best.spreadPct,
       } : { mode: "legacy" },
     },
   }, cfg);
@@ -673,12 +818,17 @@ function tradingDaysBetween(fromIso, toIso) {
 export async function evaluatePositions() {
   const rows = load();
   const open = rows.filter((p) => p.status === "OPEN");
+  const cfgM = flow.loadConfig();
+  const mgmt = cfgM.management || {};
+  let dirty = false;
   const out = [];
   for (const p of open) {
     const side = p.side || "long";
     const isShares = p.instrument === "shares";
     // Backfill for positions opened before side/level fields existed.
-    const stopLevel = p.stopLevel ?? (side === "short" ? p.pTrans : p.nTrans);
+    // `let`, not `const`: the ratchet below can move this mid-evaluation, and the
+    // stop test further down has to see the moved level, not the entry one.
+    let stopLevel = p.stopLevel ?? (side === "short" ? p.pTrans : p.nTrans);
     const trigger = p.trigger ?? (side === "short" ? p.nTrans : p.pTrans);
 
     let spot = null, optMid = null;
@@ -708,15 +858,79 @@ export async function evaluatePositions() {
     // appends today's reading. Three consecutive sessions under 10%/day is the
     // stall signal. Stored on the position so it survives restarts.
     const today = iso(new Date());
+    const priorLog = JSON.stringify(p.progressLog || []);
     p.progressLog = (p.progressLog || []).filter((e) => e.d !== today);
     p.progressLog.push({ d: today, p: +(progress * 100).toFixed(1) });
     p.progressLog = p.progressLog.slice(-6);
+    // THIS WAS THE BUG THAT KILLED STOP 4. The log was built on every pass and
+    // never written back — `rows` comes from load(), which re-reads the file, so
+    // each evaluation started from whatever was last persisted, which was
+    // nothing. progressLog therefore never reached the four entries the stall
+    // test requires, and `stalled` was permanently false. Stop 4 has been dead
+    // code since it was written: it reads correctly, logs nothing, and fires
+    // never. Marking the rows dirty and persisting at the end is the whole fix.
+    if (JSON.stringify(p.progressLog) !== priorLog) dirty = true;
     let stalled = false;
     if (p.progressLog.length >= 4 && daysHeld >= 3) {
       const last4 = p.progressLog.slice(-4);
       const gains = last4.slice(1).map((e, i) => e.p - last4[i].p);
       stalled = gains.length === 3 && gains.every((g) => g < 10);
     }
+
+    // ---- STOP RATCHET: protect a winner, not just abandon a loser ---------
+    // Stops 1-4 all answer "when do I give up on this?". Nothing answered "when
+    // do I stop being willing to give the whole move back?" — so a position
+    // could travel 80% of the way to T1 and stop out at its original nTrans for
+    // a loss, having been right the entire time. The ratchet only ever tightens,
+    // and it is capped at the position's own entry-to-T1 span so it can never
+    // jump ahead of price.
+    const ratchet = Array.isArray(mgmt.stopRatchet) ? mgmt.stopRatchet : [];
+    if (ratchet.length && spot != null && p.entrySpot != null && p.t1 != null) {
+      const span = side === "short" ? p.entrySpot - p.t1 : p.t1 - p.entrySpot;
+      if (span > 0) {
+        // Highest rung whose progress threshold we have already cleared.
+        const hit = ratchet
+          .filter((r) => progress >= (r.at ?? 1))
+          .sort((a, b) => (a.at ?? 0) - (b.at ?? 0))
+          .pop();
+        if (hit) {
+          const lock = Math.min(Math.max(hit.lock ?? 0, 0), 0.9);
+          const want = side === "short"
+            ? +(p.entrySpot - span * lock).toFixed(2)
+            : +(p.entrySpot + span * lock).toFixed(2);
+          // Tighten only. A rung must never undo a stop some other rule raised.
+          const tighter = side === "short" ? want < stopLevel : want > stopLevel;
+          if (tighter) {
+            stopLevel = want;
+            p.stopLevel = want;
+            p.lockedToBreakeven = true;
+            p.stopRatchet = {
+              at: hit.at, lock, movedTo: want, on: today,
+              progressPct: +(progress * 100).toFixed(0),
+            };
+            if (side === "long") p.nTrans = want; else p.pTrans = want;
+            dirty = true;
+          }
+        }
+      }
+    }
+
+    // Catastrophic premium backstop. Every stop above is measured on the
+    // UNDERLYING, which is right for the thesis and blind to the instrument: a
+    // vol crush or an overnight gap can halve the option while spot still sits
+    // comfortably inside structure. Set wide on purpose — structure should get
+    // to be wrong first — but not infinite.
+    const maxPremLoss = mgmt.maxPremiumLossPct ?? 0;
+    const premiumBreach = !isShares && maxPremLoss > 0 && optMid != null
+      && p.entryPremium > 0 && optMid <= p.entryPremium * (1 - maxPremLoss);
+
+    // Never carry long premium into the theta/gamma cliff. If the thesis needed
+    // 45 days and has burned 35 of them, it is not about to start working.
+    const minDte = mgmt.minDteExit ?? 0;
+    const dteLeft = !isShares && p.expiry
+      ? Math.floor((Date.parse(p.expiry + "T20:00:00Z") - Date.now()) / 864e5)
+      : null;
+    const dteBreach = minDte > 0 && dteLeft != null && dteLeft <= minDte;
 
     let action = "HOLD", reason = "", urgent = false;
     if (spot != null) {
@@ -726,6 +940,14 @@ export async function evaluatePositions() {
       } else if (drawdownHit && adverse(trigger)) {
         action = "EXIT"; urgent = true;
         reason = `Stop 2: 10% adverse from entry and back ${side === "short" ? "above" : "below"} trigger`;
+      } else if (premiumBreach) {
+        action = "EXIT"; urgent = true;
+        reason = `Stop 5: premium ${optMid} is ${Math.round((1 - optMid / p.entryPremium) * 100)}% `
+          + `below entry ${p.entryPremium} — instrument stop, structure still intact at ${spot.toFixed(2)}`;
+      } else if (dteBreach) {
+        action = "EXIT"; urgent = false;
+        reason = `Stop 6: ${dteLeft}d to expiry — closing before the theta cliff `
+          + `(${(progress * 100).toFixed(0)}% to T1)`;
       } else if (daysHeld >= 7 && progress < 0.5) {
         action = "EXIT"; urgent = true;
         reason = `Stop 3: day ${daysHeld}, only ${(progress * 100).toFixed(0)}% to T1`;
@@ -756,8 +978,14 @@ export async function evaluatePositions() {
 
     out.push({ ...p, side, instrument: p.instrument || "option",
       currentSpot: spot != null ? +spot.toFixed(2) : null, optMid, optPnl, daysHeld,
+      effectiveStop: stopLevel, dteLeft,
       progressPct: +(progress * 100).toFixed(0), action, reason, urgent });
   }
+  // Write back the progress history and any ratcheted stop. Without this the
+  // whole evaluation is amnesiac: Stop 4 needs four sessions of history and the
+  // ratchet needs its moved stop to survive the next tick, let alone a restart
+  // on a host that redeploys nightly.
+  if (dirty) persist(rows);
   return out;
 }
 

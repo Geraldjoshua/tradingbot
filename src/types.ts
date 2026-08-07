@@ -133,7 +133,9 @@ export interface VolDeskSnapshot {
   deep: boolean;
   minervini: number;
   cushion_pct: number;
-  rr: number;
+  rr: number;                  // from pTrans — the trade the setup describes
+  rr_at_fill?: number | null;  // from spot — the trade you'd actually get
+  extension_pct?: number | null;
   spike_crash: boolean;
   call_oi: number;
   put_oi: number;

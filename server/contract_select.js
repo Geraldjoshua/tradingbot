@@ -51,6 +51,22 @@ export const DEFAULTS = {
   maxDelta: 0.90,              // avoid deep ITM (ties up premium, low convexity)
   requireBreakevenBelowTarget: true,
   riskFreeRate: 0.04,
+  // ---- OPEN INTEREST -------------------------------------------------------
+  // The contracts endpoint has always returned `open_interest` and this module
+  // has always thrown it away, so contract selection had no liquidity input at
+  // all beyond the instantaneous spread. Those are not the same thing: a quiet
+  // strike can quote a tight spread for one contract and then have nothing
+  // behind it, which is precisely the strike you cannot get OUT of. Spread is
+  // what the book shows; open interest is whether anyone is actually there.
+  //
+  // It also costs nothing to apply — the field arrives in the response we
+  // already make, and filtering here means fewer contracts to quote.
+  //
+  // Deliberately NOT backed by a fallback. If no strike on this name clears the
+  // floor, the honest answer is that the chain is too thin to trade, and the
+  // share route exists for exactly that. Relaxing the bar when it empties the
+  // grid is how the old bypass behaved.
+  minOpenInterest: 250,
 };
 
 function cfgFor(cfg) {
@@ -68,9 +84,24 @@ async function candidateGrid(ticker, spot, type, c) {
   });
   if (!contracts.length) return [];
 
+  const minOI = c.minOpenInterest ?? 0;
+  const liquid = minOI > 0
+    ? contracts.filter((x) => (parseFloat(x.open_interest) || 0) >= minOI)
+    : contracts;
+  // Report the cull rather than silently shrinking the universe: "nothing
+  // passed" and "nothing had 250 lots of open interest" send you to very
+  // different places.
+  if (minOI > 0 && !liquid.length) {
+    const best = Math.max(0, ...contracts.map((x) => parseFloat(x.open_interest) || 0));
+    throw new Error(
+      `no ${type} contract with open interest >= ${minOI} `
+      + `(deepest strike had ${best}) — chain too thin to trade`);
+  }
+  const pool = liquid;
+
   const dte = (e) => (Date.parse(e + "T20:00:00Z") - Date.now()) / 864e5;
   // Keep the expiries closest to the DTE target.
-  const exps = [...new Set(contracts.map((x) => x.expiration_date))]
+  const exps = [...new Set(pool.map((x) => x.expiration_date))]
     .sort((a, b) => Math.abs(dte(a) - c.dteTarget) - Math.abs(dte(b) - c.dteTarget))
     .slice(0, c.maxExpiries);
 
@@ -78,11 +109,11 @@ async function candidateGrid(ticker, spot, type, c) {
   const perExp = Math.max(3, Math.floor(c.maxCandidates / exps.length));
   const grid = [];
   for (const e of exps) {
-    const forExp = contracts
+    const forExp = pool
       .filter((x) => x.expiration_date === e)
       .sort((a, b) => Math.abs(+a.strike_price - spot) - Math.abs(+b.strike_price - spot))
       .slice(0, perExp);
-    for (const x of forExp) grid.push({ ...x, _dte: dte(e) });
+    for (const x of forExp) grid.push({ ...x, _dte: dte(e), _oi: parseFloat(x.open_interest) || 0 });
   }
   return grid.slice(0, c.maxCandidates);
 }
@@ -147,7 +178,7 @@ export function evaluate(k, { spot, target, stop, type, c, fallbackVol }) {
     symbol: k.symbol, strike: K, expiry: k.expiration_date, dte: Math.round(k._dte),
     type, bid: bid ?? null, ask, mid: +mid.toFixed(2),
     spreadPct: +(spreadPct * 100).toFixed(1),
-    iv: +iv.toFixed(4), delta: +delta.toFixed(3),
+    iv: +iv.toFixed(4), delta: +delta.toFixed(3), openInterest: k._oi ?? null,
     breakeven: +breakeven.toFixed(2),
     entryCost: +entryCost.toFixed(2),
     valueAtTarget: +exitAtTarget.toFixed(2),
@@ -205,4 +236,39 @@ export async function selectByRiskReward(ticker, spot, levels, cfg, type = "call
       ? `best R/R ${best.rr} (${best.strike} ${best.expiry}, ${best.dte}d, delta ${best.delta})`
       : `no contract passed filters out of ${scored.length} evaluated`,
   };
+}
+
+// ---- Score a contract that some OTHER path nominated ----------------------
+// The grid selector above is the standard. This exists so a contract chosen any
+// other way -- the legacy DTE/moneyness picker, a manual override -- is held to
+// exactly the same standard before it can be bought, instead of arriving at the
+// order stage pre-approved.
+//
+// That distinction is the whole point. Previously the legacy picker's output
+// went straight to sizing with only a spread check, so minRR, the delta band and
+// breakeven-below-target simply did not apply to it. A contract the grid had
+// already rejected at 0.4:1 could be bought thirty lines later. Routing every
+// nomination through the same evaluate() closes that off structurally rather
+// than by remembering to re-check at each call site.
+//
+// `pick` is the shape selectCall/selectPut return: { symbol, strike, expiry,
+// dte, bid, ask, mid }. Returns the same verdict object evaluate() produces,
+// including `ok` and `reasons`, or null if it cannot be priced at all.
+export function evaluatePick(pick, { spot, target, stop, type, cfg, fallbackVol = 0.45, maxPremium = 0 }) {
+  if (!pick || !(pick.ask > 0)) return null;
+  const c = { ...cfgFor(cfg), ...(maxPremium > 0 ? { maxPremium } : {}) };
+  const dte = Number.isFinite(pick.dte)
+    ? pick.dte
+    : (Date.parse(pick.expiry + "T20:00:00Z") - Date.now()) / 864e5;
+  return evaluate(
+    {
+      symbol: pick.symbol,
+      strike_price: pick.strike,
+      expiration_date: pick.expiry,
+      _dte: dte,
+      _bid: pick.bid,
+      _ask: pick.ask,
+    },
+    { spot, target, stop, type, c, fallbackVol },
+  );
 }
