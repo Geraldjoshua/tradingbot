@@ -43,7 +43,7 @@ export const DEFAULTS = {
   dteTarget: 45,
   strikeBandPct: 0.20,         // consider strikes +/-20% around spot
   maxExpiries: 3,              // how many expiries to price (each costs a quote call)
-  maxCandidates: 24,           // hard cap on contracts priced
+  maxCandidates: 60,           // hard cap on contracts priced (ONE batched quote call)
   expectedDaysToTarget: 14,    // calendar days assumed to reach T1 (theta drag)
   minRR: 1.5,                  // reject anything below this reward:risk
   maxSpreadPct: 0.15,          // (ask-bid)/mid
@@ -100,19 +100,100 @@ async function candidateGrid(ticker, spot, type, c) {
   const pool = liquid;
 
   const dte = (e) => (Date.parse(e + "T20:00:00Z") - Date.now()) / 864e5;
-  // Keep the expiries closest to the DTE target.
-  const exps = [...new Set(pool.map((x) => x.expiration_date))]
-    .sort((a, b) => Math.abs(dte(a) - c.dteTarget) - Math.abs(dte(b) - c.dteTarget))
-    .slice(0, c.maxExpiries);
 
-  // Within each expiry keep strikes nearest spot, so we price a sane grid.
+  // Expiries that SPAN the DTE window, not the three nearest the target.
+  //
+  // Same failure as the strike selection had, and it bites hardest on exactly
+  // the names you trade most. "Sort by |dte - 45|, keep 3" is fine on a chain
+  // with monthlies only (23 / 51), but on a dense-expiry name it collapses:
+  //   AAPL/NVDA/TSLA weeklies -> 42, 44, 46   (4-day spread)
+  //   SPY/QQQ M/W/F           -> 44, 45, 46   (2-day spread)
+  // That is one expiry sampled three times. The selector had no DTE choice to
+  // make, and shorter-dated contracts — which are CHEAPER, and therefore the
+  // ones a tight budget needs — were never candidates.
+  //
+  // evaluate() already prices theta over expectedDaysToTarget, so a 25-DTE and a
+  // 70-DTE contract can be compared honestly on reward:risk. It just has to be
+  // given both. Anchor on the target (that is still the default holding period),
+  // then spread the remaining slots across the window.
+  const allExps = [...new Set(pool.map((x) => x.expiration_date))]
+    .sort((a, b) => dte(a) - dte(b));
+  let exps;
+  if (allExps.length <= c.maxExpiries) {
+    exps = allExps;
+  } else {
+    const chosen = new Set();
+    // 1. anchor: closest to the DTE target
+    const anchor = [...allExps]
+      .sort((a, b) => Math.abs(dte(a) - c.dteTarget) - Math.abs(dte(b) - c.dteTarget))[0];
+    chosen.add(anchor);
+    // 2. spread the rest evenly across the sorted window
+    const need = c.maxExpiries - 1;
+    const step = (allExps.length - 1) / (need + 1);
+    for (let i = 1; i <= need; i++) {
+      const idx = Math.round(i * step);
+      for (let j = 0; j < allExps.length; j++) {
+        const a = allExps[idx + j], b = allExps[idx - j];
+        if (a && !chosen.has(a)) { chosen.add(a); break; }
+        if (b && !chosen.has(b)) { chosen.add(b); break; }
+      }
+    }
+    exps = [...chosen].sort((a, b) => dte(a) - dte(b));
+  }
+
+  // Within each expiry, choose strikes that SPAN the band — not just the ones
+  // nearest spot.
+  //
+  // THE BUG THIS REPLACES. The old rule was "sort by |strike - spot|, keep the
+  // first N". With maxCandidates 24 over 3 expiries that is 8 strikes each, and
+  // on a $482 name with $5 strikes those 8 cover ±3.6% — 8 of 38 available
+  // strikes. Measured on a realistic AMD chain, 14 strikes that PASS the delta
+  // band were discarded before they were ever priced, and every one of them was
+  // cheaper than anything kept: the grid's cheapest was $2,190 while excluded
+  // strikes qualified at $1,829 and $1,666.
+  //
+  // That interacts badly with the budget. `maxPremium` is applied inside
+  // evaluate(), i.e. AFTER this grid is built — so a tight budget would report
+  // "nothing affordable passed" when the affordable contracts were never
+  // candidates. The ceiling was filtering a set already chosen by proximity to
+  // spot, which is price-blind by construction.
+  //
+  // Now: anchor on the money (that is where the best fills usually are), then
+  // sample the rest evenly across the whole band so the cheap tail is always
+  // represented. Cost is essentially zero — the entire grid is priced in ONE
+  // batched quote call, so the only extra work is local Black-Scholes.
   const perExp = Math.max(3, Math.floor(c.maxCandidates / exps.length));
+
+  function spanStrikes(list, n) {
+    if (list.length <= n) return list;
+    const byStrike = [...list].sort((a, b) => +a.strike_price - +b.strike_price);
+    const chosen = new Map();
+    // 1. Anchor: the strikes nearest spot, where liquidity concentrates.
+    const nAnchor = Math.max(2, Math.round(n * 0.4));
+    [...byStrike]
+      .sort((a, b) => Math.abs(+a.strike_price - spot) - Math.abs(+b.strike_price - spot))
+      .slice(0, nAnchor)
+      .forEach((x) => chosen.set(x.symbol, x));
+    // 2. Fill: evenly spaced across the FULL band, so both tails are covered.
+    const need = n - chosen.size;
+    if (need > 0) {
+      const step = (byStrike.length - 1) / (need + 1);
+      for (let i = 1; i <= need; i++) {
+        const idx = Math.round(i * step);
+        for (let j = 0; j < byStrike.length; j++) {
+          // walk outward from the target index to the first unused strike
+          const a = byStrike[idx + j], b = byStrike[idx - j];
+          if (a && !chosen.has(a.symbol)) { chosen.set(a.symbol, a); break; }
+          if (b && !chosen.has(b.symbol)) { chosen.set(b.symbol, b); break; }
+        }
+      }
+    }
+    return [...chosen.values()];
+  }
+
   const grid = [];
   for (const e of exps) {
-    const forExp = pool
-      .filter((x) => x.expiration_date === e)
-      .sort((a, b) => Math.abs(+a.strike_price - spot) - Math.abs(+b.strike_price - spot))
-      .slice(0, perExp);
+    const forExp = spanStrikes(pool.filter((x) => x.expiration_date === e), perExp);
     for (const x of forExp) grid.push({ ...x, _dte: dte(e), _oi: parseFloat(x.open_interest) || 0 });
   }
   return grid.slice(0, c.maxCandidates);

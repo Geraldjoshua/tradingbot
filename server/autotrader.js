@@ -362,7 +362,14 @@ async function enter(cfg) {
   //
   // Realized only. Open drawdown is noise until it closes, and marking it would
   // halt entries every time an existing position breathed.
-  const maxLoss = Math.abs(cfg.risk?.maxDailyLoss ?? 0);
+  // Derived from basePremium so it cannot desync when the budget changes. See
+  // the note on maxDailyLossMultiple in flow.js — a fixed dollar figure paired
+  // with a raised budget halts the bot after its first loser.
+  const rkA = cfg.risk || {};
+  const mult = rkA.maxDailyLossMultiple ?? 0;
+  const maxLoss = mult > 0
+    ? Math.abs((rkA.basePremium ?? 0) * mult)
+    : Math.abs(rkA.maxDailyLoss ?? 0);
   if (maxLoss > 0) {
     let realizedToday = 0;
     try {
@@ -374,7 +381,8 @@ async function enter(cfg) {
       if (st.lossHaltDay !== todayISO()) {
         st.lossHaltDay = todayISO(); saveState(st);
         log("trade", "daily-loss-halt", {
-          realizedToday: Math.round(realizedToday), limit: -maxLoss,
+          realizedToday: Math.round(realizedToday), limit: -Math.round(maxLoss),
+          basis: mult > 0 ? `${mult}x basePremium $${rkA.basePremium}` : "absolute",
           note: "no new entries for the rest of the session. Open positions are still "
             + "managed normally — this stops adding risk, it does not stop exits.",
         });

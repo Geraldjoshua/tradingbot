@@ -154,13 +154,22 @@ export async function getOptionContracts({ underlying, type, expGte, expLte, str
 }
 
 // Quotes for specific option contract symbols (indicative feed is fine for selection).
-export async function getOptionQuotes(symbols) {
+export async function getOptionQuotes(symbols, chunk = 100) {
   if (!symbols.length) return {};
-  const u = new URL(`${DATA}/v1beta1/options/snapshots`);
-  u.searchParams.set("symbols", symbols.join(","));
-  u.searchParams.set("feed", "indicative");
-  const j = await req(u);
-  return j.snapshots || {};
+  // Chunked so raising contractSelection.maxCandidates cannot silently blow the
+  // URL length limit — OCC symbols are ~21 chars each and the grid now spans the
+  // whole strike band rather than a handful around spot.
+  const out = {};
+  for (let i = 0; i < symbols.length; i += chunk) {
+    const u = new URL(`${DATA}/v1beta1/options/snapshots`);
+    u.searchParams.set("symbols", symbols.slice(i, i + chunk).join(","));
+    u.searchParams.set("feed", "indicative");
+    try {
+      const j = await req(u);
+      Object.assign(out, j.snapshots || {});
+    } catch { /* skip the chunk; the rest of the grid is still usable */ }
+  }
+  return out;
 }
 
 // ---- Trading (paper) ------------------------------------------------------

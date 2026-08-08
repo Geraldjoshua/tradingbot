@@ -108,7 +108,7 @@ const DEFAULTS = {
   },
   contractSelection: {
     mode: "rr", dteMin: 21, dteMax: 75, dteTarget: 45,
-    strikeBandPct: 0.20, maxExpiries: 3, maxCandidates: 24,
+    strikeBandPct: 0.20, maxExpiries: 3, maxCandidates: 60,
     expectedDaysToTarget: 14, minRR: 1.5, maxSpreadPct: 0.15,
     minDelta: 0.35, maxDelta: 0.90,
     requireBreakevenBelowTarget: true, riskFreeRate: 0.04,
@@ -180,10 +180,10 @@ const DEFAULTS = {
     // `spot >= pTrans` alone tagged names CONFIRMED 8-25% beyond a trigger they
     // cleared weeks ago — the move was already gone. The short side always had
     // this guard at 0.5%; the long side never did.
-    maxExtensionPct: 3.0,
+    maxExtensionPct: 10.0,
     // Regime gates required (0-3). These were computed and written to every
     // snapshot from the start, and never actually enforced.
-    minRegimeGates: 2,
+    minRegimeGates: 0,
   },
   // Which directions the bot may trade. Shorts (puts) are OPT-IN because the
   // bearish playbook is a mirror heuristic with far less forward-testing than
@@ -288,15 +288,46 @@ const DEFAULTS = {
     allowShort: true, requireEasyToBorrow: true,
   },
   risk: {
-    // Daily realized-loss circuit breaker. maxDailyEntries caps how many trades
-    // can be opened; nothing capped how much could be LOST before opening the
-    // next one. On a day where the tape is simply wrong for the system, three
-    // stop-outs in a row is a signal to stop trading, not a reason to place the
-    // fourth. Dollars, positive number. 0 disables.
-    maxDailyLoss: 600,
+    // ---- DAILY LOSS CIRCUIT BREAKER -----------------------------------------
+    // maxDailyEntries caps how many trades can be OPENED; nothing capped how much
+    // could be LOST before opening the next one.
+    //
+    // Expressed as a MULTIPLE of basePremium, not as a fixed dollar amount, and
+    // that matters. A hard-coded $600 paired with a $300 budget is sane; the same
+    // $600 paired with a $6,000 budget halts the bot after its first loser,
+    // because one option stopped at -60% premium loses $3,600 on its own. The two
+    // numbers silently desynced the moment the budget changed, and nothing said
+    // so. A multiple cannot drift out of step.
+    //
+    // 1.5 means "stop after roughly two-and-a-half full stop-outs". Set
+    // maxDailyLossMultiple to 0 to use the absolute maxDailyLoss instead; set
+    // both to 0 to disable the breaker entirely.
+    maxDailyLossMultiple: 1.5,
+    maxDailyLoss: 0,            // absolute $ fallback, used only when the multiple is 0
+    // ---- BUDGET AS A HARD CAP -----------------------------------------------
+    // One switch for "never spend more than the budget", because the three flags
+    // that actually control it (enforceBudget / findCheaper / allowBudgetOverrun)
+    // interact in a way that is easy to get wrong — leaving overrun on with a
+    // tolerance of 2 quietly permits double the budget.
+    //
+    // ON  -> the budget behaves like a buying-power ceiling. The chain is
+    //        re-ranked so only contracts that FIT are considered, and if nothing
+    //        fits the trade is skipped rather than bought at a premium.
+    // OFF -> the older behaviour: the budget guides sizing, and the overrun
+    //        settings below decide how far past it a single contract may go.
+    hardBudgetCap: true,
     // (a) The budget, and whether it actually binds. Buying power is checked
     //     separately and ALWAYS binds — we never order what the account can't pay for.
-    basePremium: 300,          // $ of premium to deploy per trade (before flow sizing)
+    // How basePremium is READ. This was implicitly "per trade" and the field name
+    // does not say so, which matters a lot at larger numbers: with maxConcurrent
+    // 5, a $16,000 per-trade budget permits $80,000 of premium.
+    //   "per-trade"  each entry may spend up to basePremium (original behaviour)
+    //   "portfolio"  basePremium is the TOTAL across all open positions. It is
+    //                divided into equal slots, and capital already committed is
+    //                subtracted, so the book can never exceed the figure typed.
+    budgetMode: "per-trade",
+    portfolioSlots: 0,         // 0 = use automation.maxConcurrent
+    basePremium: 300,          // $ of premium (see budgetMode for per-trade vs total)
     enforceBudget: true,       // false = budget is advisory, size comes from fixedContracts
     // (b) Buy exactly N contracts per trade instead of "as many as the budget fits".
     fixedContracts: { enabled: false, count: 1 },

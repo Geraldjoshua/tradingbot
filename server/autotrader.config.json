@@ -133,7 +133,7 @@
     "dteTarget": 45,
     "strikeBandPct": 0.2,
     "maxExpiries": 3,
-    "maxCandidates": 24,
+    "maxCandidates": 60,
     "expectedDaysToTarget": 14,
     "minRR": 1.5,
     "maxSpreadPct": 0.15,
@@ -142,7 +142,7 @@
     "requireBreakevenBelowTarget": true,
     "riskFreeRate": 0.04,
     "minOpenInterest": 250,
-    "onNoQualifyingContract": "shares"
+    "onNoQualifyingContract": "skip"
   },
   "execution": {
     "enabled": true,
@@ -170,8 +170,8 @@
     "minRR": 2,
     "minRRAtFill": 1.5,
     "minUpsidePctForOptions": 0.05,
-    "maxExtensionPct": 3,
-    "minRegimeGates": 2,
+    "maxExtensionPct": 10,
+    "minRegimeGates": 0,
     "vixSource": "yahoo"
   },
   "walls": {
@@ -207,6 +207,11 @@
       "giveBackPct": 0.4
     }
   },
+  "reconcile": {
+    "everyMinutes": 30,
+    "orphanMode": "full",
+    "adoptUntracked": "protect"
+  },
   "sides": {
     "long": true,
     "short": true
@@ -214,13 +219,17 @@
   "shares": {
     "enabled": true,
     "minShares": 1,
+    "maxNotionalMultiple": 1,
     "maxNotionalPct": 0.1,
     "allowShort": false,
-    "requireEasyToBorrow": true,
-    "maxNotionalMultiple": 1.0
+    "requireEasyToBorrow": true
   },
   "risk": {
-    "maxDailyLoss": 600,
+    "maxDailyLossMultiple": 1.5,
+    "maxDailyLoss": 0,
+    "hardBudgetCap": true,
+    "budgetMode": "portfolio",
+    "portfolioSlots": 4,
     "basePremium": 300,
     "enforceBudget": true,
     "fixedContracts": {
@@ -237,10 +246,5 @@
     "snapshotsPerTicker": 40,
     "keepClosedTrades": 200,
     "maxDataMB": 200
-  },
-  "reconcile": {
-    "everyMinutes": 30,
-    "orphanMode": "full",
-    "adoptUntracked": "protect"
   }
 }

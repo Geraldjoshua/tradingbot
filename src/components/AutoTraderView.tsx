@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import NumField from "./NumField";
 import * as api from "../api";
 
 // Auto-trader control panel: kill switch, toggles for automation + flow, the
@@ -181,9 +182,9 @@ export default function AutoTraderView() {
           </label>
           <label className="row">
             Stops that trigger while closed fire&nbsp;
-            <input type="number" min={0} max={60} style={{ width: 44 }}
+            <NumField min={0} max={60} style={{ width: 44 }}
               value={a.queuedExitDelayMin ?? 5}
-              onChange={(e) => patch({ automation: { queuedExitDelayMin: Math.max(0, +e.target.value) } })} />
+              onCommit={(e) => patch({ automation: { queuedExitDelayMin: Math.max(0, +e.target.value) } })} />
             &nbsp;min after the open
           </label>
           <p className="sub" style={{ margin: "0 0 4px 0" }}>
@@ -197,10 +198,10 @@ export default function AutoTraderView() {
             <input type="checkbox" checked={cfg.scaleOut?.enabled === true}
               onChange={(e) => patch({ scaleOut: { enabled: e.target.checked } })} />
             Scale out — sell&nbsp;
-            <input type="number" min={5} max={95} step="5" style={{ width: 50 }}
+            <NumField min={5} max={95} step="5" style={{ width: 50 }}
               disabled={cfg.scaleOut?.enabled !== true}
               value={Math.round((cfg.scaleOut?.firstPct ?? 0.8) * 100)}
-              onChange={(e) => patch({ scaleOut: { firstPct: Math.min(95, Math.max(5, +e.target.value)) / 100 } })} />
+              onCommit={(e) => patch({ scaleOut: { firstPct: Math.min(95, Math.max(5, +e.target.value)) / 100 } })} />
             % at T1, run the rest to T2
           </label>
           <label className="row" style={{ marginLeft: 22 }}>
@@ -216,12 +217,12 @@ export default function AutoTraderView() {
             and runs 1. Note that "breakeven" is the stop on the <i>underlying</i> at your entry price:
             the option can still be worth less there than you paid, because theta ran while you waited.
           </p>
-          <div className="row">Poll&nbsp;<input type="number" value={a.pollSeconds} style={{ width: 60 }}
-            onChange={(e) => patch({ automation: { pollSeconds: +e.target.value } })} />s ·
-            max&nbsp;<input type="number" value={a.maxConcurrent} style={{ width: 44 }}
-            onChange={(e) => patch({ automation: { maxConcurrent: +e.target.value } })} /> open ·
-            <input type="number" value={a.maxDailyEntries} style={{ width: 44 }}
-            onChange={(e) => patch({ automation: { maxDailyEntries: +e.target.value } })} />/day
+          <div className="row">Poll&nbsp;<NumField value={a.pollSeconds} style={{ width: 60 }}
+            onCommit={(e) => patch({ automation: { pollSeconds: +e.target.value } })} />s ·
+            max&nbsp;<NumField value={a.maxConcurrent} style={{ width: 44 }}
+            onCommit={(e) => patch({ automation: { maxConcurrent: +e.target.value } })} /> open ·
+            <NumField value={a.maxDailyEntries} style={{ width: 44 }}
+            onCommit={(e) => patch({ automation: { maxDailyEntries: +e.target.value } })} />/day
           </div>
           <label className="row">Entry trigger&nbsp;
             <select value={a.triggerMode || "open"}
@@ -231,8 +232,8 @@ export default function AutoTraderView() {
             </select>
             {(a.triggerMode === "intraday" || a.triggerMode === "both") && (
               <>&nbsp;· no new triggers after&nbsp;
-                <input type="number" value={Math.floor((a.intradayCutoffMin ?? 840) / 60)} style={{ width: 40 }}
-                  onChange={(e) => patch({ automation: { intradayCutoffMin: Math.max(10, +e.target.value) * 60 } })} />:00 ET
+                <NumField value={Math.floor((a.intradayCutoffMin ?? 840) / 60)} style={{ width: 40 }}
+                  onCommit={(e) => patch({ automation: { intradayCutoffMin: Math.max(10, +e.target.value) * 60 } })} />:00 ET
               </>
             )}
           </label>
@@ -267,8 +268,8 @@ export default function AutoTraderView() {
             <input type="checkbox" checked={rk.enforceBudget !== false}
               onChange={(e) => patch({ risk: { enforceBudget: e.target.checked } })} />
             Respect the premium budget&nbsp;
-            $<input type="number" step="100" value={rk.basePremium} style={{ width: 90 }}
-              onChange={(e) => patch({ risk: { basePremium: +e.target.value } })} /> per trade
+            $<NumField step="100" value={rk.basePremium} style={{ width: 90 }}
+              onCommit={(e) => patch({ risk: { basePremium: +e.target.value } })} /> per trade
           </label>
           <p className="sub" style={{ margin: "0 0 6px 22px" }}>
             On: contracts = budget ÷ (premium × 100). Off: the budget is ignored and size comes
@@ -276,20 +277,103 @@ export default function AutoTraderView() {
             it will never spend money you don't have.
           </p>
 
+          {/* (a1) is that number per trade, or the whole book? */}
+          <label className="row">
+            The budget above is&nbsp;
+            <select value={rk.budgetMode || "per-trade"} style={{ width: 190 }}
+              onChange={(e) => patch({ risk: { budgetMode: e.target.value } })}>
+              <option value="per-trade">per trade</option>
+              <option value="portfolio">the TOTAL across all positions</option>
+            </select>
+            {rk.budgetMode === "portfolio" && (
+              <>&nbsp;split into&nbsp;
+                <NumField min="1" style={{ width: 45 }}
+                  value={rk.portfolioSlots || cfg.automation?.maxConcurrent || 1}
+                  onCommit={(e) => patch({ risk: { portfolioSlots: Math.max(1, Math.round(+e.target.value)) } })} />
+                &nbsp;slots
+              </>
+            )}
+          </label>
+          <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+            <b>per trade</b> (original): every entry may spend up to the full amount — so with
+            max {cfg.automation?.maxConcurrent ?? 5} concurrent, a ${rk.basePremium ?? 0} setting
+            permits ${((rk.basePremium ?? 0) * (cfg.automation?.maxConcurrent ?? 5)).toLocaleString()} of
+            premium. The field name does not say that, which is easy to get wrong at larger numbers.
+            <br />
+            <b>total</b>: the number is the whole book. It is divided into equal slots so one name
+            cannot eat everything, and capital already committed is subtracted — measured at COST,
+            not market value, so a book that is up cannot quietly free room to add risk. When it is
+            fully committed, new entries stop with <code>BUDGET_EXHAUSTED</code> until something closes.
+            {rk.budgetMode === "portfolio" && (() => {
+              const slots = rk.portfolioSlots || cfg.automation?.maxConcurrent || 1;
+              return <> <b style={{ color: "var(--green)" }}>
+                ${(rk.basePremium ?? 0).toLocaleString()} ÷ {slots} = ${Math.round((rk.basePremium ?? 0) / slots).toLocaleString()} per trade.
+              </b></>;
+            })()}
+          </p>
+
+          {/* (a2) the budget as a HARD ceiling */}
+          <label className="row">
+            <input type="checkbox" checked={rk.hardBudgetCap === true}
+              onChange={(e) => patch({ risk: { hardBudgetCap: e.target.checked } })} />
+            <b>Treat the budget as a hard cap</b>&nbsp;— only buy contracts that fit inside it
+          </label>
+          <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+            One switch for what three separate flags used to control between them, which is how a
+            $300 budget ended up buying a $2,910 position. <b>On:</b> the budget behaves like buying
+            power — the chain is re-ranked so only contracts that FIT are ranked at all, and if
+            nothing fits the name is skipped with <code>TOO_EXPENSIVE</code> rather than bought at a
+            premium. Total cost can never exceed the budget. <b>Off:</b> the overrun settings below
+            decide how far past it one contract may go. Turning this on overrides them.
+            {rk.hardBudgetCap === true && (
+              <> <b style={{ color: "var(--green)" }}>Active</b> — a ${rk.basePremium ?? 0} budget
+                buys at most ${rk.basePremium ?? 0} of premium.</>
+            )}
+          </p>
+
+          {/* (a3) daily loss breaker, expressed against the budget */}
+          <label className="row">
+            Stop entering for the day after losing&nbsp;
+            <NumField step="0.5" min="0" style={{ width: 55 }}
+              value={rk.maxDailyLossMultiple ?? 1.5}
+              onCommit={(e) => patch({ risk: { maxDailyLossMultiple: Math.max(0, +e.target.value) } })} />
+            &nbsp;× the budget
+          </label>
+          <p className="sub" style={{ margin: "0 0 6px 22px" }}>
+            A MULTIPLE, not a dollar figure, so it cannot fall out of step when you change the
+            budget — a fixed $600 limit paired with a $6,000 budget halts after the first loser,
+            because one option stopped at −60% premium loses $3,600 on its own.
+            {(() => {
+              const bp = rk.basePremium ?? 0;
+              const m = rk.maxDailyLossMultiple ?? 1.5;
+              if (!m) return <> Set to 0 — the breaker is off.</>;
+              const worst = Math.round(bp * (cfg.management?.maxPremiumLossPct ?? 0.6));
+              const lim = Math.round(bp * m);
+              return (
+                <> Currently halts at <b>${lim}</b>; a single full stop-out costs about{" "}
+                  <b>${worst}</b>, so that is roughly {(lim / Math.max(worst, 1)).toFixed(1)} losers.
+                  {lim <= worst && (
+                    <b style={{ color: "var(--red)" }}> Too tight — one loser would halt the day.</b>
+                  )}
+                </>
+              );
+            })()}
+          </p>
+
           {/* (b) exact contract count */}
           <label className="row">
             <input type="checkbox" checked={rk.fixedContracts?.enabled === true}
               onChange={(e) => patch({ risk: { fixedContracts: { enabled: e.target.checked } } })} />
             Always buy exactly&nbsp;
-            <input type="number" min={1} value={rk.fixedContracts?.count ?? 1} style={{ width: 44 }}
+            <NumField min={1} value={rk.fixedContracts?.count ?? 1} style={{ width: 44 }}
               disabled={rk.fixedContracts?.enabled !== true}
-              onChange={(e) => patch({ risk: { fixedContracts: { count: +e.target.value } } })} />
+              onCommit={(e) => patch({ risk: { fixedContracts: { count: +e.target.value } } })} />
             &nbsp;contract(s) per trade
           </label>
           <p className="sub" style={{ margin: "0 0 6px 22px" }}>
             Off: buy as many as the budget fits. Hard ceiling either way:&nbsp;
-            <input type="number" value={rk.maxContracts ?? 10} style={{ width: 44 }}
-              onChange={(e) => patch({ risk: { maxContracts: +e.target.value } })} /> contracts.
+            <NumField value={rk.maxContracts ?? 10} style={{ width: 44 }}
+              onCommit={(e) => patch({ risk: { maxContracts: +e.target.value } })} /> contracts.
           </p>
 
           {/* (d) find something cheaper */}
@@ -307,7 +391,8 @@ export default function AutoTraderView() {
 
           {/* (c) overrun */}
           <label className="row">
-            <input type="checkbox" checked={rk.allowBudgetOverrun !== false}
+            <input type="checkbox" checked={rk.hardBudgetCap === true ? false : rk.allowBudgetOverrun !== false}
+              disabled={rk.hardBudgetCap === true}
               onChange={(e) => patch({ risk: { allowBudgetOverrun: e.target.checked } })} />
             Last resort: buy 1 contract even if it exceeds the budget
           </label>
@@ -315,8 +400,12 @@ export default function AutoTraderView() {
             A $30 premium contract costs <b>$3,000</b>, so a $300 budget can't afford one. Ticked, it
             buys 1 anyway and logs <code>OVER_BUDGET 10x</code> — that's how three ~$3,000 positions
             were opened on a "$300" budget. Unticked, it skips as <code>TOO_EXPENSIVE</code>. Capped at
-            <input type="number" value={rk.overrunTolerance ?? 15} style={{ width: 40 }}
-              onChange={(e) => patch({ risk: { overrunTolerance: +e.target.value } })} />× the budget.
+            <NumField value={rk.overrunTolerance ?? 2} style={{ width: 40 }}
+              disabled={rk.hardBudgetCap === true}
+              onCommit={(e) => patch({ risk: { overrunTolerance: +e.target.value } })} />× the budget.
+            {rk.hardBudgetCap === true && (
+              <b style={{ color: "var(--muted)" }}> (overridden — hard cap is on)</b>
+            )}
           </p>
         </div>
 
@@ -338,18 +427,18 @@ export default function AutoTraderView() {
           <label className="row"><input type="checkbox" checked={f.sources.unusualwhales}
             onChange={(e) => patch({ flow: { sources: { unusualwhales: e.target.checked } } })} /> Unusual Whales (needs UW_API_KEY)</label>
           <div className="row">Size × — agree
-            <input type="number" step="0.05" value={f.sizing.agree} style={{ width: 54 }}
-              onChange={(e) => patch({ flow: { sizing: { agree: +e.target.value } } })} /> · neutral
-            <input type="number" step="0.05" value={f.sizing.neutral} style={{ width: 54 }}
-              onChange={(e) => patch({ flow: { sizing: { neutral: +e.target.value } } })} /> · disagree
-            <input type="number" step="0.05" value={f.sizing.disagree} style={{ width: 54 }}
-              onChange={(e) => patch({ flow: { sizing: { disagree: +e.target.value } } })} />
+            <NumField step="0.05" value={f.sizing.agree} style={{ width: 54 }}
+              onCommit={(e) => patch({ flow: { sizing: { agree: +e.target.value } } })} /> · neutral
+            <NumField step="0.05" value={f.sizing.neutral} style={{ width: 54 }}
+              onCommit={(e) => patch({ flow: { sizing: { neutral: +e.target.value } } })} /> · disagree
+            <NumField step="0.05" value={f.sizing.disagree} style={{ width: 54 }}
+              onCommit={(e) => patch({ flow: { sizing: { disagree: +e.target.value } } })} />
           </div>
-          <div className="row">Min score&nbsp;<input type="number" step="0.05" value={f.minScore} style={{ width: 54 }}
-            onChange={(e) => patch({ flow: { minScore: +e.target.value } })} /></div>
+          <div className="row">Min score&nbsp;<NumField step="0.05" value={f.minScore} style={{ width: 54 }}
+            onCommit={(e) => patch({ flow: { minScore: +e.target.value } })} /></div>
           <div className="row">
-            Stale after <input type="number" step="1" value={f.maxAgeDays ?? 3} style={{ width: 48 }}
-              onChange={(e) => patch({ flow: { maxAgeDays: +e.target.value } })} /> days →&nbsp;
+            Stale after <NumField step="1" value={f.maxAgeDays ?? 3} style={{ width: 48 }}
+              onCommit={(e) => patch({ flow: { maxAgeDays: +e.target.value } })} /> days →&nbsp;
             <select value={f.staleAction || "warn"}
               onChange={(e) => patch({ flow: { staleAction: e.target.value } })}>
               <option value="warn">warn only (keep trading)</option>
@@ -378,8 +467,8 @@ export default function AutoTraderView() {
         <label className="row"><input type="checkbox" checked={sh.allowShort !== false}
           onChange={(e) => patch({ shares: { allowShort: e.target.checked } })} /> …including short stock (needs easy-to-borrow)</label>
         <div className="row">
-          max notional <input type="number" step="0.05" value={sh.maxNotionalPct ?? 0.1} style={{ width: 60 }}
-            onChange={(e) => patch({ shares: { maxNotionalPct: +e.target.value } })} /> of buying power
+          max notional <NumField step="0.05" value={sh.maxNotionalPct ?? 0.1} style={{ width: 60 }}
+            onCommit={(e) => patch({ shares: { maxNotionalPct: +e.target.value } })} /> of buying power
         </div>
         <p className="sub" style={{ marginTop: 0 }}>
           Shares are sized by risk: <code>shares = riskBudget / |entry − stop|</code>, so a stop-out
@@ -416,14 +505,14 @@ export default function AutoTraderView() {
           <code> flow_master.xlsx</code> on the Flow tab builds the same cache the local scraper would.
         </p>
         <div className="row">
-          every <input type="number" value={d.everyMinutes} style={{ width: 54 }}
-            onChange={(e) => patch({ discovery: { everyMinutes: +e.target.value } })} />min ·
-          scan top <input type="number" value={d.maxScan} style={{ width: 44 }}
-            onChange={(e) => patch({ discovery: { maxScan: +e.target.value } })} /> ·
-          min premium $<input type="number" step="50000" value={d.minPremium} style={{ width: 90 }}
-            onChange={(e) => patch({ discovery: { minPremium: +e.target.value } })} /> ·
-          min skew <input type="number" step="0.05" value={d.minScore} style={{ width: 54 }}
-            onChange={(e) => patch({ discovery: { minScore: +e.target.value } })} />
+          every <NumField value={d.everyMinutes} style={{ width: 54 }}
+            onCommit={(e) => patch({ discovery: { everyMinutes: +e.target.value } })} />min ·
+          scan top <NumField value={d.maxScan} style={{ width: 44 }}
+            onCommit={(e) => patch({ discovery: { maxScan: +e.target.value } })} /> ·
+          min premium $<NumField step="50000" value={d.minPremium} style={{ width: 90 }}
+            onCommit={(e) => patch({ discovery: { minPremium: +e.target.value } })} /> ·
+          min skew <NumField step="0.05" value={d.minScore} style={{ width: 54 }}
+            onCommit={(e) => patch({ discovery: { minScore: +e.target.value } })} />
         </div>
 
         <label className="row">GEX data source&nbsp;
@@ -447,10 +536,10 @@ export default function AutoTraderView() {
           <input type="checkbox" checked={(cfg.walls?.minDistancePct ?? 0.015) > 0}
             onChange={(e) => patch({ walls: { minDistancePct: e.target.checked ? 0.015 : 0 } })} />
           A wall must be at least&nbsp;
-          <input type="number" step="0.5" style={{ width: 50 }}
+          <NumField step="0.5" style={{ width: 50 }}
             value={+(((cfg.walls?.minDistancePct ?? 0.015) * 100).toFixed(1))}
             disabled={(cfg.walls?.minDistancePct ?? 0.015) <= 0}
-            onChange={(e) => patch({ walls: { minDistancePct: Math.max(0, +e.target.value) / 100 } })} />
+            onCommit={(e) => patch({ walls: { minDistancePct: Math.max(0, +e.target.value) / 100 } })} />
           % from spot
         </label>
         <p className="sub" style={{ margin: "0 0 6px 22px" }}>
@@ -490,9 +579,9 @@ export default function AutoTraderView() {
 
         <label className="row">
           Minimum R/R&nbsp;
-          <input type="number" step="0.25" min="0" style={{ width: 60 }}
+          <NumField step="0.25" min="0" style={{ width: 60 }}
             value={cfg.setup?.minRR ?? 2}
-            onChange={(e) => patch({ setup: { minRR: Math.max(0, +e.target.value) } })} />
+            onCommit={(e) => patch({ setup: { minRR: Math.max(0, +e.target.value) } })} />
           &nbsp;: 1
         </label>
         <p className="sub" style={{ margin: "0 0 6px 22px" }}>
@@ -504,28 +593,32 @@ export default function AutoTraderView() {
         </p>
 
         <label className="row">
-          <input type="checkbox" checked={(cfg.setup?.maxExtensionPct ?? 3) > 0}
-            onChange={(e) => patch({ setup: { maxExtensionPct: e.target.checked ? 3 : 0 } })} />
+          <input type="checkbox" checked={(cfg.setup?.maxExtensionPct ?? 10) > 0}
+            onChange={(e) => patch({ setup: { maxExtensionPct: e.target.checked ? 10 : 0 } })} />
           Reject names already more than&nbsp;
-          <input type="number" step="0.5" min="0" style={{ width: 55 }}
-            value={cfg.setup?.maxExtensionPct ?? 3}
-            disabled={(cfg.setup?.maxExtensionPct ?? 3) <= 0}
-            onChange={(e) => patch({ setup: { maxExtensionPct: Math.max(0, +e.target.value) } })} />
+          <NumField step="0.5" min="0" style={{ width: 55 }}
+            value={cfg.setup?.maxExtensionPct ?? 10}
+            disabled={(cfg.setup?.maxExtensionPct ?? 10) <= 0}
+            onCommit={(e) => patch({ setup: { maxExtensionPct: Math.max(0, +e.target.value) } })} />
           % past pTrans
         </label>
         <p className="sub" style={{ margin: "0 0 6px 22px" }}>
-          The single biggest difference from the reference system: it enters names that have{" "}
-          <i>just</i> crossed pTrans, while we were entering ones 8–25% past it. Reward measured from
-          pTrans averaged <b>15.2%</b>; from where we actually entered, <b>5.0%</b> — and 5% doesn't
-          cover an option's spread and theta. This is the freshness gate. Blocked names now report{" "}
-          <code>ext&lt;=3%</code>, so an extended name says so instead of failing a mangled R/R test.
+          A loose FRESHNESS guard, no longer the main extension control. The real one is{" "}
+          <b>minRRAtFill</b>, which re-measures reward:risk from live spot at the moment of entry —
+          tested across 20 level structures, it already binds tighter than a 3% cap in 12 of them,
+          and was <i>looser</i> than it in 4 (a T1 +25% / stop −8% setup entered 5% extended is still
+          1.54:1, and a 3% cap blocked it). So this sits wide and lets the order-time gate make the
+          call, which is where the question can be answered honestly — a scan-time number is
+          describing a moment that has already passed. Extended names now show up as{" "}
+          <code>CHASED</code> in the entry log with their actual R/R, instead of{" "}
+          <code>ext&lt;=3%</code> at scan time.
         </p>
 
         <label className="row">
           Require&nbsp;
-          <input type="number" step="1" min="0" max="3" style={{ width: 45 }}
+          <NumField step="1" min="0" max="3" style={{ width: 45 }}
             value={cfg.setup?.minRegimeGates ?? 2}
-            onChange={(e) => patch({ setup: { minRegimeGates: Math.max(0, Math.min(3, Math.round(+e.target.value))) } })} />
+            onCommit={(e) => patch({ setup: { minRegimeGates: Math.max(0, Math.min(3, Math.round(+e.target.value))) } })} />
           &nbsp;of 3 regime gates
         </label>
         <p className="sub" style={{ margin: "0 0 6px 22px" }}>
@@ -589,10 +682,10 @@ export default function AutoTraderView() {
           </select>
         </div>
         <div className="row">
-          min score <input type="number" step="0.25" value={d.minTierScore ?? 1.0} style={{ width: 54 }}
-            onChange={(e) => patch({ discovery: { minTierScore: +e.target.value } })} />×
-          &nbsp;· clamp at <input type="number" value={d.maxTierScore ?? 20} style={{ width: 54 }}
-            onChange={(e) => patch({ discovery: { maxTierScore: +e.target.value } })} />×
+          min score <NumField step="0.25" value={d.minTierScore ?? 1.0} style={{ width: 54 }}
+            onCommit={(e) => patch({ discovery: { minTierScore: +e.target.value } })} />×
+          &nbsp;· clamp at <NumField value={d.maxTierScore ?? 20} style={{ width: 54 }}
+            onCommit={(e) => patch({ discovery: { maxTierScore: +e.target.value } })} />×
         </div>
 
         {/* Per-tier bars */}
@@ -621,10 +714,10 @@ export default function AutoTraderView() {
                       <td className="sub">{range}</td>
                       <td><input type="checkbox" checked={t.enabled !== false}
                         onChange={(e) => patch({ discovery: { tiers: { [k]: { enabled: e.target.checked } } } })} /></td>
-                      <td><input type="number" step="0.1" value={t.refBps ?? 1} style={{ width: 64 }}
-                        onChange={(e) => patch({ discovery: { tiers: { [k]: { refBps: +e.target.value } } } })} /></td>
-                      <td>$<input type="number" step="50000" value={t.minPremium ?? 0} style={{ width: 100 }}
-                        onChange={(e) => patch({ discovery: { tiers: { [k]: { minPremium: +e.target.value } } } })} /></td>
+                      <td><NumField step="0.1" value={t.refBps ?? 1} style={{ width: 64 }}
+                        onCommit={(e) => patch({ discovery: { tiers: { [k]: { refBps: +e.target.value } } } })} /></td>
+                      <td>$<NumField step="50000" value={t.minPremium ?? 0} style={{ width: 100 }}
+                        onCommit={(e) => patch({ discovery: { tiers: { [k]: { minPremium: +e.target.value } } } })} /></td>
                     </tr>
                   );
                 })}

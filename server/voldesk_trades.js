@@ -272,6 +272,7 @@ export function sizeOrder({ prem, budget, budgetTarget = budget, buyingPower = 0
         budget, buyingPower: bp, overrunRatio: +overrunRatio.toFixed(2), cheaperSearch,
         note: `1 contract costs $${costPerContract.toFixed(0)} but the budget is $${budget} `
           + `(${overrunRatio.toFixed(1)}x over)`
+          + (rk.hardBudgetCap ? " — budget is a HARD CAP, so this is skipped rather than bought" : "")
           + (cheaperSearch ? ` and nothing under $${cheaperSearch.ceiling} passed the R/R filters` : "")
           + ".",
       };
@@ -442,7 +443,45 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
 
   // Flow scales the premium budget: agree -> full, disagree -> small (size mode),
   // or blocks entirely (gate mode).
-  const effectiveBudget = Math.max(0, Math.round(riskPremium * flowMult));
+  // ---- PER-TRADE vs PORTFOLIO BUDGET --------------------------------------
+  // basePremium has always meant "per trade". With maxConcurrent 5, a $16,000
+  // setting therefore permits $80,000 of premium — which is not what the number
+  // looks like it says, and is the kind of gap that only shows up as a fill.
+  //
+  // "portfolio" mode reads the same number as a TOTAL instead, and does two
+  // things with it:
+  //   1. divides it into equal slots, so one name cannot eat the whole book
+  //   2. subtracts what is already committed, so the total across open
+  //      positions can never exceed the figure you typed
+  //
+  // Deployed capital is measured at COST, not market value — a book that is up
+  // should not quietly free room to add more risk.
+  const rkP = cfg.risk || {};
+  const portfolioMode = rkP.budgetMode === "portfolio";
+  let tradeBudget = riskPremium;
+  let budgetPlan = null;
+  if (portfolioMode) {
+    const slots = Math.max(1, rkP.portfolioSlots || cfg.automation?.maxConcurrent || 1);
+    const deployed = deployedCapital();
+    const remaining = Math.max(0, riskPremium - deployed);
+    const perSlot = riskPremium / slots;
+    tradeBudget = Math.min(perSlot, remaining);
+    budgetPlan = {
+      mode: "portfolio", total: riskPremium, slots,
+      perSlot: Math.round(perSlot), deployed: Math.round(deployed),
+      remaining: Math.round(remaining), thisTrade: Math.round(tradeBudget),
+    };
+    if (tradeBudget < 1) {
+      return {
+        status: "BUDGET_EXHAUSTED", ticker, side, budgetPlan,
+        note: `portfolio budget $${riskPremium} is fully committed `
+          + `($${Math.round(deployed)} already in ${load().filter((x) => x.status === "OPEN").length} `
+          + "open positions). No room for another entry until something closes.",
+      };
+    }
+  }
+
+  const effectiveBudget = Math.max(0, Math.round(tradeBudget * flowMult));
 
   // ---- Contract selection -------------------------------------------------
   // Default: score a grid of strikes x expiries on true reward:risk against the
@@ -461,7 +500,16 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   //   allowBudgetOverrun — last resort: buy 1 anyway
   // Buying power sits above all four: we never order more than the account can
   // pay for, whatever the toggles say.
-  const rk = cfg.risk || {};
+  // hardBudgetCap collapses three interacting flags into one intent: the budget
+  // is a ceiling on what this trade may cost, full stop. It forces the budget to
+  // bind, forces the chain to be re-ranked for affordability, and removes the
+  // overrun escape hatch — which is otherwise easy to leave on by accident and
+  // is exactly how a $300 budget bought a $2,910 position.
+  const rk0 = cfg.risk || {};
+  const hardCap = rk0.hardBudgetCap === true;
+  const rk = hardCap
+    ? { ...rk0, enforceBudget: true, findCheaper: true, allowBudgetOverrun: false }
+    : rk0;
   const enforceBudget = rk.enforceBudget !== false;
   const findCheaper = rk.findCheaper !== false;
   const fixedOn = rk.fixedContracts?.enabled === true;
@@ -470,7 +518,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
 
   let buyingPower = 0;
   try { buyingPower = parseFloat((await alpaca.getAccount()).buying_power) || 0; } catch {}
-  const budgetTarget = effectiveBudget > 0 ? effectiveBudget : riskPremium;
+  const budgetTarget = effectiveBudget > 0 ? effectiveBudget : tradeBudget;
   const budgetForSizing = buyingPower > 0 ? Math.min(budgetTarget, buyingPower) : budgetTarget;
   const budgetClampedByCash = buyingPower > 0 && budgetTarget > buyingPower;
 
@@ -628,13 +676,13 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       };
     }
     if (!confirm) {
-      const sized = shares.size(spot, lv.stop, riskPremium * flowMult, buyingPower, cfg,
+      const sized = shares.size(spot, lv.stop, tradeBudget * flowMult, buyingPower, cfg,
                                 { notionalBudget: effectiveBudget });
       return {
         status: "PREVIEW", instrument: "shares", ticker, side, spot: +spot.toFixed(2),
         triggered, firstFiveMinClose: fmc,
         triggerNote: `${side} trigger: ${lv.triggerDir} ${lv.trigger}`,
-        levels: lv, shares: sized,
+        levels: lv, shares: sized, budgetPlan,
         flow: decision ? { stance: decision.stance, sizeMultiplier: decision.sizeMultiplier } : null,
         note: `${shareReason} — would trade shares instead`,
         rrAtFill,
@@ -652,7 +700,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
     }
     const res = await shares.enter({
       ticker, side, spot, stop: lv.stop,
-      riskBudget: riskPremium * flowMult,
+      riskBudget: tradeBudget * flowMult,
       // The budget now caps NOTIONAL too, not just risk-at-stop. Without it the
       // only ceiling was 10% of buying power — see the note in shares.js.
       notionalBudget: effectiveBudget,
@@ -686,6 +734,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   if (!prem) throw new Error("no option quote available to size the trade");
 
   const sized = sizeOrder({ prem, budget: budgetForSizing, budgetTarget, buyingPower, rk, cheaperSearch });
+  if (sized.sizing) sized.sizing.hardBudgetCap = hardCap;
   if (sized.status) {
     return {
       ...sized, ticker, side,
@@ -719,8 +768,8 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
         symbol: call.symbol, strike: call.strike, expiry: call.expiry, dte: call.dte,
         moneyness: call.moneyness, bid: call.bid, ask: call.ask, mid: call.mid,
       },
-      premium: prem, contracts, cost, sizing,
-      budget: riskPremium, effectiveBudget, overBudget: cost > budgetForSizing,
+      premium: prem, contracts, cost, sizing, budgetPlan,
+      budget: tradeBudget, effectiveBudget, overBudget: cost > budgetForSizing,
       flow: flowSummary,
       flowBlocked: flowBlock,
       selection: rrPick ? {
@@ -761,7 +810,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       contracts, quotedMid: prem, sizing,
       levels: { trigger: lv.trigger, stop: lv.stop, t1: lv.t1, t2: lv.t2 },
       snapLevels: { pTrans: snap.levels.pTrans, nTrans: snap.levels.nTrans },
-      entryBudget: riskPremium, effectiveBudget, flowMult,
+      entryBudget: tradeBudget, effectiveBudget, flowMult, budgetPlan,
       flowAtEntry: flowSummary,
       triggeredBy: triggered ? "5min-close" : "forced",
       rrAtFill,
@@ -1169,6 +1218,17 @@ export function createPositionFromFill(w) {
 
 export function listAll() { return load(); }
 
+// Cash already committed to OPEN positions, at COST — not at current value.
+// A budget is about what you have spent, not what it happens to be worth today;
+// marking to market would let a winning book quietly free up room to add risk.
+export function deployedCapital() {
+  return load()
+    .filter((p) => p.status === "OPEN")
+    .reduce((acc, p) => acc + (p.instrument === "shares"
+      ? (p.entryPrice || 0) * (p.shares || 0)
+      : (p.entryPremium || 0) * (p.contracts || 0) * 100), 0);
+}
+
 // Insert a position discovered at the broker rather than opened by us. Separate
 // from createPositionFromFill so the two paths can never be confused: one is a
 // trade we planned, the other is a trade we found.
@@ -1268,8 +1328,11 @@ export async function exitTrade({ id, reason = "manual", urgency = null, qty = n
     }
     const order = await shares.exit({ ticker: p.ticker, side: p.side || "long", shares: p.shares });
     const xf = await alpaca.waitForFill(order.id).catch(() => ({ filled: false, price: null }));
+    // Real-time first. This is only the FALLBACK when the fill price isn't back
+    // yet, but a 15-minute-stale number here lands straight in realizedPnl and
+    // then in the history tab as though it were a fill.
     let last = null;
-    try { last = await alpaca.getLatestTrade(p.ticker, "delayed_sip"); } catch {}
+    try { last = (await alpaca.getSpotLive(p.ticker)).price; } catch {}
     const exitPx = xf.filled && xf.price ? xf.price : (last != null ? +last.toFixed(2) : null);
     p.status = "CLOSED"; p.exitReason = reason; p.exitDate = iso(new Date());
     p.exitPrice = exitPx; p.exitFilled = Boolean(xf.filled); p.exitOrderId = order.id;
