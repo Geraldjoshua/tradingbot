@@ -146,6 +146,19 @@ export default function GexView() {
   const callWallStrike = nearestTo(gex?.callWall?.strike);
   const putWallStrike = nearestTo(gex?.putWall?.strike);
 
+  // Where a PUT trade actually takes profit — which is NOT the put wall.
+  // The put wall is where a short is TRIGGERED (dealers flip from buying weakness
+  // to selling it); the target is a measured move BELOW it, the same
+  // nTrans - (pTrans - nTrans) that playbook.levelsFor(snap,"short") computes.
+  // Without this marker the chart showed where to ENTER puts and nowhere to
+  // exit them, which reads as though the put wall were the target.
+  const putTargetStrike = (() => {
+    const flip = gex?.flipFound === false ? null : gex?.gammaFlip;
+    const pw = gex?.putWall?.strike;
+    if (flip == null || pw == null || flip <= pw) return null;
+    return nearestTo(pw - (flip - pw));
+  })();
+
   return (
     <div>
       <div className="panel">
@@ -304,11 +317,26 @@ export default function GexView() {
                 const isFlip = p.strike === flipStrike;
                 const isCall = p.strike === callWallStrike;
                 const isPut = p.strike === putWallStrike;
+                const isPutTgt = p.strike === putTargetStrike && !isPut;
                 // spot wins over flip wins over a wall, so one row never tries to
                 // render two markers in a box sized for one.
-                const marker = isSpot ? "spot" : isFlip ? "flip" : isCall ? "call wall" : isPut ? "put wall" : "";
+                const marker = isSpot ? "spot" : isFlip ? "flip" : isCall ? "call wall"
+                  : isPut ? "put wall" : isPutTgt ? "put target" : "";
+                // What the level is FOR, not just what it is called. A chart that
+                // says "flip" assumes you remember that the flip is the long
+                // trigger; saying so removes the step.
+                // ENTRY vs EXIT stated explicitly. "PUTS below" was ambiguous —
+                // it reads as "puts profit below here" when it means "puts are
+                // TRIGGERED below here". Those are opposite ends of the trade.
+                const role = isSpot ? "you are here"
+                  : isFlip ? "buy CALLS above · short stop"
+                  : isCall ? "CALL take-profit"
+                  : isPut ? "CALL stop-out · buy PUTS below"
+                  : isPutTgt ? "PUT take-profit"
+                  : "";
                 const colour = isSpot ? "var(--accent)" : isFlip ? "#e0b341"
-                  : isCall ? "var(--green)" : isPut ? "var(--red)" : "var(--muted)";
+                  : isCall ? "var(--green)" : isPut ? "var(--red)"
+                  : isPutTgt ? "var(--red)" : "var(--muted)";
                 return (
                   <div key={p.strike} style={{ display: "flex", alignItems: "center", height: 18, fontSize: 11 }}>
                     {/* Number and marker are SEPARATE fixed-width cells. Previously
@@ -322,11 +350,35 @@ export default function GexView() {
                     }}>
                       {p.strike}
                     </div>
-                    <div style={{
-                      width: 62, paddingRight: 6, color: colour, fontWeight: 700,
-                      whiteSpace: "nowrap", overflow: "hidden", fontSize: 10,
-                    }}>
-                      {marker ? `◄ ${marker}` : ""}
+                    {/* Fixed width is deliberate — the bars must start at the same
+                        x on every row or the chart stops being readable. So the
+                        label cannot flex, and the question becomes what happens
+                        when text is too long for it.
+
+                        nowrap already makes the original bug impossible: it can
+                        never spill onto a second line and bleed into the row
+                        below. What it COULD still do is clip, and plain
+                        overflow:hidden clips silently — you would read a
+                        truncated label as the whole label.
+
+                        ellipsis makes truncation visible, and title puts the full
+                        text one hover away. So the worst case is now "…" plus a
+                        tooltip, not a wrong label and not a broken layout. */}
+                    <div
+                      title={marker ? `${p.strike} — ${marker}: ${role}` : undefined}
+                      style={{
+                        width: 250, paddingRight: 8, color: colour, fontWeight: 700,
+                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                        fontSize: 10,
+                      }}>
+                      {marker && (
+                        <>
+                          ◄ {marker}
+                          <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+                            {" · "}{role}
+                          </span>
+                        </>
+                      )}
                     </div>
                     <div style={{ position: "relative", flex: 1, height: "100%", borderLeft: "1px solid var(--border)" }}>
                       <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "var(--border)" }} />
@@ -346,6 +398,33 @@ export default function GexView() {
               Green = positive GEX (dealers buy dips / sell rips near these strikes → resistance-ish).
               Red = negative GEX (support-ish). Biggest bars are the call/put walls.
             </p>
+            <div className="sub" style={{ marginTop: 6, lineHeight: 1.7 }}>
+              <b>Reading the three marked levels</b> — these are the same ones the auto-trader
+              uses, from <code>playbook.levelsFor()</code>:
+              <br />
+              <b style={{ color: "#e0b341" }}>flip</b> — the pivot. Above it dealers hedge
+              against the move and price gets pulled up toward the call wall, so it is the LONG
+              trigger. Below it they hedge with the move and selling feeds selling.
+              <br />
+              <b style={{ color: "var(--green)" }}>call wall</b> — where call gamma concentrates.
+              Price tends to stall or pin here, which is why it is the target rather than a level
+              to break through.
+              <br />
+              <b style={{ color: "var(--red)" }}>put wall</b> — the support dealers are hedging.
+              It is the long STOP, and losing it is where a short STARTS: through it they sell
+              weakness instead of buying it. It is an entry for puts, not an exit.
+              <br />
+              <b style={{ color: "var(--red)" }}>put target</b> — where a put trade takes profit,
+              a measured move below the wall (the pTrans−nTrans band projected down). Only shown
+              when it falls inside the ±8% window.
+              <br />
+              <span style={{ color: "var(--muted)" }}>
+                Nothing here is filtered. The Vol Desk tab runs the same levels through grade,
+                cushion, spike-crash, R/R and OI-freshness, and only a CONFIRMED tag is tradeable —
+                so this chart can look clean on a name the bot refuses. It blocks the TRADE, never
+                this chart.
+              </span>
+            </div>
           </div>
         </>
       )}
