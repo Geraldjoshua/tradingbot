@@ -182,7 +182,19 @@ async function adoptOne(lp, cfg, mode = "protect") {
   return { ok: true, position: pos };
 }
 
-export async function reconcile({ apply = true, cfg = null } = {}) {
+// Single-flight. Two concurrent reconciles both load the store before either
+// writes, so both conclude the same position is untracked and both adopt it —
+// which is exactly how every row ended up duplicated. Callers that arrive while
+// one is running get the SAME promise rather than starting a second pass.
+let inFlight = null;
+
+export async function reconcile(opts = {}) {
+  if (inFlight) return inFlight;
+  inFlight = _reconcile(opts).finally(() => { inFlight = null; });
+  return inFlight;
+}
+
+async function _reconcile({ apply = true, cfg = null } = {}) {
   cfg = cfg || flow.loadConfig();
   const out = {
     ranAt: new Date().toISOString(),
@@ -345,6 +357,13 @@ export async function reconcile({ apply = true, cfg = null } = {}) {
     if (mode !== "off" && apply) {
       try {
         const r = await adoptOne(lp, cfg, mode);
+        if (r.ok && r.position?.duplicateSkipped) {
+          // Already tracked by a concurrent pass — not an error, but worth
+          // counting so a race shows up in the log instead of as a double row.
+          out.adopted.push({ symbol: lp.symbol, ticker: r.position.ticker,
+                             skipped: "already tracked (concurrent reconcile)" });
+          continue;
+        }
         if (r.ok) {
           const p = r.position;
           out.adopted.push({

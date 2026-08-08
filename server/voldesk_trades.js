@@ -831,6 +831,27 @@ export async function evaluatePositions() {
   const mgmt = cfgM.management || {};
   let dirty = false;
   const out = [];
+
+  // ---- THE BROKER IS THE SOURCE OF TRUTH FOR WHAT A POSITION IS WORTH -------
+  // P&L used to be computed from the bid/ask MID for options and from a
+  // delayed_sip spot for shares. Both are biased the same way, and it showed:
+  // across nine live positions our number was above Alpaca's on eight of them,
+  // by +$1,329 in total. COIN read +$645 against a real +$195 because the mid
+  // sat $1.50 above where the option actually marks; DOCN shares read +$94
+  // against a real -$203 purely because the underlying quote was fifteen minutes
+  // old.
+  //
+  // A mid is not a price you can get — it is the average of two you can. Alpaca
+  // already publishes unrealized_pl and current_price per position, computed the
+  // same way the Paper tab displays them. Using that removes the discrepancy by
+  // construction instead of trying to reproduce it.
+  //
+  // One request for every position, so this costs a single call per pass.
+  let brokerBySymbol = new Map();
+  try {
+    const live = await alpaca.getPositions();
+    brokerBySymbol = new Map(live.map((x) => [x.symbol, x]));
+  } catch { /* fall back to our own estimate below, and say so */ }
   for (const p of open) {
     const side = p.side || "long";
     const isShares = p.instrument === "shares";
@@ -840,22 +861,57 @@ export async function evaluatePositions() {
     let stopLevel = p.stopLevel ?? (side === "short" ? p.pTrans : p.nTrans);
     const trigger = p.trigger ?? (side === "short" ? p.nTrans : p.pTrans);
 
-    let spot = null, optMid = null;
-    try { spot = await alpaca.getLatestTrade(p.ticker, "delayed_sip"); } catch {}
+    const heldSym = isShares ? p.ticker : p.optionSymbol;
+    const broker = brokerBySymbol.get(heldSym) || null;
+
+    // Underlying spot: real-time first. This feeds Stop 1 and Stop 2, so a stale
+    // reading here means a late stop, not just a wrong number on screen.
+    let spot = null, spotFeed = null;
+    if (isShares && broker?.current_price) {
+      // For a share position the broker's own mark IS the underlying price, and
+      // it is authoritative — no reason to ask a data feed for it.
+      spot = parseFloat(broker.current_price) || null;
+      spotFeed = "broker";
+    }
+    if (spot == null) {
+      try {
+        const sp = await alpaca.getSpotLive(p.ticker);
+        spot = sp.price; spotFeed = sp.feedUsed;
+      } catch {}
+    }
+
+    // Option mark: the broker's, not our mid.
+    let optMid = null, markSource = null, ourMid = null;
     if (!isShares) {
       try {
         const q = (await alpaca.getOptionQuotes([p.optionSymbol]))[p.optionSymbol]?.latestQuote;
-        if (q) optMid = +(((q.bp + q.ap) / 2) || 0).toFixed(2);
+        if (q && q.ap > 0) ourMid = +(((q.bp + q.ap) / 2) || 0).toFixed(2);
       } catch {}
+      const bmark = broker ? parseFloat(broker.current_price) : NaN;
+      if (Number.isFinite(bmark) && bmark > 0) { optMid = bmark; markSource = "broker"; }
+      else if (ourMid != null) { optMid = ourMid; markSource = "mid-estimate"; }
     }
 
     const daysHeld = tradingDaysBetween(p.entryDate, iso(new Date()));
     const progress = playbook.progressToTarget(side, spot, p.entrySpot, p.t1);
     // Long options and short options are both LONG PREMIUM, so P&L is the same
     // formula either way. Shares invert with side.
-    const optPnl = isShares
-      ? (spot != null ? +(((side === "short" ? p.entryPrice - spot : spot - p.entryPrice) * p.shares)).toFixed(0) : null)
-      : (optMid != null ? +(((optMid - p.entryPremium) * p.contracts * 100)).toFixed(0) : null);
+    // Prefer the broker's own unrealized P&L — it is the number the Paper tab
+    // shows, so the two views can no longer disagree.
+    const brokerPnl = broker ? parseFloat(broker.unrealized_pl) : NaN;
+    // Our OWN estimate, deliberately computed from our own inputs — the mid for
+    // options, the data-feed spot for shares. It must not reuse the broker's mark,
+    // or it stops being an independent second opinion and just echoes the first.
+    // Keeping it visible is how the next divergence gets noticed instead of
+    // silently resolved in the broker's favour.
+    const estPnl = isShares
+      ? (spotFeed !== "broker" && spot != null && p.entryPrice != null
+          ? +(((side === "short" ? p.entryPrice - spot : spot - p.entryPrice) * (p.shares || 0))).toFixed(0)
+          : null)     // broker supplied the mark: nothing independent to compare
+      : (ourMid != null && p.entryPremium != null
+          ? +(((ourMid - p.entryPremium) * (p.contracts || 0) * 100)).toFixed(0) : null);
+    const optPnl = Number.isFinite(brokerPnl) ? +brokerPnl.toFixed(0) : estPnl;
+    const pnlSource = Number.isFinite(brokerPnl) ? "broker" : "estimate";
 
     // Adverse/favourable are direction-aware: for a short, "spot above stop" is
     // the stop-out and "spot at/below t1" is the target.
@@ -1058,6 +1114,14 @@ export async function evaluatePositions() {
       currentSpot: spot != null ? +spot.toFixed(2) : null, optMid, optPnl, daysHeld,
       effectiveStop: stopLevel, dteLeft,
       manageMode: p.manageMode || "full", adopted: Boolean(p.adopted),
+      pnlSource, spotFeed, markSource,
+      // Both numbers, so a divergence is visible rather than silently resolved.
+      pnlEstimate: estPnl, midEstimate: ourMid,
+      // How far our own mid-based read is from the broker's. On live positions
+      // this ran to +$1,329 across nine rows, always in the same direction.
+      pnlGap: (estPnl != null && Number.isFinite(brokerPnl))
+        ? +(estPnl - brokerPnl).toFixed(0) : null,
+      marketValue: broker ? parseFloat(broker.market_value) : null,
       peakValue: p.peakValue ?? null,
       ...(prDetail ? { profitRatchet: prDetail } : {}),
       progressPct: +(progress * 100).toFixed(0), action, reason, urgent });
@@ -1110,9 +1174,45 @@ export function listAll() { return load(); }
 // trade we planned, the other is a trade we found.
 export function adoptPosition(pos) {
   const rows = load();
+  // IDEMPOTENT ON PURPOSE. Every position appeared TWICE in the UI, because
+  // boot() fires reconcile directly AND immediately calls tick(), which fires it
+  // again — both read the store before either wrote, so both saw the same
+  // position as untracked and both adopted it. Re-reading `rows` here is the
+  // last line of defence: whatever races upstream, a symbol can only be OPEN
+  // once. Cheaper and more reliable than trying to make every caller careful.
+  const sym = pos.instrument === "shares" ? pos.ticker : pos.optionSymbol;
+  const dupe = rows.find((r) => r.status === "OPEN"
+    && (r.instrument === "shares" ? r.ticker : r.optionSymbol) === sym);
+  if (dupe) return { ...dupe, duplicateSkipped: true };
   rows.push(pos);
   persist(rows);
   return pos;
+}
+
+// Collapse duplicates that were written before adoptPosition became idempotent.
+// Keeps the earliest OPEN row per symbol (it has the longer history) and marks
+// the rest CANCELED with a reason, rather than deleting — a position that was
+// real enough to display is real enough to keep a record of.
+export function dedupeOpen() {
+  const rows = load();
+  const seen = new Map();
+  const collapsed = [];
+  for (const r of rows) {
+    if (r.status !== "OPEN") continue;
+    const sym = r.instrument === "shares" ? r.ticker : r.optionSymbol;
+    if (!sym) continue;
+    const keep = seen.get(sym);
+    if (!keep) { seen.set(sym, r); continue; }
+    const loser = (r.adoptedAt || r.entryDate || "") < (keep.adoptedAt || keep.entryDate || "") ? keep : r;
+    const winner = loser === keep ? r : keep;
+    seen.set(sym, winner);
+    loser.status = "CANCELED";
+    loser.exitReason = "duplicate adoption collapsed (same symbol already tracked)";
+    loser.exitDate = iso(new Date());
+    collapsed.push({ symbol: sym, id: loser.id });
+  }
+  if (collapsed.length) persist(rows);
+  return { collapsed, remaining: seen.size };
 }
 
 // ---- Store maintenance (used by reconcile.js) -----------------------------

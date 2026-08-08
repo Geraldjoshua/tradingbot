@@ -203,6 +203,16 @@ export interface VolDeskPosition {
   urgent: boolean;
   lockedToBreakeven?: boolean;
   t1Taken?: boolean;
+  // P&L provenance. "broker" = Alpaca's own unrealized_pl, which is what the
+  // Paper tab shows. "estimate" = our mid-based calculation, used only when the
+  // broker has no row for the symbol.
+  pnlSource?: "broker" | "estimate";
+  pnlEstimate?: number | null;
+  midEstimate?: number | null;
+  pnlGap?: number | null;
+  marketValue?: number | null;
+  spotFeed?: string | null;
+  markSource?: string | null;
   manageMode?: "full" | "protect";
   adopted?: boolean;
   peakValue?: number | null;

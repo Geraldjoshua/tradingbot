@@ -107,6 +107,29 @@ export async function getSnapshots(symbols) {
   return j.snapshots || j; // shape: { SYM: { latestTrade, dailyBar, prevDailyBar, ... } }
 }
 
+// Real-time-first spot, with the delayed tape as the fallback.
+//
+// WHY THIS EXISTS: every caller used getLatestTrade(t, "delayed_sip"), which is
+// FIFTEEN MINUTES STALE. For a P&L display that is merely wrong; for Stop 1
+// ("spot below nTrans") and Stop 2 it means the stop is evaluated against a price
+// from a quarter of an hour ago, so it fires late by exactly that much. Observed
+// live: DOCN priced at 125.80 here while the broker had 124.15 — a $1.65 gap that
+// flipped a share position from +$94 to -$203.
+//
+// iex is real-time but only IEX's own prints. On a thin name its last print can
+// itself be old, so a null/zero result falls back to the consolidated tape rather
+// than being trusted. `feedUsed` is returned so a stale reading is never mistaken
+// for a live one.
+export async function getSpotLive(symbol) {
+  for (const feed of ["iex", "delayed_sip"]) {
+    try {
+      const p = await getLatestTrade(symbol, feed);
+      if (p > 0) return { price: p, feedUsed: feed, realtime: feed === "iex" };
+    } catch { /* try the next feed */ }
+  }
+  return { price: null, feedUsed: null, realtime: false };
+}
+
 export async function getLatestTrade(symbol, feed = FEED) {
   const u = new URL(`${DATA}/v2/stocks/trades/latest`);
   u.searchParams.set("symbols", symbol);

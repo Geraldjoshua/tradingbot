@@ -691,8 +691,23 @@ export function boot() {
   // Overnight (or any downtime) the broker kept living while we didn't. Sync the
   // local store to reality BEFORE the loop starts managing anything, so we never
   // chase a position that no longer exists or ignore one that silently filled.
+  // Collapse any duplicate rows written before adoptPosition became idempotent.
+  try {
+    const d = vd.dedupeOpen();
+    if (d.collapsed.length) {
+      log("info", "duplicates-collapsed", {
+        count: d.collapsed.length,
+        symbols: d.collapsed.map((x) => x.symbol).join(" "),
+        note: "written by two reconciles racing at boot; now prevented at the source",
+      });
+    }
+  } catch {}
+
   reconcile.reconcile({ apply: true })
     .then((r) => {
+      // Stamp the clock so the first tick does not immediately reconcile again.
+      // Not doing so is half of why positions were adopted twice.
+      try { const st = loadState(); st.lastReconcileAt = Date.now(); saveState(st); } catch {}
       log(r.untracked.length || r.phantomsClosed.length ? "error" : "info",
         "reconciled-with-broker", {
           summary: reconcile.summarize(r),

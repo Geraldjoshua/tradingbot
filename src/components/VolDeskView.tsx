@@ -198,8 +198,34 @@ export default function VolDeskView() {
                       <td>{positionQty(p)}</td>
                       <td>{entryOf(p)}</td>
                       <td>{p.optMid ?? "—"}</td>
-                      <td className={(p.optPnl ?? 0) >= 0 ? "pos" : "neg"}>{p.optPnl == null ? "—" : `$${p.optPnl}`}</td>
-                      <td>{p.currentSpot ?? "—"}</td>
+                      <td className={(p.optPnl ?? 0) >= 0 ? "pos" : "neg"}
+                          title={p.pnlSource === "broker"
+                            ? `Alpaca unrealized_pl${p.pnlGap ? ` · our mid-based estimate said $${p.pnlEstimate} (${p.pnlGap > 0 ? "+" : ""}${p.pnlGap} off)` : ""}`
+                            : "our own estimate — the broker had no row for this symbol"}>
+                        {p.optPnl == null ? "—" : `$${p.optPnl}`}
+                        {/* A large gap means the bid/ask is wide enough that the mid
+                            is not a price you could get. Worth seeing before you
+                            decide whether a winner is really a winner. */}
+                        {p.pnlGap != null && Math.abs(p.pnlGap) >= 100 && (
+                          <span style={{ color: "#e0b341", fontSize: 10 }} title={
+                            `Our mid-based estimate was $${p.pnlEstimate}, $${Math.abs(p.pnlGap)} `
+                            + `${p.pnlGap > 0 ? "higher" : "lower"} than the broker. Wide spread — `
+                            + `the mid is not a fill.`}> ⚠</span>
+                        )}
+                        {p.pnlSource === "estimate" && (
+                          <span style={{ color: "var(--muted)", fontSize: 10 }}
+                            title="estimate: the broker has no position row for this symbol"> ~</span>
+                        )}
+                      </td>
+                      <td title={p.spotFeed === "broker" ? "broker mark"
+                        : p.spotFeed === "iex" ? "real-time (IEX)"
+                        : p.spotFeed === "delayed_sip" ? "15-MIN DELAYED — stops are evaluated on this"
+                        : undefined}>
+                        {p.currentSpot ?? "—"}
+                        {p.spotFeed === "delayed_sip" && (
+                          <span style={{ color: "#e0b341", fontSize: 10 }} title="15-minute delayed feed"> ⏱</span>
+                        )}
+                      </td>
                       <td>{p.progressPct}%</td>
                       <td title={p.stopRatchet ? `ratcheted to ${p.stopRatchet.movedTo} on ${p.stopRatchet.on}` : undefined}>
                         {p.effectiveStop ?? p.stopLevel ?? "—"}
@@ -216,6 +242,21 @@ export default function VolDeskView() {
                 </tbody>
               </table>
             </div>
+            {(() => {
+              const gaps = positions.filter((p) => p.pnlGap != null && Math.abs(p.pnlGap!) >= 100);
+              const total = positions.reduce((a, p) => a + (p.optPnl ?? 0), 0);
+              return (
+                <p className="hint" style={{ marginTop: 6 }}>
+                  Total unrealized <b className={total >= 0 ? "pos" : "neg"}>${total.toFixed(0)}</b>
+                  {" — from Alpaca's own numbers, so this matches the Paper trading tab."}
+                  {gaps.length > 0 && (
+                    <> {" "}⚠ {gaps.length} position{gaps.length > 1 ? "s" : ""} where our mid-based
+                    estimate differs by over $100 ({gaps.map((g) => g.ticker).join(", ")}) — wide
+                    spreads, so the mid is not a price you could get out at.</>
+                  )}
+                </p>
+              );
+            })()}
             <div style={{ marginTop: 8 }}>
               {positions.map((p) => (
                 <p key={p.id} className="hint" style={{ margin: "2px 0" }}>
