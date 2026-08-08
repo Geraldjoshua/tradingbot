@@ -1,4 +1,5 @@
 import { useState } from "react";
+import ErrorBoundary from "./components/ErrorBoundary";
 import FaberView from "./components/FaberView";
 import PaperTradingView from "./components/PaperTradingView";
 import GexView from "./components/GexView";
@@ -24,9 +25,13 @@ export default function App() {
         <button className={`tab ${tab === "flow" ? "active" : ""}`} onClick={() => setTab("flow")}>Flow</button>
         <button className={`tab ${tab === "history" ? "active" : ""}`} onClick={() => setTab("history")}>History</button>
       </div>
-      {tab === "backtest" ? <FaberView /> : tab === "paper" ? <PaperTradingView /> :
-       tab === "gex" ? <GexView /> : tab === "voldesk" ? <VolDeskView /> :
-       tab === "auto" ? <AutoTraderView /> : tab === "flow" ? <FlowUploadView /> : <HistoryView />}
+      {/* Keyed by tab so switching tabs clears a previous crash rather than
+          leaving the boundary latched on the error from another view. */}
+      <ErrorBoundary name={tab} key={tab}>
+        {tab === "backtest" ? <FaberView /> : tab === "paper" ? <PaperTradingView /> :
+         tab === "gex" ? <GexView /> : tab === "voldesk" ? <VolDeskView /> :
+         tab === "auto" ? <AutoTraderView /> : tab === "flow" ? <FlowUploadView /> : <HistoryView />}
+      </ErrorBoundary>
     </div>
   );
 }

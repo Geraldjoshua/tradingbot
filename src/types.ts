@@ -154,19 +154,40 @@ export interface VolDeskSnapshot {
   error?: string;
 }
 
+// A position is EITHER an option or shares, and the option-only fields are
+// genuinely absent on a share row. They were typed as required, which is why
+// `p.expiry.slice(5)` compiled happily and then threw at runtime the first time
+// the share fallback fired. Optional is the truth.
 export interface VolDeskPosition {
   id: string;
   ticker: string;
-  optionSymbol: string;
-  strike: number;
-  expiry: string;
-  dte: number;
-  contracts: number;
-  entryPremium: number;
+  side?: "long" | "short";
+  instrument?: "option" | "shares";
+
+  // ---- options only ----
+  optionSymbol?: string;
+  optionType?: "call" | "put";
+  strike?: number;
+  expiry?: string;
+  dte?: number;
+  dteLeft?: number | null;
+  contracts?: number;
+  entryPremium?: number;
+
+  // ---- shares only ----
+  shares?: number;
+  entryPrice?: number;
+  notional?: number;
+  sizedBy?: string;
+  riskAtStop?: number;
+
   entryDate: string;
   entrySpot: number;
   pTrans: number;
   nTrans: number;
+  trigger?: number;
+  stopLevel?: number;
+  effectiveStop?: number;      // after the ratchet has moved it
   t1: number;
   t2: number;
   status: string;
@@ -175,10 +196,19 @@ export interface VolDeskPosition {
   optPnl: number | null;
   daysHeld: number;
   progressPct: number;
-  action: "HOLD" | "WATCH" | "EXIT" | "T1_HIT";
+  // T1_INFO = target reached on a protect-mode position and deliberately NOT
+  // auto-sold. T2_HIT = a scale-out runner reaching its second target.
+  action: "HOLD" | "WATCH" | "EXIT" | "T1_HIT" | "T1_INFO" | "T2_HIT";
   reason: string;
   urgent: boolean;
   lockedToBreakeven?: boolean;
+  t1Taken?: boolean;
+  manageMode?: "full" | "protect";
+  adopted?: boolean;
+  peakValue?: number | null;
+  profitRatchet?: { peak: number; floor: number; peakGainPct: number; stillUpPct: number };
+  stopRatchet?: { at: number; lock: number; movedTo: number; on: string; progressPct: number };
+  progressLog?: { d: string; p: number }[];
 }
 
 // ---- Trade history --------------------------------------------------------

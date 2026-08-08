@@ -4,7 +4,28 @@ import type { VolDeskSnapshot, VolDeskPosition } from "../types";
 
 const ACTION_COLOR: Record<string, string> = {
   HOLD: "var(--green)", T1_HIT: "var(--accent)", WATCH: "#e0b341", EXIT: "var(--red)",
+  // T1_INFO: target reached on a protect-mode position, deliberately not sold.
+  T1_INFO: "var(--accent)", T2_HIT: "var(--accent)",
 };
+
+// A share position has no strike and no expiry. Reading them unguarded is what
+// blanked this tab: `p.expiry.slice(5)` on a shares row throws, and with no error
+// boundary React unmounted the whole page.
+function describeInstrument(p: VolDeskPosition): string {
+  if (p.instrument === "shares") return `${p.shares ?? "?"} sh`;
+  const strike = p.strike != null ? `${p.strike}${p.optionType === "put" ? "p" : "c"}` : "?";
+  const exp = p.expiry ? ` ${p.expiry.slice(5)}` : "";
+  return `${strike}${exp}`;
+}
+
+function positionQty(p: VolDeskPosition): number | string {
+  return p.instrument === "shares" ? (p.shares ?? "—") : (p.contracts ?? "—");
+}
+
+function entryOf(p: VolDeskPosition): number | string {
+  const v = p.instrument === "shares" ? p.entryPrice : p.entryPremium;
+  return v ?? "—";
+}
 
 const TAG_COLOR: Record<string, string> = {
   CONFIRMED: "var(--green)",
@@ -148,23 +169,44 @@ export default function VolDeskView() {
               <table>
                 <thead>
                   <tr>
-                    <th>Ticker</th><th>Contract</th><th>Qty</th><th>Entry prem</th><th>Opt now</th>
-                    <th>Opt P/L</th><th>Spot</th><th>Prog→T1</th><th>Days</th><th>Action</th><th></th>
+                    <th>Ticker</th><th>Position</th><th>Qty</th><th>Entry</th><th>Now</th>
+                    <th>P/L</th><th>Spot</th><th>Prog→T1</th><th>Stop</th><th>Days/DTE</th><th>Action</th><th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {positions.map((p) => (
                     <tr key={p.id} style={{ background: p.urgent ? "rgba(239,83,80,.08)" : undefined }}>
-                      <td>{p.ticker}</td>
-                      <td>{p.strike}c {p.expiry.slice(5)}</td>
-                      <td>{p.contracts}</td>
-                      <td>{p.entryPremium}</td>
+                      <td>
+                        {p.ticker}
+                        {p.instrument === "shares" && (
+                          <span className="badge" style={{ marginLeft: 4, fontSize: 10 }}>SHARES</span>
+                        )}
+                        {p.adopted && (
+                          <span className="badge" style={{ marginLeft: 4, fontSize: 10, color: "#e0b341" }}
+                            title="found at the broker and adopted — levels re-derived from a fresh scan">
+                            ADOPTED
+                          </span>
+                        )}
+                        {p.manageMode === "protect" && (
+                          <span className="badge" style={{ marginLeft: 4, fontSize: 10, color: "var(--muted)" }}
+                            title="protect mode: stops only. No time stop, no auto-take-profit.">
+                            PROTECT
+                          </span>
+                        )}
+                      </td>
+                      <td>{describeInstrument(p)}</td>
+                      <td>{positionQty(p)}</td>
+                      <td>{entryOf(p)}</td>
                       <td>{p.optMid ?? "—"}</td>
                       <td className={(p.optPnl ?? 0) >= 0 ? "pos" : "neg"}>{p.optPnl == null ? "—" : `$${p.optPnl}`}</td>
                       <td>{p.currentSpot ?? "—"}</td>
                       <td>{p.progressPct}%</td>
-                      <td>{p.daysHeld}</td>
-                      <td style={{ color: ACTION_COLOR[p.action], fontWeight: 700 }}>{p.action.replace("_", " ")}</td>
+                      <td title={p.stopRatchet ? `ratcheted to ${p.stopRatchet.movedTo} on ${p.stopRatchet.on}` : undefined}>
+                        {p.effectiveStop ?? p.stopLevel ?? "—"}
+                        {p.lockedToBreakeven && <span style={{ color: "var(--green)" }} title="stop moved to entry or better"> ●</span>}
+                      </td>
+                      <td>{p.daysHeld}{p.dteLeft != null ? ` / ${p.dteLeft}d` : ""}</td>
+                      <td style={{ color: ACTION_COLOR[p.action], fontWeight: 700 }}>{(p.action || "—").replace(/_/g, " ")}</td>
                       <td style={{ whiteSpace: "nowrap" }}>
                         {p.action === "T1_HIT" && <button className="ghost" onClick={() => doLock(p.id)}>Lock</button>}{" "}
                         <button className="ghost danger" onClick={() => doExit(p.id, p.reason)}>Exit</button>
@@ -177,7 +219,9 @@ export default function VolDeskView() {
             <div style={{ marginTop: 8 }}>
               {positions.map((p) => (
                 <p key={p.id} className="hint" style={{ margin: "2px 0" }}>
-                  <b style={{ color: ACTION_COLOR[p.action] }}>{p.ticker} {p.action.replace("_", " ")}</b> — {p.reason}
+                  <b style={{ color: ACTION_COLOR[p.action] || "var(--muted)" }}>
+                    {p.ticker} {(p.action || "—").replace(/_/g, " ")}
+                  </b> — {p.reason}
                 </p>
               ))}
             </div>
