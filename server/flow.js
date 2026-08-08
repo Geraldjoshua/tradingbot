@@ -236,10 +236,55 @@ const DEFAULTS = {
     // Never carry a long-premium position into the gamma/theta cliff. If the
     // thesis needed 45 days and has had 35 of them, it isn't working.
     minDteExit: 10,
+    // ---- PROFIT RATCHET: a trailing stop that knows nothing about the thesis --
+    // stopRatchet above measures progress toward T1, which is fine for a trade
+    // the bot planned and meaningless for one you placed yourself — T1 is not
+    // your target. But "don't let a +150% winner become a loser" is not a view
+    // about where price is going; it is risk management, and risk applies to
+    // every position regardless of who opened it.
+    //
+    // So this trails the position's OWN P&L. It arms only after a real gain, and
+    // then refuses to give back more than `giveBackPct` OF THAT GAIN (not of the
+    // premium). Entry 8.00, peak 16.00 -> floor 12.80, still +60%. It never
+    // decides when to take profit; it decides when a profit has been handed back.
+    //
+    // Options are noisy, so armAtGainPct is deliberately high — a trailing stop
+    // that arms at +15% would be stopped out by ordinary two-day chop.
+    profitRatchet: {
+      enabled: true,          // applies to protect-mode positions
+      alsoInFullMode: false,  // full mode already has T1 + the T1-progress ratchet
+      armAtGainPct: 0.50,     // only once the position is up 50%
+      giveBackPct: 0.40,      // then keep 60% of the peak gain
+    },
+  },
+  // Keeping the local store honest against the broker.
+  reconcile: {
+    everyMinutes: 30,
+    // Two categories, opposite defaults.
+    //
+    // orphanMode — positions the BOT opened and lost track of. data/ is
+    //   gitignored and wiped on redeploy, so this happens routinely. These were
+    //   placed under the framework and belong back under it: "full".
+    //
+    // adoptUntracked — positions the bot has never seen, i.e. yours. "protect"
+    //   applies risk controls only (structural stop, drawdown, premium and DTE
+    //   backstops) and deliberately withholds the time stop, the stall stop, the
+    //   ratchet and auto-take-profit — those encode the GEX playbook's thesis,
+    //   not yours. "full" hands them over completely; "off" leaves them alone.
+    //
+    // Either way, levels are RE-DERIVED from a fresh Vol Desk scan and the entry
+    // is recovered from the broker's own fill ledger — nothing is invented.
+    orphanMode: "full",              // "full" | "protect" | "off"
+    adoptUntracked: "protect",       // "protect" | "full" | "off"
   },
   sides: { long: true, short: false },
   shares: {
-    enabled: true, minShares: 1, maxNotionalPct: 0.10,
+    enabled: true, minShares: 1,
+    // Notional <= this x the trade's budget. Was missing entirely, so the only
+    // ceiling was maxNotionalPct of buying power — on a paper account that meant
+    // a $6,000 budget could buy $25,000 of stock. See server/shares.js.
+    maxNotionalMultiple: 1.0,
+    maxNotionalPct: 0.10,
     allowShort: true, requireEasyToBorrow: true,
   },
   risk: {

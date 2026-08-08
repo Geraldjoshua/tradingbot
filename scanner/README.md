@@ -3,6 +3,7 @@
 Standalone. Does not touch the Vol Desk options bot, does not place orders.
 
 ```bash
+python3 scanner/check_setup.py                        # RUN THIS FIRST
 python3 scanner/momentum_scanner.py --once            # one pass
 python3 scanner/momentum_scanner.py                   # loop, 60s
 python3 scanner/momentum_scanner.py --interval 30 --min-gap 10 --risk-dollars 200
@@ -12,6 +13,15 @@ python3 scanner/test_core.py                          # 60 tests, no keys needed
 
 Needs `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment or `.env` at the
 project root. Stdlib only — no `pip install`.
+
+`check_setup.py` verifies the keys and, more usefully, reports **what this
+account is actually entitled to** — which data feeds answer, whether the free
+news API is live, and whether the option chain still carries the
+`open_interest_date` the GEX engine now enforces. Run it before the open, not
+at 09:31. `sip` failing is normal and expected on the free plan.
+
+**Never put keys in a `.py` or `.js` file.** `.env` is gitignored; source files
+are not, and they end up in commits and zips.
 
 ## Sessions
 

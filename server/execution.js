@@ -97,6 +97,10 @@ async function currentQuote(symbol, isOption) {
  */
 export async function execute({ symbol, qty, side, urgency = "patient", isOption = true, cfg = {} }) {
   const c = cfgFor(cfg);
+  // Underlying out of an OCC symbol (AAPL251219C00250000 -> AAPL) so the
+  // client_order_id the broker keeps is human-readable months later.
+  const tag = { kind: side === "buy" ? "entry" : "exit",
+                ticker: (/^([A-Z]+)\d{6}[CP]\d{8}$/.exec(symbol || "") || [, symbol])[1] };
   const profile = urgency === "urgent" ? c.urgent : c.patient;
 
   const q = await currentQuote(symbol, isOption);
@@ -104,7 +108,7 @@ export async function execute({ symbol, qty, side, urgency = "patient", isOption
     // No quote — fall back to a plain marketable order rather than doing nothing.
     const order = await alpaca.placeOrder({
       symbol, qty, side, type: "market", time_in_force: "day",
-    });
+    }, tag);
     const f = await alpaca.waitForFill(order.id, { timeoutMs: 15000 });
     return { ...f, orderId: order.id, rungs: [], note: "no quote — market order" };
   }
@@ -113,7 +117,7 @@ export async function execute({ symbol, qty, side, urgency = "patient", isOption
     const px = side === "buy" ? round2(q.ask * 1.02) : round2(q.bid * 0.98);
     const order = await alpaca.placeOrder({
       symbol, qty, side, type: "limit", limit_price: px, time_in_force: "day",
-    });
+    }, tag);
     const f = await alpaca.waitForFill(order.id, { timeoutMs: 20000 });
     return { ...f, orderId: order.id, rungs: [px], note: "ladder disabled — crossed" };
   }
@@ -131,7 +135,7 @@ export async function execute({ symbol, qty, side, urgency = "patient", isOption
 
     const order = await alpaca.placeOrder({
       symbol, qty, side, type: "limit", limit_price: px, time_in_force: "day",
-    });
+    }, tag);
     lastOrderId = order.id;
 
     // Give the rung its dwell time — but never overrun the tick budget.

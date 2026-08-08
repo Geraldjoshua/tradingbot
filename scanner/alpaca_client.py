@@ -121,16 +121,41 @@ def assets():
 
 
 # ---- Snapshots ------------------------------------------------------------
+# Set by snapshots() so callers can tell a quiet market from a dead connection.
+last_snapshot_status = {"chunks": 0, "failed": 0, "error": None}
+
+
 def snapshots(symbols, feed=None):
-    """{symbol: snapshot}. Chunked — the URL is the limit, not the API."""
+    """{symbol: snapshot}. Chunked — the URL is the limit, not the API.
+
+    A failed chunk is skipped so one bad request cannot kill a whole scan. But
+    skipping SILENTLY is how "every request 403'd" comes out looking identical to
+    "nothing gapped today", and those need opposite responses from you. So:
+    partial failures are recorded in `last_snapshot_status`, and if EVERY chunk
+    failed the error is raised rather than returned as an empty dict.
+
+    Found by running the setup checker behind a proxy that blocks Alpaca: it
+    cheerfully reported "OK — 0 symbols" for a connection that never succeeded.
+    """
     out = {}
+    chunks = failed = 0
+    first_error = None
     for group in chunked(list(symbols), 400):
+        chunks += 1
         params = {"symbols": ",".join(group), "feed": feed or VOL_FEED}
         try:
             data = _get(f"{DATA_BASE}/v2/stocks/snapshots?{urllib.parse.urlencode(params)}")
-        except AlpacaError:
-            continue                                  # skip the chunk, keep the scan alive
+        except AlpacaError as e:
+            failed += 1
+            first_error = first_error or e
+            continue
         out.update(data.get("snapshots") or data or {})
+
+    last_snapshot_status.update(
+        {"chunks": chunks, "failed": failed,
+         "error": str(first_error) if first_error else None})
+    if chunks and failed == chunks:
+        raise first_error or AlpacaError("every snapshot chunk failed")
     return out
 
 
@@ -143,7 +168,10 @@ def bars_multi(symbols, timeframe, start, end=None, feed=None, limit=10000):
     ~100 round trips; batched it is three or four.
     """
     out = {}
+    groups = failed = 0
+    first_error = None
     for group in chunked(list(symbols), 100):
+        groups += 1
         params = {
             "symbols": ",".join(group), "timeframe": timeframe,
             "start": start, "limit": limit, "feed": feed or VOL_FEED,
@@ -152,19 +180,29 @@ def bars_multi(symbols, timeframe, start, end=None, feed=None, limit=10000):
         if end:
             params["end"] = end
         token = None
+        got_any = False
         for _ in range(20):
             p = dict(params)
             if token:
                 p["page_token"] = token
             try:
                 data = _get(f"{DATA_BASE}/v2/stocks/bars?{urllib.parse.urlencode(p)}")
-            except AlpacaError:
+            except AlpacaError as e:
+                first_error = first_error or e
                 break
+            got_any = True
             for sym, arr in (data.get("bars") or {}).items():
                 out.setdefault(sym, []).extend(arr)
             token = data.get("next_page_token")
             if not token:
                 break
+        if not got_any:
+            failed += 1
+    # Same reasoning as snapshots(): a total failure must not masquerade as
+    # "this name simply had no prints", because one means fix your connection
+    # and the other means move on to the next ticker.
+    if groups and failed == groups:
+        raise first_error or AlpacaError("every bars request failed")
     for sym in out:
         out[sym].sort(key=lambda b: b.get("t", ""))
     return out

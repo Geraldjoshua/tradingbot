@@ -206,6 +206,20 @@ async function manage(cfg) {
         });
       } else if (!open) {
         continue;                 // nothing else is actionable with the market shut
+      } else if (p.action === "T1_INFO") {
+        // Protect mode: the bot will not bank a trade it did not plan. Say so
+        // once per day rather than every 60-second tick.
+        const st4 = loadState();
+        st4.t1Notified = st4.t1Notified || {};
+        if (st4.t1Notified[p.id] !== todayISO()) {
+          st4.t1Notified[p.id] = todayISO(); saveState(st4);
+          log("trade", "T1-reached-not-taken", {
+            ticker: p.ticker, id: p.id, t1: p.t1,
+            spot: p.currentSpot, unrealized: p.optPnl,
+            note: "protect mode — this position is yours to close. The structural stop "
+              + "is still being enforced.",
+          });
+        }
       } else if (p.action === "T2_HIT") {
         // The runner left over from a scale-out has reached T2 — close it out.
         const r = await vd.exitTrade({ id: p.id, reason: `auto: T2 runner @${p.t2}`, urgency: "patient" });
@@ -533,6 +547,60 @@ async function maybeAssess(cfg) {
   }
 }
 
+// ---- Periodic reconcile ----------------------------------------------------
+// This used to run ONCE, on boot. Everything it detects — a position closed by
+// hand, an entry that filled after we stopped looking, something at the broker
+// the store has never heard of — can happen at any point in a session, and until
+// the next restart the bot simply would not know. On a host that redeploys (and
+// wipes data/) that window can be the whole day.
+//
+// It is a handful of GETs, so running it every `reconcileEveryMin` is cheap. The
+// untracked warning is repeated on every pass rather than logged once at boot,
+// because an unmanaged position is an ongoing condition, not a startup event.
+async function maybeReconcile(cfg) {
+  try {
+    const st = loadState();
+    const gapMin = cfg.reconcile?.everyMinutes ?? 30;
+    if (st.lastReconcileAt && Date.now() - st.lastReconcileAt < gapMin * 60 * 1000) return;
+
+    const r = await reconcile.reconcile({ apply: true, cfg });
+    const st2 = loadState();
+    st2.lastReconcileAt = Date.now();
+    saveState(st2);
+
+    if (r.phantomsClosed.length || r.entriesResolved.length || r.adopted?.length) {
+      log("trade", "reconciled", {
+        summary: reconcile.summarize(r),
+        ...(r.adopted?.length
+          ? { ADOPTED: r.adopted.map((a) => `${a.symbol}(stop ${a.stop} t1 ${a.t1})`).join(" ") }
+          : {}),
+        ...(r.phantomsClosed.length
+          ? { closed: r.phantomsClosed.map((x) => x.ticker).join(" ") } : {}),
+      });
+    }
+    const st3 = loadState();
+    st3.lastUntracked = r.untracked.map((u) => ({
+      symbol: u.symbol, qty: u.qty, unrealizedPl: u.unrealizedPl,
+      marketValue: u.marketValue, adoptFailed: u.adoptFailed || null,
+    }));
+    saveState(st3);
+
+    if (r.untracked.length) {
+      log("error", "UNTRACKED-POSITIONS", {
+        count: r.untracked.length,
+        positions: r.untracked.map((u) => `${u.symbol}x${u.qty}(${u.unrealizedPl})`).join(" "),
+        ...(r.untracked.some((u) => u.adoptFailed)
+          ? { adoptFailed: r.untracked.filter((u) => u.adoptFailed)
+              .map((u) => `${u.symbol}:${u.adoptFailed}`).join("; ") } : {}),
+        note: "these are held at the broker with NO stop, target or time limit being "
+          + "applied. Set reconcile.adoptUntracked=true to manage them, or close by hand.",
+      });
+    }
+  } catch (e) {
+    log("error", "reconcile-failed", { error: String(e.message || e) });
+  }
+}
+
 // ---- Housekeeping: prune data/ once per day --------------------------------
 function maybeSweep(cfg) {
   try {
@@ -561,7 +629,8 @@ async function tick() {
     // and a fill here should be managed in the same tick.
     await advanceWorkingOrders(cfg);
     await manage(cfg);                            // always manage exits
-    await maybeAssess(cfg);                       // re-vet the observe list (once/day)
+    await maybeReconcile(cfg);                    // broker truth, not just at boot
+    await maybeAssess(cfg);                       // re-vet the observe list
     await enter(cfg);                             // enter only in full + hours
     maybeSweep(cfg);                              // bound disk growth (once/day)
   } catch (e) {
@@ -664,6 +733,10 @@ export function status() {
     observing, ready,
     dailyEntries: st.entries,
     openPositions: open,
+    // Last known unmanaged positions, so the UI can show them rather than
+    // leaving the condition buried in a log line from boot.
+    untracked: st.lastUntracked || [],
+    lastReconcileAt: st.lastReconcileAt || null,
     log: readJson(LOG, []).slice(-50).reverse(),
   };
 }

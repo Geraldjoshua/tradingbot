@@ -160,8 +160,42 @@ export async function getOrders(status = "open") {
   u.searchParams.set("nested", "true");
   return req(u);
 }
-export async function placeOrder(body) {
-  return req(`${TRADE}/v2/orders`, { method: "POST", body: JSON.stringify(body) });
+// ---- Order provenance -----------------------------------------------------
+// Every order the bot places carries a client_order_id it chose, so the BROKER
+// remembers which positions are ours.
+//
+// This exists because the local store cannot be trusted to. data/ is gitignored
+// and wiped on every redeploy, so the record that says "the bot opened this"
+// disappears in exactly the event that orphans the position — the evidence is
+// destroyed by the thing it was meant to explain. Alpaca's copy survives, so
+// after any data loss we can still ask the broker "was this mine?" and get a
+// real answer instead of guessing from an empty file.
+//
+// Alpaca requires client_order_id to be unique and <=128 chars. Keep it
+// alphanumeric + dashes; some characters are rejected.
+export const CLIENT_TAG = "vd";
+
+export function makeClientOrderId(kind, ticker) {
+  const t = String(ticker || "X").replace(/[^A-Za-z0-9]/g, "").slice(0, 12);
+  const k = String(kind || "order").replace(/[^A-Za-z0-9]/g, "").slice(0, 10);
+  const stamp = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 7);
+  return `${CLIENT_TAG}-${k}-${t}-${stamp}-${rand}`;
+}
+
+export function isOurClientOrderId(id) {
+  return typeof id === "string" && id.startsWith(`${CLIENT_TAG}-`);
+}
+
+// `tag` = { kind, ticker }. Omitted for pass-through callers (the raw /api/order
+// endpoint), which stay untagged on purpose: an order you placed by hand through
+// the API is not the bot's, and labelling it as such would be a lie the
+// reconciler would later act on.
+export async function placeOrder(body, tag = null) {
+  const payload = tag && !body.client_order_id
+    ? { ...body, client_order_id: makeClientOrderId(tag.kind, tag.ticker) }
+    : body;
+  return req(`${TRADE}/v2/orders`, { method: "POST", body: JSON.stringify(payload) });
 }
 export async function getOrder(id) {
   return req(`${TRADE}/v2/orders/${id}`);

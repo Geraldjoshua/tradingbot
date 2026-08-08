@@ -112,7 +112,16 @@ def sweep(symbols, args, session):
     latest trade — so it is one cheap pass over ~11k names rather than a bar
     fetch per symbol.
     """
-    snaps = ac.snapshots(symbols)
+    try:
+        snaps = ac.snapshots(symbols)
+    except Exception as e:
+        # Distinguish a dead feed from a quiet market. These look the same on a
+        # scanner (an empty table) and mean completely different things.
+        raise RuntimeError(f"snapshot feed unreachable — {e}") from e
+    st = ac.last_snapshot_status
+    if st.get("failed"):
+        print(f"  [warn] {st['failed']}/{st['chunks']} snapshot chunks failed "
+              f"({st['error']}) — the universe below is incomplete", flush=True)
     hot = []
     for sym, s in snaps.items():
         if not s:

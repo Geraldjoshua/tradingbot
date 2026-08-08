@@ -628,7 +628,8 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       };
     }
     if (!confirm) {
-      const sized = shares.size(spot, lv.stop, riskPremium * flowMult, buyingPower, cfg);
+      const sized = shares.size(spot, lv.stop, riskPremium * flowMult, buyingPower, cfg,
+                                { notionalBudget: effectiveBudget });
       return {
         status: "PREVIEW", instrument: "shares", ticker, side, spot: +spot.toFixed(2),
         triggered, firstFiveMinClose: fmc,
@@ -649,7 +650,14 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       return { status: "NOT_TRIGGERED", ticker, side, spot, firstFiveMinClose: fmc,
         trigger: lv.trigger, note: `needs 5-min close ${lv.triggerDir} ${lv.trigger}` };
     }
-    const res = await shares.enter({ ticker, side, spot, stop: lv.stop, riskBudget: riskPremium * flowMult, cfg });
+    const res = await shares.enter({
+      ticker, side, spot, stop: lv.stop,
+      riskBudget: riskPremium * flowMult,
+      // The budget now caps NOTIONAL too, not just risk-at-stop. Without it the
+      // only ceiling was 10% of buying power — see the note in shares.js.
+      notionalBudget: effectiveBudget,
+      cfg,
+    });
     const sf = await alpaca.waitForFill(res.order.id).catch(() => ({ filled: false, price: null }));
     const shareEntry = sf.filled && sf.price ? sf.price : +spot.toFixed(2);
     const pos = {
@@ -663,6 +671,7 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
       triggeredBy: triggered ? "5min-close" : "forced",
       entryBudget: riskPremium, flowMult, flowAtEntry: flowSummary0(decision, conviction),
       riskAtStop: res.sized.riskAtStop,
+      notional: res.sized.notional, sizedBy: res.sized.boundBy,
       // Why this is stock and not an option. Without it the trade log cannot
       // distinguish "we chose shares" from "the option leg silently failed",
       // and those two need very different follow-up.
@@ -877,6 +886,20 @@ export async function evaluatePositions() {
       stalled = gains.length === 3 && gains.every((g) => g < 10);
     }
 
+    // ---- MANAGEMENT MODE ---------------------------------------------------
+    // "full"    the complete framework. Everything the bot opened, plus its own
+    //           orphans recovered from the broker.
+    // "protect" risk controls ONLY: structural stop, drawdown stop, premium and
+    //           DTE backstops. NO time stop, NO stall stop, NO auto-take-profit.
+    //
+    // The distinction matters for a position you opened by hand. Stop 3 and Stop
+    // 4 encode a THESIS — "this should reach T1 within seven sessions" — and that
+    // thesis is the GEX reclaim playbook's, not yours. Applying it to a LEAP or a
+    // hedge would exit for reasons unrelated to why you own it. Taking profit at
+    // +GEX is the same kind of judgement. Stopping a position that has broken its
+    // structural level is not: that is risk, and risk applies to everything.
+    const protectOnly = (p.manageMode || "full") === "protect";
+
     // ---- STOP RATCHET: protect a winner, not just abandon a loser ---------
     // Stops 1-4 all answer "when do I give up on this?". Nothing answered "when
     // do I stop being willing to give the whole move back?" — so a position
@@ -885,7 +908,12 @@ export async function evaluatePositions() {
     // and it is capped at the position's own entry-to-T1 span so it can never
     // jump ahead of price.
     const ratchet = Array.isArray(mgmt.stopRatchet) ? mgmt.stopRatchet : [];
-    if (ratchet.length && spot != null && p.entrySpot != null && p.t1 != null) {
+    // Ratcheting is thesis-shaped: it measures progress toward T1, and on a
+    // hand-placed position T1 is not the target you had in mind. Protect mode
+    // holds the structural stop where it is rather than tightening toward a goal
+    // you never set.
+    const ratchetOn = ratchet.length && !protectOnly;
+    if (ratchetOn && spot != null && p.entrySpot != null && p.t1 != null) {
       const span = side === "short" ? p.entrySpot - p.t1 : p.t1 - p.entrySpot;
       if (span > 0) {
         // Highest rung whose progress threshold we have already cleared.
@@ -926,6 +954,39 @@ export async function evaluatePositions() {
 
     // Never carry long premium into the theta/gamma cliff. If the thesis needed
     // 45 days and has burned 35 of them, it is not about to start working.
+    // ---- PROFIT RATCHET (thesis-free trailing stop) -------------------------
+    // High-water mark on the position's own value, so nothing here references
+    // T1, pTrans or any view about direction. Armed only after a real gain.
+    const pr = mgmt.profitRatchet || {};
+    const prApplies = pr.enabled !== false
+      && (protectOnly || pr.alsoInFullMode === true);
+    let profitGiveBack = false, prDetail = null;
+    if (prApplies) {
+      const entryVal = isShares ? p.entryPrice : p.entryPremium;
+      const nowVal = isShares ? spot : optMid;
+      if (entryVal > 0 && nowVal != null) {
+        // For a short share position "up" means price DOWN, so value the
+        // position rather than the instrument.
+        const val = (isShares && side === "short")
+          ? entryVal + (entryVal - nowVal)
+          : nowVal;
+        const peak = Math.max(p.peakValue ?? entryVal, val);
+        if (peak !== p.peakValue) { p.peakValue = +peak.toFixed(4); dirty = true; }
+        const peakGain = (peak - entryVal) / entryVal;
+        if (peakGain >= (pr.armAtGainPct ?? 0.5)) {
+          const floor = entryVal + (peak - entryVal) * (1 - (pr.giveBackPct ?? 0.4));
+          if (val <= floor) {
+            profitGiveBack = true;
+            prDetail = {
+              peak: +peak.toFixed(2), floor: +floor.toFixed(2),
+              peakGainPct: Math.round(peakGain * 100),
+              stillUpPct: Math.round(((val - entryVal) / entryVal) * 100),
+            };
+          }
+        }
+      }
+    }
+
     const minDte = mgmt.minDteExit ?? 0;
     const dteLeft = !isShares && p.expiry
       ? Math.floor((Date.parse(p.expiry + "T20:00:00Z") - Date.now()) / 864e5)
@@ -944,14 +1005,23 @@ export async function evaluatePositions() {
         action = "EXIT"; urgent = true;
         reason = `Stop 5: premium ${optMid} is ${Math.round((1 - optMid / p.entryPremium) * 100)}% `
           + `below entry ${p.entryPremium} — instrument stop, structure still intact at ${spot.toFixed(2)}`;
+      } else if (profitGiveBack) {
+        // Not a loss — a banked winner that started handing itself back. This is
+        // the ONLY profitable exit protect mode will take on its own, and it is
+        // deliberately not a target: it fires because the gain shrank, never
+        // because price reached some level the bot picked.
+        action = "EXIT"; urgent = false;
+        reason = `Stop 7: profit ratchet — peaked +${prDetail.peakGainPct}% `
+          + `(${prDetail.peak}), now back to +${prDetail.stillUpPct}% at or under the `
+          + `${prDetail.floor} floor. Banking it rather than giving the move back.`;
       } else if (dteBreach) {
         action = "EXIT"; urgent = false;
         reason = `Stop 6: ${dteLeft}d to expiry — closing before the theta cliff `
           + `(${(progress * 100).toFixed(0)}% to T1)`;
-      } else if (daysHeld >= 7 && progress < 0.5) {
+      } else if (!protectOnly && daysHeld >= 7 && progress < 0.5) {
         action = "EXIT"; urgent = true;
         reason = `Stop 3: day ${daysHeld}, only ${(progress * 100).toFixed(0)}% to T1`;
-      } else if (stalled) {
+      } else if (!protectOnly && stalled) {
         // Stop 4 — the stalling rule, which was missing. Under 10% progress per
         // day for three consecutive sessions means the thesis isn't playing out,
         // and waiting for Stop 3 on day 7 spends four more days of theta finding
@@ -960,9 +1030,17 @@ export async function evaluatePositions() {
         action = "EXIT"; urgent = true;
         reason = `Stop 4: stalled — under 10%/day progress for 3 sessions (now ${(progress * 100).toFixed(0)}% to T1)`;
       } else if (p.t1 != null && favourable(p.t1) && !p.t1Taken) {
-        action = "T1_HIT";
-        reason = `T1 reached (${p.t1}) — take profit, or lock stop to entry and ride to T2 ${p.t2}`;
-      } else if (p.t1Taken && p.t2 != null && favourable(p.t2)) {
+        if (protectOnly) {
+          // Say it loudly, do nothing. Banking the trade is your call on a
+          // position the bot did not plan.
+          action = "T1_INFO";
+          reason = `T1 (${p.t1}) reached — NOT auto-taken: this position is in protect `
+            + `mode, so the exit is yours. Stop stays at ${stopLevel}.`;
+        } else {
+          action = "T1_HIT";
+          reason = `T1 reached (${p.t1}) — take profit, or lock stop to entry and ride to T2 ${p.t2}`;
+        }
+      } else if (!protectOnly && p.t1Taken && p.t2 != null && favourable(p.t2)) {
         // Scale-out runner: the first tranche went at T1, the remainder is
         // riding to T2 on a breakeven stop.
         action = "T2_HIT";
@@ -979,6 +1057,9 @@ export async function evaluatePositions() {
     out.push({ ...p, side, instrument: p.instrument || "option",
       currentSpot: spot != null ? +spot.toFixed(2) : null, optMid, optPnl, daysHeld,
       effectiveStop: stopLevel, dteLeft,
+      manageMode: p.manageMode || "full", adopted: Boolean(p.adopted),
+      peakValue: p.peakValue ?? null,
+      ...(prDetail ? { profitRatchet: prDetail } : {}),
       progressPct: +(progress * 100).toFixed(0), action, reason, urgent });
   }
   // Write back the progress history and any ratcheted stop. Without this the
@@ -1023,6 +1104,16 @@ export function createPositionFromFill(w) {
 }
 
 export function listAll() { return load(); }
+
+// Insert a position discovered at the broker rather than opened by us. Separate
+// from createPositionFromFill so the two paths can never be confused: one is a
+// trade we planned, the other is a trade we found.
+export function adoptPosition(pos) {
+  const rows = load();
+  rows.push(pos);
+  persist(rows);
+  return pos;
+}
 
 // ---- Store maintenance (used by reconcile.js) -----------------------------
 // Deliberately narrow: set a terminal status, or patch a few fields. Kept here so

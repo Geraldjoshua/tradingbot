@@ -199,7 +199,13 @@
       }
     ],
     "maxPremiumLossPct": 0.6,
-    "minDteExit": 10
+    "minDteExit": 10,
+    "profitRatchet": {
+      "enabled": true,
+      "alsoInFullMode": false,
+      "armAtGainPct": 0.5,
+      "giveBackPct": 0.4
+    }
   },
   "sides": {
     "long": true,
@@ -210,7 +216,8 @@
     "minShares": 1,
     "maxNotionalPct": 0.1,
     "allowShort": false,
-    "requireEasyToBorrow": true
+    "requireEasyToBorrow": true,
+    "maxNotionalMultiple": 1.0
   },
   "risk": {
     "maxDailyLoss": 600,
@@ -230,5 +237,10 @@
     "snapshotsPerTicker": 40,
     "keepClosedTrades": 200,
     "maxDataMB": 200
+  },
+  "reconcile": {
+    "everyMinutes": 30,
+    "orphanMode": "full",
+    "adoptUntracked": "protect"
   }
 }

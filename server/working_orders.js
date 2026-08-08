@@ -71,7 +71,7 @@ async function placeRung(w, cfg) {
   const order = await alpaca.placeOrder({
     symbol: w.symbol, qty: w.qty, side: w.side,
     type: "limit", limit_price: px, time_in_force: "day",
-  });
+  }, { kind: w.kind, ticker: w.ticker });
   w.orderId = order.id;
   w.lastPrice = px;
   w.placedAt = Date.now();
