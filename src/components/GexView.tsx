@@ -103,19 +103,28 @@ export default function GexView() {
   const [maxDte, setMaxDte] = useState(45);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [errDetail, setErrDetail] = useState<any>(null);
   const [gex, setGex] = useState<GexResult | null>(null);
 
   async function run() {
-    setBusy(true); setErr("");
+    setBusy(true); setErr(""); setErrDetail(null);
     try {
+      setErrDetail(null);
       setGex(await getGex(symbol.toUpperCase(), 4, maxDte));
-    } catch (e: any) { setErr(e.message || String(e)); setGex(null); }
+    } catch (e: any) { setErr(e.message || String(e)); setErrDetail(e.detail || null); setGex(null); }
     finally { setBusy(false); }
   }
 
   // window the profile to ±8% around spot for a readable chart
-  const windowed = gex
-    ? gex.profile.filter((p) => Math.abs(p.strike - gex.spot) <= gex.spot * 0.08)
+  // Defensive on purpose. `gex.profile` was read straight off the response, so a
+  // payload without one — which /api/gex used to return with a 200 whenever
+  // gex.py printed {"error": ...} — threw
+  //   TypeError: Cannot read properties of undefined (reading 'filter')
+  // and took the whole tab down. The server now returns a proper status, but the
+  // view should not depend on that to stay alive.
+  const profile = Array.isArray(gex?.profile) ? gex!.profile : [];
+  const windowed = gex && gex.spot
+    ? profile.filter((p) => Math.abs(p.strike - gex.spot) <= gex.spot * 0.08)
     : [];
   const maxAbs = Math.max(1, ...windowed.map((p) => Math.abs(p.gex)));
 
@@ -154,14 +163,66 @@ export default function GexView() {
         </p>
       </div>
 
-      {err && <div className="err">Error: {err}</div>}
+      {err && (
+        <div className="panel" style={{ borderColor: "var(--red)" }}>
+          <strong style={{ color: "var(--red)" }}>Couldn't compute GEX for {symbol.toUpperCase()}</strong>
+          <p className="hint" style={{ marginTop: 6 }}>{err}</p>
+          {/* Which feeds were tried, and what each one said. Without this the tab
+              just went quiet and you could not tell "no keys on Render" from
+              "Alpaca is 403ing" from "this symbol has no chain". */}
+          {Array.isArray(errDetail?.providerTrace) && errDetail.providerTrace.length > 0 && (
+            <table style={{ marginTop: 8, fontSize: 12 }}>
+              <thead><tr><th style={{ textAlign: "left" }}>Data source</th>
+                <th style={{ textAlign: "left" }}>Result</th>
+                <th style={{ textAlign: "left" }}>Detail</th></tr></thead>
+              <tbody>
+                {errDetail.providerTrace.map((t: any, i: number) => (
+                  <tr key={i}>
+                    <td style={{ paddingRight: 14, fontWeight: 700 }}>{t.provider}</td>
+                    <td style={{ paddingRight: 14, color: t.result === "ok" ? "var(--green)" : "var(--red)" }}>
+                      {t.result}
+                    </td>
+                    <td style={{ color: "var(--muted)" }}>{t.detail || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {errDetail?.hint && (
+            <p className="sub" style={{ marginTop: 8, color: "#e0b341" }}>{errDetail.hint}</p>
+          )}
+        </div>
+      )}
 
-      {gex && (
+      {/* A response with no usable profile is a data problem, not a crash. */}
+      {gex && !windowed.length && (
+        <div className="panel">
+          <strong>No strike profile returned for {gex.symbol || symbol}</strong>
+          <p className="hint" style={{ marginTop: 6 }}>
+            The request succeeded but came back without usable strikes. Usually the option
+            chain was empty for the DTE window, or every strike failed the IV/open-interest
+            sanity filters. Try a longer Max DTE, or a more liquid underlying.
+          </p>
+        </div>
+      )}
+      {gex && windowed.length > 0 && (
         <>
           <div className="panel">
             <div className="spread" style={{ marginBottom: 12 }}>
               <strong>{gex.symbol} — dealer gamma exposure</strong>
-              <span className="hint">expiries: {gex.expiries.join(", ")}</span>
+              <span className="hint">
+                expiries: {gex.expiries.join(", ")}
+                {(gex as any).dataQuality?.provider && (
+                  <> · source <b style={{
+                    color: (gex as any).dataQuality.provider === "alpaca" ? "var(--green)" : "#e0b341",
+                  }}>{(gex as any).dataQuality.provider}</b></>
+                )}
+                {(gex as any).dataQuality?.oiDate
+                  ? <> · OI as of {(gex as any).dataQuality.oiDate}</>
+                  : (gex as any).dataQuality?.provider === "yahoo"
+                    ? <> · <span style={{ color: "#e0b341" }}>OI date unknown (Yahoo never says)</span></>
+                    : null}
+              </span>
             </div>
             <div className="stats-grid">
               <div className="stat"><div className="k">Spot</div><div className="v">${gex.spot}</div></div>

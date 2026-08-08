@@ -246,11 +246,32 @@ app.get("/api/gex", (req, res) => {
   child.stderr.on("data", (d) => (errout += d));
   child.on("error", (e) => res.status(500).json({ error: `spawn failed: ${e.message}` }));
   child.on("close", (code) => {
+    let payload;
     try {
-      res.json(JSON.parse(out));
+      payload = JSON.parse(out);
     } catch {
-      res.status(500).json({ error: `gex failed (code ${code}): ${(errout || out).slice(0, 400)}` });
+      return res.status(500).json({
+        error: `gex failed (code ${code}): ${(errout || out).slice(0, 400)}` });
     }
+    // gex.py signals failure by printing {"error": ...} on stdout, which parses
+    // perfectly well — so this handler used to return it as a 200 and the UI
+    // treated an error as a successful result. The next line read
+    // `gex.profile.filter(...)` on a payload that has no profile, which is the
+    // TypeError that took the tab down. A failure has to arrive as a failure.
+    if (payload && payload.error) {
+      // Pass the per-provider trace and hint through. "Failed to get GEX" is not
+      // actionable; "alpaca: failed (403), yahoo: skipped (yfinance missing)" is.
+      return res.status(502).json({
+        error: String(payload.error),
+        providerTrace: payload.providerTrace || null,
+        hint: payload.hint || null,
+      });
+    }
+    if (!payload || !Array.isArray(payload.profile)) {
+      return res.status(502).json({
+        error: "gex returned no strike profile — the chain came back empty or unusable" });
+    }
+    res.json(payload);
   });
 });
 

@@ -212,6 +212,76 @@ class YahooProvider:
         return out
 
 
+def providers_in_order(preferred=None):
+    """Every provider we could try, best first, with a note on any we skipped.
+
+    Returns (usable, skipped) where `skipped` is [(name, why)] — so a caller can
+    report "Alpaca was skipped because no keys are set" instead of silently
+    behaving as though Yahoo were the intended source.
+    """
+    preferred = (preferred or os.environ.get("GEX_DATA_PROVIDER") or "alpaca").lower()
+    alpaca, yahoo = AlpacaProvider(), YahooProvider()
+    order = [alpaca, yahoo] if preferred == "alpaca" else [yahoo, alpaca]
+    usable, skipped = [], []
+    for p in order:
+        if p.available():
+            usable.append(p)
+        else:
+            skipped.append((p.name,
+                            "no ALPACA_API_KEY / ALPACA_SECRET_KEY in this process"
+                            if p.name == "alpaca" else "yfinance not importable"))
+    return usable, skipped
+
+
+def fetch_chain(symbol, max_dte, preferred=None, days=10):
+    """Get (provider, closes, highs, chains) from the first provider that WORKS.
+
+    get_provider() only ever checked available(), which asks "is this configured"
+    — not "does it answer". So a set of valid Alpaca keys against an API that is
+    403ing meant Alpaca was selected, the call threw, and Yahoo was never tried.
+    The fallback covered a missing key and not a failing feed, which is precisely
+    the case where you want the other one.
+
+    Raises ProviderError carrying what EVERY provider said, so the caller can
+    report a real diagnosis rather than one raw exception string.
+    """
+    usable, skipped = providers_in_order(preferred)
+    trace = [{"provider": n, "result": "skipped", "detail": why} for n, why in skipped]
+
+    for p in usable:
+        try:
+            closes, highs = p.history(symbol, days=days)
+            if not closes:
+                trace.append({"provider": p.name, "result": "no data",
+                              "detail": f"no price history for {symbol}"})
+                continue
+            chains = p.chains(symbol, max_dte=max_dte)
+            if not chains:
+                trace.append({"provider": p.name, "result": "no data",
+                              "detail": f"no expiries within {max_dte} DTE"})
+                continue
+            trace.append({"provider": p.name, "result": "ok"})
+            return p, closes, highs, chains, trace
+        except Exception as e:
+            trace.append({"provider": p.name, "result": "failed",
+                          "detail": f"{type(e).__name__}: {str(e)[:160]}"})
+            continue
+
+    raise ProviderError(f"no data provider could serve {symbol}", trace)
+
+
+class ProviderError(RuntimeError):
+    def __init__(self, msg, trace):
+        super().__init__(msg)
+        self.trace = trace
+
+    def summary(self):
+        """One readable line per provider — what was tried and what it said."""
+        return "; ".join(f"{t['provider']}: {t['result']}"
+                         + (f" ({t['detail']})" if t.get("detail") else "")
+                         for t in self.trace)
+
+
 def get_provider(preferred=None):
     """Pick a provider, falling back rather than failing.
 

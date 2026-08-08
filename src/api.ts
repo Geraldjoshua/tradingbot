@@ -24,7 +24,15 @@ async function j<T>(url: string, opts?: RequestInit): Promise<T> {
     );
   }
   const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  if (!r.ok) {
+    // Keep the whole error body on the Error, not just its message. /api/gex
+    // returns a per-provider trace and a hint explaining WHY every data source
+    // failed, and throwing only `data.error` discarded exactly the part that
+    // tells you what to do about it.
+    const err = new Error(data.error || `HTTP ${r.status}`) as Error & { detail?: unknown };
+    err.detail = data;
+    throw err;
+  }
   return data as T;
 }
 

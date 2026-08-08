@@ -17,7 +17,7 @@ index like SPY returns meaningless far strikes (a "call wall" below spot).
 
 Usage: gex.py SYMBOL [max_expiries] [max_dte_days]
 """
-import sys, json, math, os
+import sys, os, json, math
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,58 +32,73 @@ def main():
     max_exp = int(sys.argv[2]) if len(sys.argv) > 2 else 4
     max_dte = int(sys.argv[3]) if len(sys.argv) > 3 else 45
 
+    # ---- DATA SOURCE ------------------------------------------------------
+    # This used to call yfinance directly, and it was the LAST thing in the
+    # project still doing so. voldesk.py was moved to the shared provider because
+    # Yahoo rate-limits hard (~19 tickers in a burst was enough to fail) — but
+    # gex.py kept its own Yahoo path, so the GEX tab broke exactly when Yahoo was
+    # unhappy while every other view carried on fine.
+    #
+    # Worse, it meant the DISPLAY and the TRADING LEVELS could be computed from
+    # different feeds on the same day. gexcore.py exists specifically so those two
+    # cannot disagree; sharing the maths and then splitting the data undoes that.
+    #
+    # Now both go through gex/dataprovider.py: Alpaca first, Yahoo as fallback.
     try:
-        import yfinance as yf
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import dataprovider as dp
     except Exception as e:
-        print(json.dumps({"error": f"yfinance not installed: {e}"}))
+        print(json.dumps({"error": f"no data provider available: {type(e).__name__}: {e}"}))
         return
 
     try:
-        tk = yf.Ticker(symbol)
-        fi = tk.fast_info
-        spot = fi.get("lastPrice") or fi.get("last_price")
-        if not spot:
-            hist = tk.history(period="1d")
-            spot = float(hist["Close"].iloc[-1])
-        spot = float(spot)
-
-        exps = list(tk.options)
+        # Tries every configured provider in turn and only gives up when they all
+        # fail — carrying what each one said, so the UI can show a diagnosis
+        # instead of one raw URLError.
+        try:
+            provider, closes, _highs, chains, trace = dp.fetch_chain(symbol, max_dte)
+        except dp.ProviderError as pe:
+            print(json.dumps({
+                "error": f"could not get option data for {symbol} — {pe.summary()}",
+                "providerTrace": pe.trace,
+                "hint": "If Alpaca was skipped, set ALPACA_API_KEY and ALPACA_SECRET_KEY "
+                        "in the Render dashboard (render.yaml marks them sync:false, so they "
+                        "are not in the image). If Alpaca failed, check the key is a PAPER "
+                        "key and the plan allows option data.",
+            }))
+            return
+        spot = float(closes[-1])
         now = datetime.now(timezone.utc)
-        chosen = []
-        for e in exps:
-            exp_dt = datetime.strptime(e, "%Y-%m-%d").replace(hour=20, tzinfo=timezone.utc)
-            dte_days = (exp_dt - now).total_seconds() / 86400
-            if dte_days <= 0:
-                continue
-            if dte_days > max_dte:
-                break
-            chosen.append((e, exp_dt, dte_days))
-            if len(chosen) >= max_exp:
-                break
+
+        def _dte(e):
+            return (datetime.strptime(e, "%Y-%m-%d").replace(hour=20, tzinfo=timezone.utc)
+                    - now).total_seconds() / 86400
+        chosen = sorted([(e, _dte(e)) for e in chains if _dte(e) > 0],
+                        key=lambda x: x[1])[:max_exp]
         if not chosen:
-            print(json.dumps({"error": f"no expiries within {max_dte} DTE for {symbol}"}))
+            print(json.dumps({"error": f"no unexpired expiries within {max_dte} DTE"}))
             return
 
         # Collect + sanitize PER EXPIRY (the relative-IV filter needs each
         # expiry's own ATM IV as the baseline).
         contracts = []
         used_exps = []
-        quality = {"droppedAbsIv": 0, "droppedRelIv": 0, "atmIvByExpiry": {}, "rawRows": 0}
-        for e, exp_dt, dte_days in chosen:
-            oc = tk.option_chain(e)
+        quality = {"droppedAbsIv": 0, "droppedRelIv": 0, "atmIvByExpiry": {}, "rawRows": 0,
+                   "provider": provider.name,
+                   "providerTrace": trace,
+                   "oiDate": getattr(provider, "last_oi_date", None)}
+        for e, dte_days in chosen:
             T = dte_days / 365.0
             rows = []
-            for df, is_call in ((oc.calls, True), (oc.puts, False)):
-                for _, row in df.iterrows():
-                    K, oi, iv = row.get("strike"), row.get("openInterest"), row.get("impliedVolatility")
-                    quality["rawRows"] += 1
-                    if gc._is_bad(K) or not K:
-                        continue
-                    if gc._is_bad(oi) or oi <= 0:
-                        continue
-                    if gc._is_bad(iv) or iv <= 0:
-                        continue
-                    rows.append((float(K), T, float(iv), float(oi), is_call))
+            for (K, oi, iv, is_call) in chains[e]:
+                quality["rawRows"] += 1
+                if gc._is_bad(K) or not K:
+                    continue
+                if gc._is_bad(oi) or oi <= 0:
+                    continue
+                if gc._is_bad(iv) or iv <= 0:
+                    continue
+                rows.append((float(K), T, float(iv), float(oi), is_call))
             kept, stats = gc.sanitize_expiry(rows, spot)
             contracts.extend(kept)
             quality["droppedAbsIv"] += stats["droppedAbs"]
