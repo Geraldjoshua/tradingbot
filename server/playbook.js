@@ -4,7 +4,11 @@
 // The Vol Desk engine was written long-only. Its levels are:
 //
 //   nTrans      put wall — largest negative-GEX strike BELOW spot
-//   pTrans      gamma-flip reclaim level, clamped into (nTrans, spot]
+//   pTrans      the gamma flip, snapped to the nearest strike. NOT clamped —
+//               voldesk.py used to clamp it into (nTrans, spot] and that was a
+//               bug: it forged confirmations by dragging the trigger below spot.
+//               If pTrans sits ABOVE spot the name simply hasn't reclaimed yet,
+//               which the PENDING/BLOCKED tag already expresses.
 //   plusGEX_T1  call wall ABOVE spot           <- long target
 //   T2 / COTMC  call-OI-weighted strike        <- long runner
 //   COTMP       put-OI-weighted strike         <- the DOWNSIDE analog

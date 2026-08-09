@@ -152,11 +152,31 @@ export default function GexView() {
   // nTrans - (pTrans - nTrans) that playbook.levelsFor(snap,"short") computes.
   // Without this marker the chart showed where to ENTER puts and nowhere to
   // exit them, which reads as though the put wall were the target.
+  //
+  // TWO GEOMETRIES, and the first version only handled one.
+  //
+  //   NORMAL   put wall < flip < spot
+  //            The flip is the long trigger and the put wall is the stop below
+  //            it. A short's target is a measured move below the wall:
+  //            putWall - (flip - putWall).
+  //
+  //   INVERTED flip < put wall < spot        (seen live on NVDA: 207.5 / 220 / 225)
+  //            The zero-crossing sits BELOW the biggest put-gamma strike. Here
+  //            `flip - putWall` is negative, so the measured move lands ABOVE the
+  //            wall — nonsense — and the old guard returned null and drew nothing.
+  //
+  //            Silence was the wrong answer. There IS a downside objective in this
+  //            shape and it is the flip: from the wall down to it dealers are still
+  //            long gamma so the fall is dampened, and BELOW it they are short
+  //            gamma and selling feeds selling. That is exactly where a put taken
+  //            at the wall should come off.
+  const flipVal = gex?.flipFound === false ? null : (gex?.gammaFlip ?? null);
+  const putWallVal = gex?.putWall?.strike ?? null;
+  const inverted = flipVal != null && putWallVal != null && flipVal < putWallVal;
   const putTargetStrike = (() => {
-    const flip = gex?.flipFound === false ? null : gex?.gammaFlip;
-    const pw = gex?.putWall?.strike;
-    if (flip == null || pw == null || flip <= pw) return null;
-    return nearestTo(pw - (flip - pw));
+    if (flipVal == null || putWallVal == null) return null;
+    if (inverted) return nearestTo(flipVal);                       // the flip is the objective
+    return nearestTo(putWallVal - (flipVal - putWallVal));         // measured move below the wall
   })();
 
   return (
@@ -328,10 +348,17 @@ export default function GexView() {
                 // ENTRY vs EXIT stated explicitly. "PUTS below" was ambiguous —
                 // it reads as "puts profit below here" when it means "puts are
                 // TRIGGERED below here". Those are opposite ends of the trade.
+                // In the inverted shape the flip is BOTH the gamma pivot and the
+                // downside objective, so it has to say both — otherwise the chart
+                // shows a put entry with no exit anywhere on it.
                 const role = isSpot ? "you are here"
-                  : isFlip ? "buy CALLS above · short stop"
+                  : isFlip ? (inverted
+                      ? "PUT take-profit · below here selling accelerates"
+                      : "buy CALLS above · short stop")
                   : isCall ? "CALL take-profit"
-                  : isPut ? "CALL stop-out · buy PUTS below"
+                  : isPut ? (inverted
+                      ? "CALL stop-out · buy PUTS below"
+                      : "CALL stop-out · buy PUTS below")
                   : isPutTgt ? "PUT take-profit"
                   : "";
                 const colour = isSpot ? "var(--accent)" : isFlip ? "#e0b341"
@@ -414,15 +441,26 @@ export default function GexView() {
               It is the long STOP, and losing it is where a short STARTS: through it they sell
               weakness instead of buying it. It is an entry for puts, not an exit.
               <br />
-              <b style={{ color: "var(--red)" }}>put target</b> — where a put trade takes profit,
-              a measured move below the wall (the pTrans−nTrans band projected down). Only shown
-              when it falls inside the ±8% window.
+              <b style={{ color: "var(--red)" }}>put target</b> — where a put trade takes profit.
+              Normally a measured move below the wall; when the flip sits BELOW the put wall it is
+              the flip itself, because that is the point where dealers stop dampening the fall and
+              start feeding it. Only shown when it lands inside the ±8% window.
               <br />
               <span style={{ color: "var(--muted)" }}>
                 Nothing here is filtered. The Vol Desk tab runs the same levels through grade,
                 cushion, spike-crash, R/R and OI-freshness, and only a CONFIRMED tag is tradeable —
                 so this chart can look clean on a name the bot refuses. It blocks the TRADE, never
                 this chart.
+              </span>
+              <br />
+              <span style={{ color: "var(--muted)" }}>
+                <b>One place the map and the bot genuinely differ.</b> This chart's put wall is the
+                biggest put-gamma strike below <i>spot</i>. The bot's stop (nTrans) is the biggest
+                put-gamma strike below <i>pTrans</i> — below the level it would ENTER on, not below
+                today's price, because a stop belongs under your entry. When spot has run well past
+                the flip the two anchors point at different strikes, and the bot's stop is the lower
+                one. Read this chart for shape; read the Vol Desk row for the levels it will
+                actually trade.
               </span>
             </div>
           </div>
