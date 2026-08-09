@@ -170,6 +170,8 @@ export default function GexView() {
   //            long gamma so the fall is dampened, and BELOW it they are short
   //            gamma and selling feeds selling. That is exactly where a put taken
   //            at the wall should come off.
+  // Mirrors WALL_MIN_DIST_PCT in gexcore.py (config: walls.minDistancePct).
+  const wallMinDist = 0.015;
   const flipVal = gex?.flipFound === false ? null : (gex?.gammaFlip ?? null);
   const putWallVal = gex?.putWall?.strike ?? null;
   const inverted = flipVal != null && putWallVal != null && flipVal < putWallVal;
@@ -364,6 +366,10 @@ export default function GexView() {
                 const colour = isSpot ? "var(--accent)" : isFlip ? "#e0b341"
                   : isCall ? "var(--green)" : isPut ? "var(--red)"
                   : isPutTgt ? "var(--red)" : "var(--muted)";
+                // Strikes inside WALL_MIN_DIST_PCT of spot cannot normally be a
+                // wall, however big their bar. Without showing it, the obvious
+                // reading of this chart is "the wall marker is on the wrong bar".
+                const inDeadZone = Math.abs(p.strike - gex.spot) < gex.spot * wallMinDist;
                 return (
                   <div key={p.strike} style={{ display: "flex", alignItems: "center", height: 18, fontSize: 11 }}>
                     {/* Number and marker are SEPARATE fixed-width cells. Previously
@@ -407,7 +413,12 @@ export default function GexView() {
                         </>
                       )}
                     </div>
-                    <div style={{ position: "relative", flex: 1, height: "100%", borderLeft: "1px solid var(--border)" }}>
+                    <div style={{
+                      position: "relative", flex: 1, height: "100%",
+                      borderLeft: "1px solid var(--border)",
+                      // faint tint = too close to spot to qualify as a wall
+                      background: inDeadZone ? "rgba(255,255,255,.035)" : undefined,
+                    }}>
                       <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "var(--border)" }} />
                       <div style={{
                         position: "absolute", top: 3, bottom: 3,
@@ -423,8 +434,25 @@ export default function GexView() {
             </div>
             <p className="hint" style={{ marginTop: 10 }}>
               Green = positive GEX (dealers buy dips / sell rips near these strikes → resistance-ish).
-              Red = negative GEX (support-ish). Biggest bars are the call/put walls.
+              Red = negative GEX (support-ish).
             </p>
+            <p className="sub" style={{ marginTop: 4 }}>
+              <b>The wall is not always the biggest bar.</b> Per-contract gamma peaks
+              at-the-money, so "largest gamma above spot" would return the next strike up almost
+              every time — a target 0.3% away that could never clear the 2:1 filter. Strikes within{" "}
+              <b>{(wallMinDist * 100).toFixed(1)}%</b> of spot (the shaded band) are therefore
+              excluded from wall selection however large they look. A big bar in that band is real
+              gamma; it just isn't far enough away to be a target or a stop.
+            </p>
+            {Array.isArray((gex as any).dataQuality?.wallNotes)
+              && (gex as any).dataQuality.wallNotes.length > 0 && (
+              <p className="sub" style={{ marginTop: 4, color: "#e0b341" }}>
+                ⚠ Wall selection had to relax its rules here:{" "}
+                {(gex as any).dataQuality.wallNotes.join("; ")}. That means the marked wall came
+                from a fallback — it may sit inside the shaded band or outside the usual moneyness
+                window, so treat it as weaker than a clean pick.
+              </p>
+            )}
             <div className="sub" style={{ marginTop: 6, lineHeight: 1.7 }}>
               <b>Reading the three marked levels</b> — these are the same ones the auto-trader
               uses, from <code>playbook.levelsFor()</code>:
