@@ -344,5 +344,9 @@ export interface GexResult {
   netGex?: number;
   grossGex?: number;
   dataQuality?: Record<string, any>;
-  profile: { strike: number; gex: number }[];
+  // gex.py emits callGex and putGex per strike alongside the net. The type only
+  // declared `gex`, so the components were arriving over the wire and were
+  // unreachable in TypeScript — which is why the chart could only draw NET and a
+  // wall marker on an opposite-coloured bar had no way to explain itself.
+  profile: { strike: number; gex: number; callGex?: number; putGex?: number }[];
 }

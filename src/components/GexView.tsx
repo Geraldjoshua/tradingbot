@@ -177,8 +177,20 @@ export default function GexView() {
   const inverted = flipVal != null && putWallVal != null && flipVal < putWallVal;
   const putTargetStrike = (() => {
     if (flipVal == null || putWallVal == null) return null;
-    if (inverted) return nearestTo(flipVal);                       // the flip is the objective
-    return nearestTo(putWallVal - (flipVal - putWallVal));         // measured move below the wall
+    if (!inverted) return nearestTo(putWallVal - (flipVal - putWallVal));  // measured move
+
+    // INVERTED. My first attempt returned the flip itself and called it the put
+    // take-profit. That is backwards, and expensively so: BELOW the flip dealers
+    // are short gamma and sell into weakness, so the flip is where a short starts
+    // WORKING, not where it ends. Exiting there closes the position at the moment
+    // the accelerant switches on.
+    //
+    // The real downside objective is the next put-gamma concentration below the
+    // flip — the strike price is actually drawn toward. That is in the profile we
+    // already have, so it can be measured instead of assumed.
+    const below = profile.filter((x) => x.strike < flipVal && x.gex < 0);
+    if (!below.length) return null;
+    return below.reduce((a, b) => (b.gex < a.gex ? b : a)).strike;
   })();
 
   return (
@@ -332,6 +344,27 @@ export default function GexView() {
 
           <div className="panel">
             <strong>GEX by strike (±8% of spot)</strong>
+            {/* The one thing to understand before reading the bars. Everything else
+                on this panel is detail, and now sits behind a toggle. */}
+            <div style={{
+              marginTop: 8, padding: "8px 10px", borderRadius: 6,
+              background: "rgba(255,255,255,.03)", fontSize: 12, lineHeight: 1.65,
+            }}>
+              <b>The flip is a switch, not a target.</b> One level — which trade it enables depends
+              on which side price is on.
+              <div style={{ marginTop: 4, fontFamily: "monospace", fontSize: 11, color: "var(--muted)" }}>
+                above flip · dealers buy dips · falls cushioned ·{" "}
+                <span style={{ color: "var(--green)" }}>CALLS work</span><br />
+                ──── flip ────────────────────────────────────────<br />
+                below flip · dealers sell dips · falls accelerate ·{" "}
+                <span style={{ color: "var(--red)" }}>PUTS work</span>
+              </div>
+              <div style={{ marginTop: 4 }}>
+                So the same level is a <b>long trigger</b> going up and a <b>short green light</b>{" "}
+                going down. For a long it is the invalidation; for a short it is where the trade
+                starts working. It is never a profit target for either.
+              </div>
+            </div>
             <div style={{ marginTop: 12 }}>
               {windowed.map((p) => {
                 const pct = (p.gex / maxAbs) * 50; // half-width %
@@ -355,13 +388,13 @@ export default function GexView() {
                 // shows a put entry with no exit anywhere on it.
                 const role = isSpot ? "you are here"
                   : isFlip ? (inverted
-                      ? "PUT take-profit · below here selling accelerates"
+                      // Not a target — a green light. Below it dealers stop
+                      // cushioning the fall and start feeding it.
+                      ? "below here selling ACCELERATES · run puts"
                       : "buy CALLS above · short stop")
                   : isCall ? "CALL take-profit"
-                  : isPut ? (inverted
-                      ? "CALL stop-out · buy PUTS below"
-                      : "CALL stop-out · buy PUTS below")
-                  : isPutTgt ? "PUT take-profit"
+                  : isPut ? "CALL stop-out · buy PUTS below"
+                  : isPutTgt ? "PUT take-profit · biggest put gamma below"
                   : "";
                 const colour = isSpot ? "var(--accent)" : isFlip ? "#e0b341"
                   : isCall ? "var(--green)" : isPut ? "var(--red)"
@@ -398,7 +431,14 @@ export default function GexView() {
                         text one hover away. So the worst case is now "…" plus a
                         tooltip, not a wrong label and not a broken layout. */}
                     <div
-                      title={marker ? `${p.strike} — ${marker}: ${role}` : undefined}
+                      title={marker
+                        ? `${p.strike} — ${marker}: ${role}`
+                          + `\nnet ${fmtB(p.gex)}`
+                          + (p.callGex != null ? ` · call ${fmtB(p.callGex)}` : "")
+                          + (p.putGex != null ? ` · put ${fmtB(p.putGex)}` : "")
+                          + (isCall ? "\nchosen on CALL gamma, not net"
+                            : isPut ? "\nchosen on PUT gamma, not net" : "")
+                        : undefined}
                       style={{
                         width: 250, paddingRight: 8, color: colour, fontWeight: 700,
                         whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
@@ -437,6 +477,15 @@ export default function GexView() {
               Red = negative GEX (support-ish).
             </p>
             <p className="sub" style={{ marginTop: 4 }}>
+              <b>A wall marker can sit on an opposite-coloured bar.</b> The bars show NET gamma
+              (call − put), but the walls are chosen on ONE side of the book: the call wall is the
+              biggest CALL gamma above spot, the put wall the biggest PUT gamma below it. A strike
+              can hold the largest put gamma on the chart and still print green because its call
+              gamma is larger still. The marker is not on the wrong bar — it is measuring a
+              different quantity than the bar draws. Hover a marked row to see the side value that
+              won it.
+            </p>
+            <p className="sub" style={{ marginTop: 4 }}>
               <b>The wall is not always the biggest bar.</b> Per-contract gamma peaks
               at-the-money, so "largest gamma above spot" would return the next strike up almost
               every time — a target 0.3% away that could never clear the 2:1 filter. Strikes within{" "}
@@ -444,6 +493,13 @@ export default function GexView() {
               excluded from wall selection however large they look. A big bar in that band is real
               gamma; it just isn't far enough away to be a target or a stop.
             </p>
+            {inverted && putTargetStrike == null && (
+              <p className="sub" style={{ marginTop: 4, color: "var(--muted)" }}>
+                No <b>put target</b> is marked: the flip sits below the put wall, so the objective
+                is the biggest put-gamma strike beneath the flip — and on this name that falls
+                outside the ±8% window drawn here. The level exists, it is just off-chart.
+              </p>
+            )}
             {Array.isArray((gex as any).dataQuality?.wallNotes)
               && (gex as any).dataQuality.wallNotes.length > 0 && (
               <p className="sub" style={{ marginTop: 4, color: "#e0b341" }}>
@@ -453,8 +509,12 @@ export default function GexView() {
                 window, so treat it as weaker than a clean pick.
               </p>
             )}
+            <details style={{ marginTop: 6 }}>
+              <summary style={{ cursor: "pointer", fontSize: 12, color: "var(--muted)" }}>
+                Why these levels — and the three ways this chart can mislead you
+              </summary>
             <div className="sub" style={{ marginTop: 6, lineHeight: 1.7 }}>
-              <b>Reading the three marked levels</b> — these are the same ones the auto-trader
+              <b>Reading the marked levels</b> — these are the same ones the auto-trader
               uses, from <code>playbook.levelsFor()</code>:
               <br />
               <b style={{ color: "#e0b341" }}>flip</b> — the pivot. Above it dealers hedge
@@ -470,9 +530,11 @@ export default function GexView() {
               weakness instead of buying it. It is an entry for puts, not an exit.
               <br />
               <b style={{ color: "var(--red)" }}>put target</b> — where a put trade takes profit.
-              Normally a measured move below the wall; when the flip sits BELOW the put wall it is
-              the flip itself, because that is the point where dealers stop dampening the fall and
-              start feeding it. Only shown when it lands inside the ±8% window.
+              Normally a measured move below the wall. When the flip sits BELOW the put wall the
+              measured move is meaningless, so it is the biggest put-gamma strike beneath the flip
+              instead — the level price is actually drawn toward. Note the flip itself is NOT a
+              target for a short: below it dealers sell into weakness, so that is where the trade
+              starts working, not where it ends. Only shown when it lands inside the ±8% window.
               <br />
               <span style={{ color: "var(--muted)" }}>
                 Nothing here is filtered. The Vol Desk tab runs the same levels through grade,
@@ -490,7 +552,15 @@ export default function GexView() {
                 one. Read this chart for shape; read the Vol Desk row for the levels it will
                 actually trade.
               </span>
+              <br />
+              <span style={{ color: "var(--muted)" }}>
+                <b>When the flip sits BELOW the put wall</b> — as it does on some names — the long
+                setup is far away and mostly irrelevant. The flip is then acting purely as the
+                accelerant for shorts, and the put target becomes the biggest put-gamma strike
+                beneath it rather than a measured move.
+              </span>
             </div>
+            </details>
           </div>
         </>
       )}
