@@ -326,6 +326,42 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   const fmc = trig.close;
   const triggered = trig.triggered;
 
+  // ORDER MATTERS. This block used to sit AFTER the live entry gates, and the
+  // logs lied because of it: SHOP was tagged BLOCKED by the scan at 10:06:39 and
+  // reported one second later as CHASED — "the setup was valid; the entry is
+  // not" — when the setup was never valid at all. A name the engine already
+  // refused must say so with its real blockers, not be relabelled as chasing.
+  // Grade first, timing second.
+  // --- SETUP QUALITY GATE ---------------------------------------------------
+  // This check was missing, and the omission was serious: entry gated ONLY on the
+  // flow decision and the price trigger, never on the Vol Desk verdict. Discovery
+  // candidates had to reach CONFIRMED to be offered at all, but anything placed on
+  // the manual watchlist went straight to the buy path — so the bot would happily
+  // buy a setup its own engine had graded BLOCKED (failing grade, R/R, db_change).
+  // Two sources of trades, two completely different standards.
+  //
+  // Now every entry is held to the same bar. Opt out per-call with ignoreSetup, or
+  // globally with entry.requireTag = [] if you really want the old behaviour.
+  const cfg = cfg0;
+  const requireTags = force ? [] : (cfg.entry?.requireTag ?? ["CONFIRMED"]);
+  const minGrade = cfg.entry?.minGrade ?? 0;
+  if (!ignoreSetup && requireTags.length) {
+    const tagOK = requireTags.includes(snap.tag);
+    const gradeOK = (snap.grade ?? 0) >= minGrade;
+    if (!tagOK || !gradeOK) {
+      return {
+        status: "NOT_CONFIRMED", ticker, side,
+        tag: snap.tag ?? null, grade: snap.grade ?? null,
+        requiredTags: requireTags, minGrade,
+        blockers: snap.filter_reasons || [],
+        note: `Vol Desk graded this ${snap.tag ?? "ungraded"}`
+          + (snap.grade != null ? ` (grade ${snap.grade}/11)` : "")
+          + (snap.filter_reasons?.length ? ` — failing: ${snap.filter_reasons.join(", ")}` : "")
+          + ". Not entering. Use Force/ignoreSetup to override, or loosen entry.requireTag.",
+      };
+    }
+  }
+
   // ---- Is there any reward left? ------------------------------------------
   // The trigger is decided from an earlier bar, but price keeps moving. If spot
   // has already reached T1 by the time we get here, the target is behind us and
@@ -384,15 +420,34 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   //    instant of committing capital it is simply the trade's reward:risk, and
   //    refusing a 1.1:1 is not masking anything.
   const minRRFill = cfg0.setup?.minRRAtFill ?? 1.5;
+  // Price at which this exact setup clears the floor, from the SAME levels:
+  //   (t1 - s) / (s - stop) = floor   ->   s = (t1 + floor*stop) / (1 + floor)
+  const entersAt = (lv.t1 != null && lv.stop != null && minRRFill > 0)
+    ? (side === "short"
+        ? (lv.t1 + minRRFill * lv.stop) / (1 + minRRFill)
+        : (lv.t1 + minRRFill * lv.stop) / (1 + minRRFill))
+    : null;
   if (!force && minRRFill > 0 && rrAtFill != null && rrAtFill < minRRFill) {
     return {
       status: "CHASED", ticker, side,
       spot: +spot.toFixed(2), trigger: lv.trigger, stop: lv.stop, t1: lv.t1,
       rrAtFill, minRRAtFill: minRRFill,
       extensionPct: lv.trigger ? +(((spot - lv.trigger) / lv.trigger) * 100).toFixed(2) : null,
+      // THE PRICE THIS BECOMES TRADEABLE AT.
+      // CHASED is not terminal — the loop re-checks after the cooldown and will
+      // enter if price comes back. But the rejection said only "too far", which
+      // reads as a permanent no and gives you nothing to watch. Solving
+      // (t1 - s)/(s - stop) = floor for s turns a wall of refusals into a
+      // watchlist with levels on it.
+      entersAt: entersAt != null ? +entersAt.toFixed(2) : null,
+      needsMovePct: entersAt != null ? +(((entersAt - spot) / spot) * 100).toFixed(2) : null,
       note: `R/R from the actual fill is ${rrAtFill}:1 against a ${minRRFill}:1 floor — price has `
         + `run too far past ${lv.trigger} for the remaining move to pay for the risk. `
-        + "The setup was valid; the entry is not.",
+        + "The setup was valid; the entry is not."
+        + (entersAt != null
+            ? ` Becomes tradeable at ${entersAt.toFixed(2)} `
+              + `(${(((entersAt - spot) / spot) * 100).toFixed(1)}%) — still being re-checked.`
+            : ""),
     };
   }
 
@@ -403,35 +458,6 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   const minUpside = cfg0.setup?.minUpsidePctForOptions ?? 0;
   const thinForOptions = minUpside > 0 && upsidePct != null && upsidePct < minUpside;
 
-  // --- SETUP QUALITY GATE ---------------------------------------------------
-  // This check was missing, and the omission was serious: entry gated ONLY on the
-  // flow decision and the price trigger, never on the Vol Desk verdict. Discovery
-  // candidates had to reach CONFIRMED to be offered at all, but anything placed on
-  // the manual watchlist went straight to the buy path — so the bot would happily
-  // buy a setup its own engine had graded BLOCKED (failing grade, R/R, db_change).
-  // Two sources of trades, two completely different standards.
-  //
-  // Now every entry is held to the same bar. Opt out per-call with ignoreSetup, or
-  // globally with entry.requireTag = [] if you really want the old behaviour.
-  const cfg = cfg0;
-  const requireTags = force ? [] : (cfg.entry?.requireTag ?? ["CONFIRMED"]);
-  const minGrade = cfg.entry?.minGrade ?? 0;
-  if (!ignoreSetup && requireTags.length) {
-    const tagOK = requireTags.includes(snap.tag);
-    const gradeOK = (snap.grade ?? 0) >= minGrade;
-    if (!tagOK || !gradeOK) {
-      return {
-        status: "NOT_CONFIRMED", ticker, side,
-        tag: snap.tag ?? null, grade: snap.grade ?? null,
-        requiredTags: requireTags, minGrade,
-        blockers: snap.filter_reasons || [],
-        note: `Vol Desk graded this ${snap.tag ?? "ungraded"}`
-          + (snap.grade != null ? ` (grade ${snap.grade}/11)` : "")
-          + (snap.filter_reasons?.length ? ` — failing: ${snap.filter_reasons.join(", ")}` : "")
-          + ". Not entering. Use Force/ignoreSetup to override, or loosen entry.requireTag.",
-      };
-    }
-  }
   let conviction = flowDecision?.conviction || null;
   let decision = flowDecision?.decision || null;
   if (!ignoreFlow && !decision) {
@@ -482,6 +508,25 @@ export async function enterTrade({ ticker, riskPremium = 300, force = false, con
   }
 
   const effectiveBudget = Math.max(0, Math.round(tradeBudget * flowMult));
+
+  // ---- Not triggered yet? Stop here. --------------------------------------
+  // `triggered` has been known since triggerBar() ran near the top, but the
+  // refusal used to sit after contract selection — so a name that had not
+  // crossed still cost a chain fetch, a batched quote call and a 60-contract
+  // scoring pass every poll. Harmless when only already-CONFIRMED names got
+  // this far; wasteful now that PENDING names sit here waiting to cross.
+  //
+  // Only short-circuits a REAL entry attempt. The preview path (confirm=false)
+  // still prices the chain, because "what would I buy if it triggers" is the
+  // whole point of a preview.
+  if (confirm && !triggered && !force) {
+    return {
+      status: "NOT_TRIGGERED", ticker, side, spot: +spot.toFixed(2),
+      firstFiveMinClose: fmc, trigger: lv.trigger, tag: snap.tag ?? null,
+      note: `waiting for a 5-min close ${lv.triggerDir} ${lv.trigger} `
+        + `(spot ${spot.toFixed(2)}). Chain not priced until it crosses.`,
+    };
+  }
 
   // ---- Contract selection -------------------------------------------------
   // Default: score a grid of strikes x expiries on true reward:risk against the

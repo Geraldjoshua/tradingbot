@@ -119,7 +119,8 @@
     "flowDecayRatio": 0.4,
     "blockedStrikes": 3,
     "requireTags": [
-      "CONFIRMED"
+      "CONFIRMED",
+      "PENDING"
     ],
     "minGrade": 0,
     "assessEveryMinutes": 60,
@@ -142,7 +143,7 @@
     "requireBreakevenBelowTarget": true,
     "riskFreeRate": 0.04,
     "minOpenInterest": 250,
-    "onNoQualifyingContract": "skip"
+    "onNoQualifyingContract": "shares"
   },
   "execution": {
     "enabled": true,
@@ -162,7 +163,8 @@
   },
   "entry": {
     "requireTag": [
-      "CONFIRMED"
+      "CONFIRMED",
+      "PENDING"
     ],
     "minGrade": 0
   },

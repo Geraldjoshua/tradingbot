@@ -85,7 +85,10 @@ const DEFAULTS = {
   observe: {
     maxObserving: 25, maxObserveDays: 10,
     dropOnFlowGone: true, dropOnFlowFlip: true, flowDecayRatio: 0.4,
-    blockedStrikes: 3, requireTags: ["CONFIRMED"], minGrade: 0,
+    // Same reasoning as entry.requireTag: a PENDING name is fully vetted and
+    // simply hasn't crossed yet. Holding it at OBSERVING until the next scan
+    // sees it CONFIRMED guarantees the bot is late.
+    blockedStrikes: 3, requireTags: ["CONFIRMED", "PENDING"], minGrade: 0,
     // How often the list is re-vetted. This was hard-wired to once per calendar
     // day, which meant a name that firmed up at 10:15 could not become READY
     // until tomorrow -- by which point the reclaim it was waiting for had
@@ -150,7 +153,17 @@ const DEFAULTS = {
   },
   // Entry quality gate — applies to EVERY entry path (discovery, observe list and
   // the manual watchlist alike). Previously only discovery names were vetted.
-  entry: { requireTag: ["CONFIRMED"], minGrade: 0 },
+  // CONFIRMED means "spot is already past pTrans" — the cross has happened and,
+  // by the time the next scan notices, price has usually run. Measured live:
+  // NVDA was 8.00:1 at its trigger and 0.36:1 six percent later; TSLA 2.97:1 ->
+  // 0.33:1. The setups were not bad, the arrival was.
+  //
+  // PENDING means "passed grade, cushion, R/R, spike-crash and OI-freshness, and
+  // is within 0.5% BELOW pTrans" — everything vetted except the cross itself.
+  // triggerBar() already watches 5-min bars live for that cross, so admitting
+  // PENDING lets the bot enter AT the reclaim instead of after it. The trigger,
+  // not the tag, becomes the last gate — which is what the playbook always said.
+  entry: { requireTag: ["CONFIRMED", "PENDING"], minGrade: 0 },
   // The tradeable reward:risk bar for the SETUP (not for picking the contract —
   // that's contractSelection.minRR). Measured from where you'd actually fill, so
   // 2.0 is a real 2:1. Exposed so it can be tested against logged outcomes.

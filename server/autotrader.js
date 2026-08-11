@@ -483,7 +483,11 @@ async function enter(cfg) {
           // to see whether the thresholds are set right.
           ...(r.status === "CHASED"
             ? { rrAtFill: r.rrAtFill, floor: r.minRRAtFill, extension: `${r.extensionPct}%`,
-                spot: r.spot, trigger: r.trigger, t1: r.t1 }
+                spot: r.spot, trigger: r.trigger, t1: r.t1,
+                // Not a permanent no — the loop keeps re-checking. This is the
+                // level to watch for.
+                ...(r.entersAt != null
+                  ? { WATCH: `enters at ${r.entersAt} (${r.needsMovePct}%)` } : {}) }
             : {}),
           ...(r.status === "STRUCTURE_BROKEN" ? { spot: r.spot, stop: r.stop } : {}),
           ...(r.status === "NO_QUALIFYING_CONTRACT"
