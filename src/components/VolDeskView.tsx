@@ -226,7 +226,16 @@ export default function VolDeskView() {
                           <span style={{ color: "#e0b341", fontSize: 10 }} title="15-minute delayed feed"> ⏱</span>
                         )}
                       </td>
-                      <td>{p.progressPct}%</td>
+                      <td title={p.progressSignedPct != null && p.progressSignedPct < 0
+                        ? `underwater: ${p.progressSignedPct}% of the way to T1`
+                        : "progress toward T1"}
+                        className={(p.progressSignedPct ?? 0) < 0 ? "neg" : undefined}>
+                        {/* Show the signed number when it is negative — otherwise every
+                            losing trade renders as a flat 0% and the table looks inert. */}
+                        {p.progressSignedPct != null && p.progressSignedPct < 0
+                          ? `${p.progressSignedPct}%`
+                          : `${p.progressPct}%`}
+                      </td>
                       <td title={p.stopRatchet ? `ratcheted to ${p.stopRatchet.movedTo} on ${p.stopRatchet.on}` : undefined}>
                         {p.effectiveStop ?? p.stopLevel ?? "—"}
                         {p.lockedToBreakeven && <span style={{ color: "var(--green)" }} title="stop moved to entry or better"> ●</span>}

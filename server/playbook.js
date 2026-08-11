@@ -130,3 +130,16 @@ export function progressToTarget(side, spot, entrySpot, t1) {
   const moved = side === "short" ? entrySpot - spot : spot - entrySpot;
   return Math.max(0, Math.min(1, moved / span));
 }
+
+// The SIGNED version. progressToTarget clamps at 0, which is right for the stop
+// rules — "how far toward T1" should never be negative. But it makes a position
+// that is DOWN 8% render as "0%", identical to one that has not moved. Every
+// losing trade looks flat, which is why the table reads as though nothing ever
+// goes anywhere.
+export function signedProgress(side, spot, entrySpot, t1) {
+  if (spot == null || entrySpot == null || t1 == null) return null;
+  const span = side === "short" ? entrySpot - t1 : t1 - entrySpot;
+  if (!(span > 0)) return null;
+  const moved = side === "short" ? entrySpot - spot : spot - entrySpot;
+  return Math.max(-2, Math.min(1, moved / span));      // floor at -200% of the span
+}

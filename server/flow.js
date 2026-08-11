@@ -263,11 +263,47 @@ const DEFAULTS = {
     //
     // Options are noisy, so armAtGainPct is deliberately high — a trailing stop
     // that arms at +15% would be stopped out by ordinary two-day chop.
+    // ON IN BOTH MODES. I originally left this off in full mode reasoning that
+    // "T1 plus the stopRatchet already cover it". They do not, and the gap is
+    // exactly the "went green then closed red" pattern:
+    //
+    //   stopRatchet measures the UNDERLYING's progress toward T1.
+    //   Your P&L is in the OPTION, which moves ~6x that.
+    //
+    //   underlying +4%  ->  33% of the way to T1  ->  ratchet NOT armed
+    //                   ->  but the option is already up ~24%
+    //
+    // So a position can be up 24%, round-trip the lot, and exit at Stop 1/3/4
+    // for a loss having never once been protected. The underlying ratchet only
+    // arms at the halfway mark, which on a 12% target means a 6% move — by which
+    // point the option is up ~36% and has had plenty of chances to give it back.
+    //
+    // This one trails the option's own P&L, so it does not care where T1 is.
+    // TIERED, because a single (arm, giveback) pair conflates two different jobs:
+    //
+    //   a +25% gain  -> the job is "do not let this become a LOSS"
+    //   a +100% gain -> the job is "bank most of it"
+    //
+    // Those want opposite givebacks, so one pair has to pick a side. Armed at
+    // +50% it ignored every smaller winner; armed at +25% with a tight giveback
+    // it would clip real trends, because a 45-DTE 0.6-delta call swings 20-30%
+    // intraday on a 3-4% underlying move.
+    //
+    // Tiers resolve it. The lowest tier gives back 90% — it only fires when a
+    // gain has almost entirely evaporated, so ordinary chop cannot reach it, but
+    // a winner can no longer round-trip into a loser. Higher tiers tighten as
+    // there is more to protect. Highest tier reached wins.
     profitRatchet: {
-      enabled: true,          // applies to protect-mode positions
-      alsoInFullMode: false,  // full mode already has T1 + the T1-progress ratchet
-      armAtGainPct: 0.50,     // only once the position is up 50%
-      giveBackPct: 0.40,      // then keep 60% of the peak gain
+      enabled: true,
+      alsoInFullMode: true,   // the bot's own trades need this MOST
+      tiers: [
+        { atGainPct: 0.25, giveBackPct: 0.90 },   // +25% peak -> floor ~ +2%   (no losers)
+        { atGainPct: 0.50, giveBackPct: 0.40 },   // +50% peak -> floor ~ +30%
+        { atGainPct: 1.00, giveBackPct: 0.30 },   // +100% peak -> floor ~ +70%
+      ],
+      // Fallback if `tiers` is removed — the old single-pair behaviour.
+      armAtGainPct: 0.50,
+      giveBackPct: 0.40,
     },
   },
   // Keeping the local store honest against the broker.

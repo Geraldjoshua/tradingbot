@@ -520,13 +520,30 @@ export async function discover(cfg, { openTickers = new Set(), cooldown = {} } =
       flowSource: c.source || "?", inKnows: !!c.in_knows, inUnusual: !!c.in_unusual,
     });
   }
+  // Why did no shorts appear? Until now the log only reported what QUALIFIED, so
+  // "shorts are broken" and "nothing was below its put wall today" produced the
+  // same empty result. Count both sides and the reason each failed.
+  const sideStats = { long: { seen: 0, qualified: 0 }, short: { seen: 0, qualified: 0 }, shortReasons: {} };
+  for (const s of scans) {
+    if (s.error) continue;
+    const sd = (byTicker[s.ticker] || {}).side || "long";
+    sideStats[sd].seen++;
+    if (qualified.find((q) => q.ticker === s.ticker)) sideStats[sd].qualified++;
+    else if (sd === "short") {
+      for (const r of (s.bearishReasons || ["no reason recorded"])) {
+        const k = r.replace(/[\d.]+/g, "N");         // bucket "spot 221.58 >0.5% above..." together
+        sideStats.shortReasons[k] = (sideStats.shortReasons[k] || 0) + 1;
+      }
+    }
+  }
+
   // Best flow conviction first — the entry stage takes them in this order.
   qualified.sort((a, b) => b.flowRank - a.flowRank);
 
   watch.sort((a, b) => b.flowRank - a.flowRank);
   return {
     enabled: true, sources, considered: candidates.length,
-    scanned: scans.length, qualified, watch, tagCounts,
+    scanned: scans.length, qualified, watch, tagCounts, sideStats,
     rejected: scans.filter((s) => !s.error && !qualified.find((q) => q.ticker === s.ticker))
       .map((s) => ({ ticker: s.ticker, tag: s.tag, grade: s.grade ?? null })),
   };

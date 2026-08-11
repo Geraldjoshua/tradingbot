@@ -988,6 +988,8 @@ export async function evaluatePositions() {
 
     const daysHeld = tradingDaysBetween(p.entryDate, iso(new Date()));
     const progress = playbook.progressToTarget(side, spot, p.entrySpot, p.t1);
+    // Signed, for display only. The stop rules keep using the clamped value.
+    const progressSigned = playbook.signedProgress(side, spot, p.entrySpot, p.t1);
     // Long options and short options are both LONG PREMIUM, so P&L is the same
     // formula either way. Shares invert with side.
     // Prefer the broker's own unrealized P&L — it is the number the Paper tab
@@ -1123,14 +1125,22 @@ export async function evaluatePositions() {
         const peak = Math.max(p.peakValue ?? entryVal, val);
         if (peak !== p.peakValue) { p.peakValue = +peak.toFixed(4); dirty = true; }
         const peakGain = (peak - entryVal) / entryVal;
-        if (peakGain >= (pr.armAtGainPct ?? 0.5)) {
-          const floor = entryVal + (peak - entryVal) * (1 - (pr.giveBackPct ?? 0.4));
+        // Highest tier whose threshold the peak has cleared. Falls back to the
+        // single arm/giveback pair when no tiers are configured.
+        const tiers = Array.isArray(pr.tiers) && pr.tiers.length
+          ? [...pr.tiers].sort((a, b) => (a.atGainPct ?? 0) - (b.atGainPct ?? 0))
+          : [{ atGainPct: pr.armAtGainPct ?? 0.5, giveBackPct: pr.giveBackPct ?? 0.4 }];
+        const tier = tiers.filter((x) => peakGain >= (x.atGainPct ?? 1)).pop();
+        if (tier) {
+          const floor = entryVal + (peak - entryVal) * (1 - (tier.giveBackPct ?? 0.4));
           if (val <= floor) {
             profitGiveBack = true;
             prDetail = {
               peak: +peak.toFixed(2), floor: +floor.toFixed(2),
               peakGainPct: Math.round(peakGain * 100),
               stillUpPct: Math.round(((val - entryVal) / entryVal) * 100),
+              tier: `+${Math.round((tier.atGainPct ?? 0) * 100)}%`,
+              keeps: `${Math.round((1 - (tier.giveBackPct ?? 0)) * 100)}% of peak`,
             };
           }
         }
@@ -1161,9 +1171,10 @@ export async function evaluatePositions() {
         // deliberately not a target: it fires because the gain shrank, never
         // because price reached some level the bot picked.
         action = "EXIT"; urgent = false;
-        reason = `Stop 7: profit ratchet — peaked +${prDetail.peakGainPct}% `
-          + `(${prDetail.peak}), now back to +${prDetail.stillUpPct}% at or under the `
-          + `${prDetail.floor} floor. Banking it rather than giving the move back.`;
+        reason = `Stop 7: profit ratchet (${prDetail.tier} tier, keeps ${prDetail.keeps}) — `
+          + `peaked +${prDetail.peakGainPct}% (${prDetail.peak}), now back to `
+          + `+${prDetail.stillUpPct}% at or under the ${prDetail.floor} floor. `
+          + "Banking it rather than giving the move back.";
       } else if (dteBreach) {
         action = "EXIT"; urgent = false;
         reason = `Stop 6: ${dteLeft}d to expiry — closing before the theta cliff `
@@ -1218,7 +1229,10 @@ export async function evaluatePositions() {
       marketValue: broker ? parseFloat(broker.market_value) : null,
       peakValue: p.peakValue ?? null,
       ...(prDetail ? { profitRatchet: prDetail } : {}),
-      progressPct: +(progress * 100).toFixed(0), action, reason, urgent });
+      progressPct: +(progress * 100).toFixed(0),
+      // -18% reads very differently from 0%, and until now both showed as 0%.
+      progressSignedPct: progressSigned != null ? +(progressSigned * 100).toFixed(0) : null,
+      action, reason, urgent });
   }
   // Write back the progress history and any ratcheted stop. Without this the
   // whole evaluation is amnesiac: Stop 4 needs four sessions of history and the

@@ -196,6 +196,9 @@ export interface VolDeskPosition {
   optPnl: number | null;
   daysHeld: number;
   progressPct: number;
+  // Signed version. progressPct clamps at 0, so a position down 46% displayed
+  // identically to one that had not moved.
+  progressSignedPct?: number | null;
   // T1_INFO = target reached on a protect-mode position and deliberately NOT
   // auto-sold. T2_HIT = a scale-out runner reaching its second target.
   action: "HOLD" | "WATCH" | "EXIT" | "T1_HIT" | "T1_INFO" | "T2_HIT";

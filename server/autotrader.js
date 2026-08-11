@@ -302,6 +302,19 @@ async function discoverNames(cfg, ctx) {
       sources: (res.sources || []).join("+"),
       considered: res.considered, scanned: res.scanned,
       qualified: res.qualified.map((q) => `${q.ticker}(${q.tag},g${q.grade},$${Math.round(q.netPremium / 1000)}k)`).join(" "),
+      ...(res.sideStats ? {
+        longs: `${res.sideStats.long.qualified}/${res.sideStats.long.seen}`,
+        shorts: `${res.sideStats.short.qualified}/${res.sideStats.short.seen}`,
+        // The reason no puts appear. Without this, "shorts are broken" and
+        // "nothing was below its put wall today" look identical.
+        ...(res.sideStats.short.seen && !res.sideStats.short.qualified
+          ? { whyNoShorts: Object.entries(res.sideStats.shortReasons)
+              .sort((a, b) => b[1] - a[1]).slice(0, 3)
+              .map(([r, n]) => `${n}x ${r}`).join("; ") }
+          : {}),
+        ...(res.sideStats.short.seen === 0
+          ? { whyNoShorts: "no bearish candidates in the flow book at all" } : {}),
+      } : {}),
     });
   } else {
     log("info", "discovery-none", {
