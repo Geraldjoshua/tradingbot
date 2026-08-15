@@ -202,17 +202,18 @@
     ],
     "maxPremiumLossPct": 0.6,
     "minDteExit": 10,
+    "protectTakesT1": true,
     "profitRatchet": {
       "enabled": true,
       "alsoInFullMode": true,
       "tiers": [
         {
-          "atGainPct": 0.25,
-          "giveBackPct": 0.9
+          "atGainPct": 0.2,
+          "giveBackPct": 0.4
         },
         {
           "atGainPct": 0.5,
-          "giveBackPct": 0.4
+          "giveBackPct": 0.35
         },
         {
           "atGainPct": 1,

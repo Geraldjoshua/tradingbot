@@ -182,6 +182,23 @@ export async function process(cfg, { onFilled } = {}) {
   return events;
 }
 
+// Cancel every working order for one symbol and mark them locally, returning the
+// broker ids that need cancelling. Used by an URGENT exit, which must clear the
+// book before it can sell — the contracts are held by the resting order and
+// Alpaca refuses the new one with 403 "insufficient qty available".
+export function cancelForSymbol(symbol) {
+  const rows = load();
+  const ids = [];
+  for (const w of rows) {
+    if (w.status !== "working" || w.symbol !== symbol) continue;
+    ids.push(w.orderId);
+    w.status = "canceled";
+    w.cancelReason = "superseded by an urgent exit";
+  }
+  if (ids.length) persist(rows);
+  return ids;
+}
+
 export function cancelAll(reason = "manual") {
   const rows = load();
   const ids = [];

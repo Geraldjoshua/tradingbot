@@ -249,6 +249,21 @@ const DEFAULTS = {
     // Never carry a long-premium position into the gamma/theta cliff. If the
     // thesis needed 45 days and has had 35 of them, it isn't working.
     minDteExit: 10,
+    // Should a PROTECT-mode position bank itself when it reaches T1?
+    //
+    // Off by default because T1 is the +GEX call wall — the PLAYBOOK's target,
+    // not necessarily yours. If you bought a name expecting 150 and the bot's T1
+    // is 136, auto-selling at 136 overrides the reason you own it.
+    //
+    // But the alternative surprised us live: DOCN reached T1 at +$1,930 and the
+    // bot logged "yours to close" and held. Stop 7 was armed, but it is a
+    // TRAILING stop — it only acts once the trade turns, so at the peak there
+    // was nothing for it to do.
+    //
+    // Turn this on if you would rather adopted positions take the playbook's
+    // target than wait for you. The time stop, stall stop and ratchet stay off
+    // either way — this changes only the profit exit.
+    protectTakesT1: true,
     // ---- PROFIT RATCHET: a trailing stop that knows nothing about the thesis --
     // stopRatchet above measures progress toward T1, which is fine for a trade
     // the bot planned and meaningless for one you placed yourself — T1 is not
@@ -296,10 +311,20 @@ const DEFAULTS = {
     profitRatchet: {
       enabled: true,
       alsoInFullMode: true,   // the bot's own trades need this MOST
+      // Givebacks are now roughly flat across sizes, and that is the correction.
+      // The first version had the bottom tier give back 90%, reasoning it only
+      // needed to stop a winner becoming a loser. Priced in dollars that was
+      // absurd: DOCN peaked +$1,930 and the floor sat at +$193 — it would have
+      // watched 90% of the gain evaporate and called that protection.
+      //
+      // "Has it become a loss yet?" is the wrong question. The right one is
+      // "how much of this gain am I willing to hand back?", and the answer is
+      // about a third whether the gain is $200 or $2,000. Small gains keep a
+      // slightly looser leash because they are closer to the noise floor.
       tiers: [
-        { atGainPct: 0.25, giveBackPct: 0.90 },   // +25% peak -> floor ~ +2%   (no losers)
-        { atGainPct: 0.50, giveBackPct: 0.40 },   // +50% peak -> floor ~ +30%
-        { atGainPct: 1.00, giveBackPct: 0.30 },   // +100% peak -> floor ~ +70%
+        { atGainPct: 0.20, giveBackPct: 0.40 },   // +20% peak -> keep 60% of it
+        { atGainPct: 0.50, giveBackPct: 0.35 },   // +50% peak -> keep 65%
+        { atGainPct: 1.00, giveBackPct: 0.30 },   // +100% peak -> keep 70%
       ],
       // Fallback if `tiers` is removed — the old single-pair behaviour.
       armAtGainPct: 0.50,

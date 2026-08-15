@@ -1191,12 +1191,13 @@ export async function evaluatePositions() {
         action = "EXIT"; urgent = true;
         reason = `Stop 4: stalled — under 10%/day progress for 3 sessions (now ${(progress * 100).toFixed(0)}% to T1)`;
       } else if (p.t1 != null && favourable(p.t1) && !p.t1Taken) {
-        if (protectOnly) {
+        if (protectOnly && mgmt.protectTakesT1 !== true) {
           // Say it loudly, do nothing. Banking the trade is your call on a
-          // position the bot did not plan.
+          // position the bot did not plan — unless protectTakesT1 says otherwise.
           action = "T1_INFO";
           reason = `T1 (${p.t1}) reached — NOT auto-taken: this position is in protect `
-            + `mode, so the exit is yours. Stop stays at ${stopLevel}.`;
+            + `mode, so the exit is yours. Stop stays at ${stopLevel}. `
+            + "(Set management.protectTakesT1 to have the bot bank these.)";
         } else {
           action = "T1_HIT";
           reason = `T1 reached (${p.t1}) — take profit, or lock stop to entry and ride to T2 ${p.t2}`;
@@ -1385,6 +1386,31 @@ export async function exitTrade({ id, reason = "manual", urgency = null, qty = n
       p.exitDate = iso(new Date()); persist(rows);
       return { status: "CANCELED", position: p };
     }
+    // Clear anything resting on the ticker first. Identical failure to the
+    // options path, and this is the one that actually bit: AVGO had 7 shares
+    // held by an open order, so every exit attempt came back
+    //   403 insufficient qty available (requested 7, available 0)
+    // once a minute. `p.orderId` above only cancels the ENTRY order we recorded;
+    // it does nothing about a resting exit, or an order placed by hand.
+    let clearedShares = 0;
+    for (const id of working.cancelForSymbol(p.ticker)) {
+      try { await alpaca.cancelOrder(id); clearedShares++; } catch {}
+    }
+    try {
+      for (const o of await alpaca.getOrders("open")) {
+        if (o.symbol !== p.ticker) continue;
+        try { await alpaca.cancelOrder(o.id); clearedShares++; } catch {}
+      }
+    } catch {}
+    if (clearedShares) {
+      for (let i = 0; i < 6; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          const still = (await alpaca.getOrders("open")).filter((o) => o.symbol === p.ticker).length;
+          if (!still) break;
+        } catch { break; }
+      }
+    }
     const order = await shares.exit({ ticker: p.ticker, side: p.side || "long", shares: p.shares });
     const xf = await alpaca.waitForFill(order.id).catch(() => ({ filled: false, price: null }));
     // Real-time first. This is only the FALLBACK when the fill price isn't back
@@ -1401,7 +1427,8 @@ export async function exitTrade({ id, reason = "manual", urgency = null, qty = n
       : null;
     p.pnlIsEstimate = !xf.filled;
     persist(rows);
-    return { status: "CLOSED", instrument: "shares", position: p, order, realizedPnl: p.realizedPnl };
+    return { status: "CLOSED", instrument: "shares", position: p, order,
+      realizedPnl: p.realizedPnl, ...(clearedShares ? { clearedResting: clearedShares } : {}) };
   }
 
   // If the entry order never filled (e.g. placed off-hours), there's nothing to
@@ -1468,6 +1495,40 @@ export async function exitTrade({ id, reason = "manual", urgency = null, qty = n
     // Couldn't place a resting order (no quote, etc.) — fall through and cross.
   }
 
+  // ---- URGENT: clear the book before crossing -----------------------------
+  // A resting order holds the contracts. Alpaca then refuses the stop with
+  //   403 insufficient qty available (requested 7, available 0, held_for_orders 7)
+  // and manage() retries every 60s until the resting ladder times out twelve
+  // minutes later — a stop that cannot fill, failing silently in a loop.
+  // Observed live on AVGO.
+  //
+  // The patient path already guards against colliding with itself. The urgent
+  // path did not, which is backwards: not filling a stop is the expensive
+  // outcome, so it is the one that should be allowed to cancel everything else.
+  const stale = working.cancelForSymbol(p.optionSymbol);
+  let cleared = 0;
+  for (const id of stale) { try { await alpaca.cancelOrder(id); cleared++; } catch {} }
+  // Anything resting at the broker that we did not place (or lost track of).
+  try {
+    const open = await alpaca.getOrders("open");
+    for (const o of open) {
+      if (o.symbol !== p.optionSymbol) continue;
+      try { await alpaca.cancelOrder(o.id); cleared++; } catch {}
+    }
+  } catch {}
+  // Cancels are asynchronous — the quantity is not free the instant the request
+  // returns. Poll briefly rather than firing into a book that is still held.
+  if (cleared) {
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const still = (await alpaca.getOrders("open"))
+          .filter((o) => o.symbol === p.optionSymbol).length;
+        if (!still) break;
+      } catch { break; }
+    }
+  }
+
   const xexec = await execution.execute({
     symbol: p.optionSymbol, qty: sellQty ?? p.contracts, side: "sell",
     urgency: urg, isOption: true, cfg: cfgX,
@@ -1475,6 +1536,7 @@ export async function exitTrade({ id, reason = "manual", urgency = null, qty = n
   if (!xexec.filled) {
     return {
       status: "EXIT_NOT_FILLED", position: p, urgency: urg,
+      ...(cleared ? { clearedResting: cleared } : {}),
       rungs: xexec.rungs, mid: xexec.mid, bid: xexec.bid, ask: xexec.ask,
       note: xexec.note || "exit ladder expired unfilled — position still OPEN, will retry",
     };
